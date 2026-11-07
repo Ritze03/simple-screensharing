@@ -14,4 +14,4 @@ in the rig, `vah264enc`, window sizes >= 640x360, one change per 3-6 s: the 4th 
 succeeded` (no full reset). A kernel-log watcher (`.tl-scratch/kwatch`-style: poll `journalctl -k` every 2 s, `hs-rig.sh down` on a hit) ended
 the run at once. So **no VA resize test at all** (not even gentle) until the capture-restart teardown is fixed; software encoding
 (`LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system` in `CLIENT_ENV_1`/`_2`, the log must say `using software encoder`) took 120 s window
-stresses with sizes down to 40x30 and bursts every 60 ms without a kernel message. Details: `features/stream-control.md` "Resize recovery verified".
+stresses with sizes down to 40x30 and bursts every 60 ms without a kernel message. Details: `features/stream/capture-sources.md` "Resize recovery verified".

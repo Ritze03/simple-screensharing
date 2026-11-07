@@ -403,8 +403,8 @@ pub struct AppSettings {
     /// `renderStartStreamCard`) — framerate, bitrate, and the three
     /// testing-oriented encoder tuning knobs, saved on every change so the
     /// form pre-fills with what was last used instead of resetting to
-    /// hardcoded defaults on each launch (see `superdoc/features/
-    /// stream-control.md`'s 2026-07-28 note).
+    /// hardcoded defaults on each launch (see `superdoc/features/stream/encoder-tuning.md`
+    /// "Start-stream defaults").
     ///
     /// `Why its own nested struct rather than five flat fields:` every field
     /// here is set together by `session::save_start_stream_defaults`
@@ -418,8 +418,7 @@ pub struct AppSettings {
     pub start_stream_defaults: StartStreamDefaults,
     /// The global display name shown to everyone in every room this client
     /// joins or creates (Settings tab). Replaces what used to be a per-join
-    /// "Display name" field on the Join/Create dialogs — see
-    /// `superdoc/features/stream-control.md`'s 2026-07-28 note on why: the
+    /// "Display name" field on the Join/Create dialogs. Why: the
     /// wire protocol has no concept of changing a display name after joining
     /// a given room anyway (`net.rs`/`protocol.rs` send it once, at connect),
     /// so "one name, set once" is just this client choosing not to re-ask

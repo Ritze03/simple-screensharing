@@ -70,9 +70,9 @@
   (`paint_cover`), a `PREVIEW` chip in the top-right corner and the usual `LIVE`/`STARTING` chip left.
   Audio-only shares have no video handle and no preview.
 - **Not the room-preview thumbnails:** those are the ~30 s JPEGs other members see (`preview.rs`); a
-  separate fixed 1 fps branch feeds them and is unchanged (verified at 1.0 fps behind its `videorate` while the source ran 239 fps, #79: `stream-control.md`).
+  separate fixed 1 fps branch feeds them and is unchanged (verified at 1.0 fps behind its `videorate` while the source ran 239 fps, #79: `stream/capture-pipeline.md`).
 
-Measured numbers (headless rig, H.265 240 fps): `superdoc/features/stream-control.md`
+Measured numbers (headless rig, H.265 240 fps): `superdoc/features/stream/capture-pipeline.md`
 "Own-tile live preview".
 
 ## Browser
@@ -85,7 +85,7 @@ placeholder shows and nothing renders (the track itself keeps feeding the encode
 element per capture:* `render()` rebuilds the tree on every state change; the stage (`docs/js/ui/stage.js`) re-inserts the same
 element, so playback never restarts (same idea as the fullscreen stage in `popout.js`). CSS (`app.css`
 `.st-tile.mine`, `.st-tile .mine-pic`) uses `:has()` to hide the "Your screen" placeholder (`.mine-pic`) and show the `PREVIEW` chip. Audio-only captures
-(`c.video == null`) get no element. E2E: `docs/dev/e2e/live-preview.mjs` (see `features/website.md`).
+(`c.video == null`) get no element. E2E: `docs/dev/e2e/live-preview.mjs` (see `features/website/viewer-features.md`).
 
 ## History
 
@@ -100,6 +100,6 @@ element, so playback never restarts (same idea as the fullscreen stage in `popou
 
 ## Related docs
 
-- `superdoc/features/stream-control.md`: capture pipeline, capture domains, "Own-tile live preview".
-- `superdoc/ui/APP-SHELL.md`: the own tile.
-- `superdoc/features/website.md`: browser side.
+- `superdoc/features/stream/capture-pipeline.md`: capture pipeline, capture domains, "Own-tile live preview".
+- `superdoc/ui/STAGE.md`: the own tile.
+- `superdoc/features/website/viewer-features.md`: browser side ("Own-tile live preview").

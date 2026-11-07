@@ -90,13 +90,13 @@ either lives inside its `RoomSession` or is looked up by `(room, stream_id)`, ne
 **Multi-destination captures are live.** One capture feeds N rooms: every destination —
 including the first — is a dynamic tee branch with its own encoder, room key, `stream_id`
 and pump task, driven by `spawn_add_destination`/`spawn_remove_destination` (fan-out and
-transfer). See "Per-destination lifecycle" below and `superdoc/features/stream-control.md`.
+transfer). See "Per-destination lifecycle" below and `superdoc/features/stream/go-live-and-destinations.md`.
 
 The **sidebar** is genuinely multi-room: "Watched streams" (the cross-room grid) plus the ROOMS list,
 each joined room with its sharers as sub-rows (`ui/sidebar.rs`); so are `drain_events`, watch-texture
 upload and pop-out viewports. `AppState::active_room` still exists as the room the stage is
 showing (set when a room row is clicked, `ui/mod.rs`). The old Stream Control / View content tabs and
-the share panel are gone: the **stage** replaced them (`ui/APP-SHELL.md`), and the only tab enums left
+the share panel are gone: the **stage** replaced them (`ui/STAGE.md`), and the only tab enums left
 are the modal ones, `AddTab` and `SettingsTab` (`ui/modals.rs`).
 
 The remaining single-room seams, listed so later work fixes them deliberately rather than
@@ -190,7 +190,7 @@ they were, never worse.
 A destination enters `Stalled` on a deliberate source restart (`branch::stall_all`) and,
 since 2026-10-14, when a `Live` un-paused branch produces nothing for
 `destination::silence_threshold` (`DestinationRuntime::stall_if_silent`). See
-`features/stream-control.md` ("Idle monitors") for why a capture can also have *no first
+`features/stream/capture-sources.md` ("Idle monitors") for why a capture can also have *no first
 frame at all*, which is handled before a branch exists (`branch::wait_for_source_frame`).
 
 While `Stalled`, the destination is **never torn down** — no `StopStream`, so the viewer
@@ -224,7 +224,7 @@ only the *signal*; the placeholder UI that consumes it (pulsing bar → spinner 
 now show a centred chip from `StreamDecoder::view_state` ("Recovering…" / "Sharer's capture
 stalled", the latter driven by this flag, display only) and the viewer acts on *local* evidence
 (loss, silence, a decoder that outputs nothing) with keyframe requests, a decoder reset and a
-reconnect: `features/video-pipeline.md` "Viewer recovery". The flag itself still drives nothing.
+reconnect: `features/video/viewer-recovery.md`. The flag itself still drives nothing.
 
 ### The wire-PTS continuity invariant
 

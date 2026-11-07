@@ -49,7 +49,7 @@ the viewer is the only one (a valve pause/resume), and one IDR goes to everybody
 
 - **A requested IDR can itself be the problem** (field case 2026-11-03, #102): a VA encoder under motion emits
   IDRs of ~1 s of bitrate (~1000 fragments, almost never intact), each failure triggers the next request.
-  The sharer now squeezes and rate-paces such IDRs and skips their repeats: `features/stream-control.md`
+  The sharer now squeezes and rate-paces such IDRs and skips their repeats: `features/stream/capture-restart.md`
   "Big keyframes".
 - **Min 1.5 s between requests** (browser parity): a request cannot be answered faster than ~1.2 s, so
   asking sooner only multiplies keyframes. Silent failures back off 1.5 / 3 / 6 / 10 s so a dead sharer or

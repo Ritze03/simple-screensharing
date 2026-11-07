@@ -2,6 +2,8 @@
 
 Viewer loudness levelling, sender boost, volume sliders (500 %, wheel, live drag) and the share meter (#96, #113, #114, #115, #119, #135). Hub: `../audio-sharing.md`.
 
+The text moved here verbatim from the Audio sharing page: "above", "below", "this page" and "the #128 block" in it may point at a section that now lives in a sibling page of this folder (the hub lists them).
+
 ## 2026-11-03: volume sliders apply while dragging, not on release (task #135)
 
 User request: *"make sure that when the volume slider is moved it instantly sets the volume even while moving and not
@@ -49,7 +51,7 @@ viewer slider is a linear amplitude (500 % = +14 dB, loud sources clip above ~20
   `AppSettings::level_loudness`, live, native and browser). The viewer's volume slider and mute act after it.
   *Follow-up #126 (2026-11-03):* the same global switch also has a small toggle button right after every volume slider
   (native tile / pop-out / fullscreen pill, browser tile pill), so the viewer sees the state and can change it where they
-  adjust the volume. Still one global setting, not per stream. Details: `ui/APP-SHELL.md`.
+  adjust the volume. Still one global setting, not per stream. Details: `ui/SETTINGS.md`.
 
 **Why viewer-side.** Every viewer has a different output chain and listening level, and watches several sharers
 with different levels at once: the level that sounds right is a property of the *listener*, so it is the listener's

@@ -14,7 +14,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **Shared view, no second decode.** The viewport paints the same `Arc<Mutex<VideoView>>` as the tile
   (`paint(ui, ui.max_rect(), Fit::Contain)`), so GPU textures and the decoder are shared and the tile
   shows a placeholder while popped (`VideoViews`' `popped` flag, `ui/video.rs`).
-- **Hover chrome** (the former Electron `body:hover` rule, no idle timeout in a window; in fullscreen it auto-hides after 3 s idle, task #124, `ui/APP-SHELL.md`): while the pointer is anywhere in
+- **Hover chrome** (the former Electron `body:hover` rule, no idle timeout in a window; in fullscreen it auto-hides after 3 s idle, task #124, `ui/STAGE.md`): while the pointer is anywhere in
   the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-500 %, snaps at 100 %][%]`,
   or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
   in fixed tabular-width fields. A centred chip is always shown while waiting for the first frame, "Recovering…" (viewer recovery, `features/video/viewer-recovery.md`) or "Sharer's capture stalled" (not hover-gated; same wording as the in-app tile). The
@@ -25,9 +25,9 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **F11** or a **double-click** on the video toggles fullscreen (double-click added 2026-10-15, task #77; the chrome's
   buttons keep their own clicks); **Esc** only *leaves* fullscreen and never closes (the former Electron rule,
   kept on purpose: a stray Esc must not kill someone's stream window).
-  The same overlay is drawn over the main window's own fullscreen stream (task #106, `ui/APP-SHELL.md`), with an exit-fullscreen button in place of the ×.
+  The same overlay is drawn over the main window's own fullscreen stream (task #106, `ui/STAGE.md`), with an exit-fullscreen button in place of the ×.
 - **A reconnect or a re-share keeps the window** (task #132): the pop-out is carried over to the resumed watch of the same
-  owner name + label, see `ui/APP-SHELL.md` "A pop-out survives its watch being re-created". Before, such an event closed
+  owner name + label, see `ui/STAGE.md` "A pop-out survives its watch being re-created". Before, such an event closed
   the window by itself and the stream came back inline.
 - **Closing brings the stream back.** The x button or an OS close sets `close_requested`, which the
   next main-window frame turns into `UiAction::BringBack`: the stream returns to its tile.
@@ -38,7 +38,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 
 ## A watch's lifecycle (viewer side, `client/src/session.rs`)
 
-Full detail in `superdoc/architecture/implementation-notes.md` (tasks #36 and #40); the rules:
+Full detail in `superdoc/architecture/client-reconnect-and-watches.md` (tasks #36 and #40); the rules:
 
 - **A watch ends when the sharer stops (#40).** On the relay's `StreamStopped`
   `RoomSession::end_watch_of_stopped` removes the watch (tile, decoder and GPU view go away
@@ -84,7 +84,7 @@ Playwright `_electron`) is in git: `git log -- superdoc/features/viewer-window.m
   stack, wide ones go side by side). *Why:* the owner asked for "stack them, if that maximises
   the used viewing area". It lived on as `grid_shape` in `client/src/ui/room.rs` (ported from the
   former Electron frontend's `computeGridShape`) until the stage (I1, 2026-11-04) replaced the grid: the rule is now `best_rows` in
-  `client/src/ui/stage/geom.rs` (rows of tiles in order, the row count that shows the most picture area wins; Split / Crop; `features/website.md` "The stage" for the browser twin).
+  `client/src/ui/stage/geom.rs` (rows of tiles in order, the row count that shows the most picture area wins; Split / Crop; `features/website/stage.md` "The stage" for the browser twin).
 - **Verification lesson:** the Electron-era checks drove the real shell with synthetic mouse
   events and fabricated stream keys; the egui equivalent is the `run` skill plus the headless rig (`hs-rig.sh`, `hs-drive.sh`)
   (`client/.claude/skills/run/SKILL.md`, `client/scripts/`).

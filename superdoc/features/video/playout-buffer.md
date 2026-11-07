@@ -36,7 +36,7 @@ keyframes need (23 ms in the rig with no bottleneck).
 
 **Why (user, 2026-11-04):** "On 5 mbit/s it seems a little bit shorter. But if building the playout buffer fixes it, add it.
 Make it dynamic, like it was before with an automatic catchup speed. Also add the settings back to the Settings menu."
-Cause of the stutter: row 133 (`stream-control.md`): a keyframe needs size / sender uplink to arrive, later frames queue
+Cause of the stutter: row 133 (`features/stream/keyframes-and-bandwidth.md`): a keyframe needs size / sender uplink to arrive, later frames queue
 behind it and arrive in a clump.
 
 **A/V sync follows.** `StreamDecoder::feed` tells `AvSync` the video arrived at `now + playout delay`

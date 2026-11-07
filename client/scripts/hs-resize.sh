@@ -7,8 +7,8 @@
 #        SCRATCH=<rig scratch> hs-resize.sh burst [N] [GAP_MS] [FINAL WxH]
 #          N sizes (default 12) walking between 1280x720 and 1920x1080, GAP_MS apart (default 80),
 #          ending on FINAL (default 1600x900). Prints each change with a ms timestamp.
-# The size change reaches the client as a source size change: see features/stream-control.md
-# "Source resize (2026-11-05)". Needs a running rig (hs-rig.sh up).
+# The size change reaches the client as a source size change: see features/stream/capture-sources.md
+# "The source changes size". Needs a running rig (hs-rig.sh up).
 
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

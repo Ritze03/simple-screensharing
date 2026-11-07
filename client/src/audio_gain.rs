@@ -8,7 +8,7 @@
 //! encoding in float, where nothing clips until the limiter says so. It is capped at 200 % since
 //! #119: the old 10 s calibration (up to 800 %) is gone, and the *viewer* now levels loudness
 //! itself ([`crate::leveller`]), so this slider is only a manual trim for a source that is far too
-//! quiet or too loud. See `superdoc/features/audio-sharing.md`.
+//! quiet or too loud. See `superdoc/features/audio/levelling-and-volume.md`.
 
 /// Quietest boost the setting accepts: -6 dB. Below 1x exists for a source that is too loud.
 pub const MIN_GAIN: f64 = 0.5;

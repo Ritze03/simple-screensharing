@@ -5,7 +5,7 @@ Webcam and audio-only sharing and the PIP pairing in the browser. Part of the br
 ## Webcam, audio-only shares and webcam in picture (task I10, 2026-11-04)
 
 The browser caught up with native I7 (audio-only shares), I8 (webcam, webcam in picture) on the stage of I6. Decisions D1, D7, D9, D10 are the plan's; the native side is
-`superdoc/ui/APP-SHELL.md` "Webcam and webcam in picture" and `features/audio-sharing.md` (I7).
+`superdoc/ui/STAGE.md` "Webcam and webcam in picture" and `features/audio/desktop-audio.md` (I7).
 
 **Listening to audio-only senders.** A native client can share audio with no screen. `stage-state.js` `collect` adds a `kind: "audio"` item for every audio stream whose owner
 shares **no screen** (`RoomEntry.ownerHasVideo`: a webcam is not a screen; native `owner_has_video`) and a Listen tile for it: avatar, `X is sharing audio`, `Audio only`,

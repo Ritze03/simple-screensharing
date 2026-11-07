@@ -11,7 +11,7 @@ screen (or alone, a screen share is not needed), with its own destinations and i
 `capture::webcam` module (listing, modes, the source fragment, pure and tested), `CaptureSource::Webcam`,
 `capture::start_webcam_sharing`; `AppState::start_webcam` / `stop_webcam` / `set_webcam_settings` /
 `refresh_webcams` and `AppSettings::webcam` (`rooms::WebcamSettings`) on the session side; the UI is
-`ui/webcam_settings.rs`, `share::webcam_menu`, `stage/pip.rs` (`superdoc/ui/APP-SHELL.md` "Webcam and webcam in picture").
+`ui/webcam_settings.rs`, `share::webcam_menu`, `stage/pip.rs` (`superdoc/ui/STAGE.md` "Webcam and webcam in picture").
 
 - **On the wire a webcam is an ordinary `StreamKind::Video` stream whose label starts with `Webcam`** (D7;
   `webcam::LABEL`, `webcam::is_webcam_label`, `LocalCapture::is_webcam`, `LocalCapture::wire_label`). *Why a label and

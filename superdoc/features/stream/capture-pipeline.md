@@ -46,7 +46,7 @@ destination through the same `spawn_destination` every later one goes through.
 `Why one pump task per destination rather than one per capture:` each destination's samples
 go to a different room, under a different key, on a different `stream_id`, and a swap
 *consumes* the branch by value (that ownership transfer is the appsink-reader handoff —
-see `EncodeBranch`'s "single `AppSinkStream`" rule in `architecture/overview.md`). One task
+see `EncodeBranch`'s "single `AppSinkStream`" rule in `architecture/session-model.md`). One task
 per destination gives each branch exactly one owner and lets a swap be `await`ed without
 the UI thread ever blocking. The capture keeps one task of its own
 (`capture_loop`) for the two things that genuinely are per capture: the pipeline bus and

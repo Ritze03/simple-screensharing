@@ -25,7 +25,7 @@ Usage: portal-probe.py [--secs N] [--tail "video/x-raw ! fakesink sync=false"] [
   Stream/Input/Unknown and WirePlumber 0.5 refuses to link it to the Video/Source ("stream error:
   target not found"). Any tail that starts with a video caps filter or a video element is fine.
   Also pass --src "min-buffers=8": with the portal's default 2-buffer pool a plain fakesink tail
-  gets one frame and then "out of buffers" (see features/stream-control.md).
+  gets one frame and then "out of buffers" (see features/stream/capture-pipeline.md).
 """
 import argparse
 import os

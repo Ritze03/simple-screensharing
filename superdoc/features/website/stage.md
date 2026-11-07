@@ -15,8 +15,8 @@ Why: the user wanted a working fullscreen or a useful full-size view, never an e
 
 ## The stage (task I6, 2026-11-04)
 
-The browser client got the stage of the native client (`superdoc/ui/APP-SHELL.md` "The stage", design approved in the replica
-`superdoc/ui/replica/index.html`, `ui/STYLING-GUIDE.md` "HTML replica"). It replaces the room's "On screen" tiles and "Sharing in this room" cards, the
+The browser client got the stage of the native client (`superdoc/ui/STAGE.md` "The stage", design approved in the replica
+`superdoc/ui/replica/index.html`, `ui/REPLICA.md` "HTML replica"). It replaces the room's "On screen" tiles and "Sharing in this room" cards, the
 People list on the right, the bottom action bar and the old popups, and the Watched view. Classic views were not built. A joined room and the whole
 "Watched streams" view are one black stage with the streams, the people strip and the control bar; a room that is not joined (connecting,
 reconnecting, not connected) keeps the scrolling body with its banner and a `⋯` in the header for the Room settings menu (native

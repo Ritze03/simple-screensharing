@@ -133,7 +133,7 @@ The room view of the desktop client: the black stage with its tiles, layouts, pe
   the bar's one-line status does not have. *Why a dropdown with avatars:* the user's request ("a
   viewer number ... when he hovers over it, a drop-down thingy ... the profile picture and the
   username"); "profile picture" is the app's existing avatar. Browser twin: `docs/js/ui/stage.js`
-  `viewersChip`, `features/website.md`.
+  `viewersChip`, `features/website/viewer-features.md` "Who watches my share".
 
 **The control bar** (task I3, `stage/bar.rs`; the replica's `.ctlrow`): `[hide sidebar][Copy invite link]` left, two button
 groups and Leave in the middle, `[pop out][fullscreen]` right (Watched has no Invite, Room settings or Leave and shows
@@ -156,7 +156,7 @@ share** (`AppState::apply_destination_edit`), user: "It should also save the mos
 destination's live params, so an automatic codec fallback (AV1 -> H.265 -> H.264) is never remembered. Staged edits that
 never went live stay unsaved. Its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
 codec and rate; Preset (with its caption) and then FPS for the live destination or the next stream (2026-11-05: Preset above FPS, a preset lit only on an exact FPS + encoding + keyframe match); Change source, All stream settings…, Go live
-in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio-sharing.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
+in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio/desktop-audio.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
 camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its
 arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
 mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
@@ -252,7 +252,7 @@ and the pop-out windows keep their older twin (`popout::overlay_shown`).
 
 **Webcam and webcam in picture** (task I8, 2026-11-04; `ui/webcam_settings.rs`, `stage/pip.rs`, `stage/geom.rs`; replica
 `superdoc/ui/replica/index.html` `camMenu`, `camModal`, `.pip`, `snapPip`, `layoutPip`; the design notes are in
-`REPLICA.md` "Stream settings and webcam"; the capture side in `features/stream-control.md` "Webcam capture").
+`REPLICA.md` "Stream settings and webcam"; the capture side in `features/stream/webcam-capture.md`).
 
 - **Your webcam** is an item of your own stage like your screen (`Kind::Mine`, `ItemId.label == "Webcam"`, `who == ""`):
   a tile `You · Webcam` with the live preview (while the window is focused, else the placeholder "Your webcam · live"),
@@ -311,7 +311,7 @@ the next launch (`superdoc/features/presentation-modes.md`).
 
 Pop-out: the view sits in an `Arc<Mutex<VideoView>>` so the deferred viewport closure
 (`Send + Sync + 'static`) can paint the same view the tile would; while `popped` the stage leaves the
-stream out. The pop-out has hover-gated chrome (statbar, audio pill; volume 0-500 % with a snap at 100 %, task #96, `features/audio-sharing.md`), F11
+stream out. The pop-out has hover-gated chrome (statbar, audio pill; volume 0-500 % with a snap at 100 %, task #96, `features/audio/levelling-and-volume.md`), F11
 fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
 rules, carried over; `superdoc/features/viewer-window.md`).
 

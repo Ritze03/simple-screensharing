@@ -2,6 +2,8 @@
 
 What a share captures (Desktop audio or one named app), source groups, the exclusion list, the audio settings menu and notification sounds (tasks I7, I9). Hub: `../audio-sharing.md`.
 
+The text moved here verbatim from the Audio sharing page: "above", "below", "this page" and "the #128 block" in it may point at a section that now lives in a sibling page of this folder (the hub lists them).
+
 ## 2026-11-04: desktop audio, audio-only shares, the exclusion list, source groups, the audio settings menu (task I7)
 
 User requirements (D1, the plan's own words) and the design decision (D9):
@@ -19,7 +21,7 @@ User requirements (D1, the plan's own words) and the design decision (D9):
   audio-only shares replace the 'paired video' invariant in `start_audio_share` — a plain output monitor couldn't leave
   Discord out. Desktop audio, source groups and the exclusion list are native Linux only: a browser can't list apps,
   and Windows has no audio capture."*
-- **Browser twin (I10):** the website has the audio button too, as an audio-only share of a picked tab or the system audio (`docs/js/ui/capture.js` `startAudio`) and the Listen tile for an audio-only sender; it has no Desktop audio, no groups and no exclusion list. Details and the browser's notification sounds: `features/website.md` "Webcam, audio-only shares and webcam in picture" and "Sounds".
+- **Browser twin (I10):** the website has the audio button too, as an audio-only share of a picked tab or the system audio (`docs/js/ui/capture.js` `startAudio`) and the Listen tile for an audio-only sender; it has no Desktop audio, no groups and no exclusion list. Details and the browser's notification sounds: `features/website/webcam-and-audio.md` "Webcam, audio-only shares and webcam in picture" and `features/website/viewer-features.md` "Sounds".
 
 ### What a share captures (`audio.rs`)
 
@@ -65,7 +67,7 @@ unit-tested (`desktop_audio_tests`). First match wins:
 | 4 | a whole word of Discord, Vesktop, TeamSpeak, Mumble, Zoom, Skype, Teams in the binary, application or node name | Voice chat |
 | 5 | ... of Firefox, Chromium, Chrome, Zen, Brave, Vivaldi, Opera, LibreWolf, Waterfox, Edge, Epiphany, Falkon | Browsers |
 | 6 | ... `gamescope` | Games |
-| 7 | ... of mpv, VLC, Rhythmbox, Celluloid, Totem, Clementine, Strawberry, Audacious, Elisa, Amberol, ... | Media |
+| 7 | ... of Spotify, mpv, VLC, Rhythmbox, Celluloid, Totem, Clementine, Strawberry, Audacious, Elisa, Amberol, ... | Media |
 | 8 | `SteamAppId` in the process environment | Games |
 | 9 | `media.role` = Music, Movie or Video | Media |
 | 10 | anything else | Other |
@@ -152,7 +154,7 @@ unlink-before-removal holds for Desktop audio, and unlinking one stream does not
 
 ### Tests
 
-Unit (`audio::desktop_audio_tests`, `rooms` and `ui` tests): the group table with the brief's real examples (a music player,
+Unit (`audio::desktop_audio_tests`, `rooms` and `ui` tests): the group table with the brief's real examples (Spotify,
 the Firefox-based browser/Chromium/Zen, gamescope, `Skill Up!.exe`/cs2 with and without `SteamAppId`, java with and without the Game role,
 Discord, TeamSpeak, a Bluetooth phone), that the environment is read only for streams no known app claims, the `SteamAppId`
 prefix test, the exclusion match (case, blanks), the matching set of Desktop vs Named, the stream list of a snapshot (pid on

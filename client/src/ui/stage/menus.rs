@@ -213,7 +213,7 @@ fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAct
     }
 }
 
-/// A stream's menu (`⋯` on its tile, or a right click): who and what, volume and level loudness, then
+/// A stream's menu (`⋯` on its tile, or a right click): who and what, volume, then
 /// pop out / fullscreen / stop watching (your own share: Stream settings and Stop sharing). Volume acts during
 /// the drag and the wheel steps it (5 % up to 200 %, 10 % above).
 fn tile_menu(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, view: &StageView, pop: &Popover, it: &Item) {

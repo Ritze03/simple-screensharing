@@ -76,7 +76,7 @@ binaries for `cargo run`. Consequences, all handled in `main.rs`:
   A panic hook and an `Err` returned from `main` are written to the same file, since their default output also
   goes to stderr. **A startup failure on a user's machine: read that file.** (Not a logging system: just where
   the existing output lands.) Independently of that file, Settings > Diagnostics > Logs copies/saves the in-memory
-  ring (`logbuf.rs`, `ui/APP-SHELL.md`), the easier thing to ask a friend for.
+  ring (`logbuf.rs`, `ui/SETTINGS.md`), the easier thing to ask a friend for.
 - `--help` / bad-argument output: `attach_parent_console` attaches to the launching terminal's console when the
   process has no stdout handle (a plain cmd/PowerShell prompt). With stdout redirected (`> file`, a pipe, ssh) the
   inherited handle is used; attaching in that case replaced the handles and lost the output (seen over SSH).
@@ -87,7 +87,7 @@ the window. A shipped GUI app must not show a console.
 
 Where the output lands for the user: after `package.ps1`, the folder and the zip are also copied to the test VM user's
 Desktop so it can be started by double-click; the zip is also copied back to the Linux repo's `dist\` (gitignored).
-Exact locations: `.claude/local/windows-vm.md` in the main checkout.
+Exact locations: `.claude/local/windows-vm.md` in the main checkout, if present.
 
 **A missing GStreamer element breaks every share (2026-10-15, task #73).** The first real share in the VM
 failed with `failed to construct encode branch bin: ... no element "capssetter"`: the `debug` plugin was not in
@@ -139,7 +139,7 @@ viewer would otherwise pick that one.
 ## The Windows test VM and syncing the sources (agents; SSH only, never the VM's window)
 
 How to reach the VM (address, login, key, paths, network topology) is local setup: `.claude/local/windows-vm.md` in the
-main checkout (not committed). What is generally true:
+main checkout (not committed; if present). What is generally true:
 
 - The login shell is **cmd.exe**; `tar`, `git` and `scp` are on the VM.
 - **Sources**: the VM holds a plain copy of the workspace, **not a git checkout**. Refresh it with
@@ -156,7 +156,7 @@ main checkout (not committed). What is generally true:
 
 - A VM behind a NAT may not reach the host (a host firewall can drop what arrives from the VM bridge) while the host can
   reach the VM: then the relay runs **inside the VM** and the Linux side connects to it. The topology of the test VM is in
-  `.claude/local/windows-vm.md`. Inside the VM the Windows firewall needs an inbound UDP rule
+  `.claude/local/windows-vm.md` in the main checkout, if present. Inside the VM the Windows firewall needs an inbound UDP rule
   (`New-NetFirewallRule -Direction Inbound -Protocol UDP -LocalPort 4433 -Action Allow`).
 - The relay's TUI needs a console: started through `Win32_Process.Create` (a hidden session 0 console) or a
   scheduled task in the interactive session.

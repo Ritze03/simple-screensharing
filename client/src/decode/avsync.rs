@@ -1,7 +1,7 @@
 //! Viewer-side audio/video sync: audio is delayed so it lands with the matching picture, and the
 //! delay follows the video's latency as it changes.
 //!
-//! Full write-up with the `Why:` notes: `superdoc/features/audio-sharing.md`.
+//! Full write-up with the `Why:` notes: `superdoc/features/audio/sync-and-clocks.md`.
 //!
 //! # The model
 //!

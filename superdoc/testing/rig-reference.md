@@ -54,7 +54,7 @@ Rules for working in it:
   (`ext_image_copy_capture_session_v1#18: error 1: session already has a frame object`) when `pipewiresrc`'s
   start-up streaming -> paused -> streaming flap resumes while the portal's first frame is still outstanding.
   The client defuses that (#52 queue behind `pipewiresrc`, #112 a 30 ms pause between PAUSED and PLAYING,
-  `capture::PORTAL_START_SETTLE`; see `features/stream-control.md`). **How to read the error** (#112 measured it
+  `capture::PORTAL_START_SETTLE`; see `features/stream/capture-pipeline.md`). **How to read the error** (#112 measured it
   across commits, 20-90 starts each, same rig, stock xdpw): that line in `xdpw.log`/`xdpw-crashed.log` does NOT by
   itself mean a regression of a recent commit. Before #112 it hit 13-20 % of starts at *every* commit from `a5433cf` (#52)
   to `HEAD` (and 4 of 5 before #52), the rate moving with whatever else ran on the machine; since #112 it is 0 of

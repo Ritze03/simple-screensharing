@@ -411,7 +411,7 @@ audio, every destination) as capture time on a single clock, so a receiver can c
 PTS with a video PTS of the same sender. The native client uses microseconds since a process-wide
 epoch (`decode::sender_clock_epoch`); the browser client uses its shared `MediaClock`. The
 receiver does not need the clock's absolute offset: it compares per-stream `arrival - pts`
-minima (`features/audio-sharing.md`). Before this date native audio PTS counted from the audio
+minima (`features/audio/sync-and-clocks.md`). Before this date native audio PTS counted from the audio
 pipeline start and video PTS from the destination's creation, so they were not comparable.
 No wire change, no version bump.
 
@@ -519,7 +519,7 @@ security-relevant. The relay never decrypts anything for this either.
 
 * **Detect.** A missing fragment of an incomplete frame is *suspect* once at least 2 later
   fragments of the frame have arrived (a hole behind data, short reorder margin), or, for the
-  tail, once the frame has been quiet for 20 ms. (A paced IDR, `features/stream-control.md`
+  tail, once the frame has been quiet for 20 ms. (A paced IDR, `features/stream/capture-restart.md`
   "Big keyframes", sends a chunk every 2 ms, so 20 ms of silence is not pacing.)
 * **Ask.** Send a Request per contiguous run of suspect fragments, then again every
   `R = clamp(2 x rtt + 60 ms, 100, 300 ms)` for the fragments still missing, at most **3 times**. (*Why the generous floor:* the viewer only knows its own RTT, but a repair of sharer → relay loss also crosses the sharer's link; a first rig run with a 60 ms floor abandoned a keyframe whose repair had to cross a sharer link measured at ~90 ms RTT.)
@@ -533,7 +533,7 @@ security-relevant. The relay never decrypts anything for this either.
   the fragment count). A relay or sender holding the frame answers with the fragments it has; a Miss for a range past the
   frame's end (the ask covers more fragments than exist) is ignored by the viewer, it only ends the wait when nothing was
   supplied. *Why:* the frame has no reassembly state to name a range from, and the ask must stay one 18-byte datagram.
-  Seen by the user as `repaired (...)` in the Connection log (`website.md` "Phone decoder failures").
+  Seen by the user as `repaired (...)` in the Connection log (`features/website/phone.md` "Phone decoder failures").
 * **Order.** While a frame is being repaired, **later complete frames of the same stream are
   held back and released in order** once it completes or is abandoned. *Why:* the decoder must
   see frame N before N+1; a late-completing N fed after N+5 corrupts the picture, and an IDR

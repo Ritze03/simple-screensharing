@@ -44,7 +44,7 @@
 //! every place it is applied or reverse-looked-up stay in one file.
 //!
 //! Rate control is not part of a preset (removed 2026-10-15, #88): every
-//! encode is Dynamic. See `superdoc/features/stream-control.md` "Rate control".
+//! encode is Dynamic. See `superdoc/features/stream/rate-control.md`.
 
 use crate::capture::{QualityLevel, TuneMode, VideoCodec};
 use crate::session::{AppState, DestEdit, DestinationId};

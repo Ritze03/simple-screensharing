@@ -17,7 +17,7 @@
 //! shape's extremes, so a slice of pizza (nothing in its lower left) or a crescent sits visibly off
 //! the disc with its box perfectly centred (the user's report on 🍕, row 120). The mass centre alone
 //! overshoots on those (🌙, 🎸) and the smallest enclosing circle alone follows thin parts (🎮's
-//! handles); their midpoint looked right on all 40 (contact sheet, `ui/STYLING-GUIDE.md`).
+//! handles); their midpoint looked right on all 40 (contact sheet, `ui/REPLICA.md`).
 //!
 //! `Why` the outline is baked: a half-size texture sampled down about 3 to 1 without mipmaps, drawn five times, gave
 //! a broken stair-step line; dilating the alpha at the size it is shown gives the even line the

@@ -15,7 +15,7 @@
 //!   guarantee for large overshoots); `audiodynamic` is a static compressor with no notion of a
 //!   target loudness. Neither can level.
 //! - So: ~60 lines of DSP we control. Every number below is a deliberate trade, documented at its
-//!   constant and in `superdoc/features/audio-sharing.md`.
+//!   constant and in `superdoc/features/audio/levelling-and-volume.md`.
 //!
 //! # The two stages
 //!

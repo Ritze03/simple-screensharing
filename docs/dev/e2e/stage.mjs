@@ -1,6 +1,6 @@
 // Task I6 through the REAL site UI: the browser client's stage (Split / Crop / Floating, resize bars, the control bar, the people strip with its
 // hover card, the Layout / Room / Share / stream menus, the stage pop-out, fullscreen auto-hide, the new stream settings, emoji avatars) and
-// every D1 item the native client passed ("D1 items" in superdoc/features/website.md). Real pointer input through CDP Input.dispatchMouseEvent,
+// every D1 item the native client passed ("What the stage tests cover (D1)" in superdoc/features/website/stage.md). Real pointer input through CDP Input.dispatchMouseEvent,
 // headless Chromium, a throwaway relay. Four pages: Alice, Bob and Carol share a synthetic screen each (video only: no audio stream is ever
 // created, `?fakeaudio=1` on the viewer makes every stream act as if it had audio for the ring / volume / card rows), Vera watches all three and
 // shares too, so her stage holds four tiles.

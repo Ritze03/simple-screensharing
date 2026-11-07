@@ -39,7 +39,7 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
 
 /// An unsubscribe followed by a subscribe of the same viewer within this long counts as a
 /// re-subscribe, which is how the native viewer asks for a keyframe (Unsubscribe+Subscribe,
-/// `superdoc/features/video-pipeline.md` "Viewer recovery").
+/// `superdoc/features/video/viewer-recovery.md`).
 const RESUB_WITHIN: Duration = Duration::from_secs(5);
 
 /// A connection with less UDP traffic than this per window (keep-alive pings are ~1 KB per

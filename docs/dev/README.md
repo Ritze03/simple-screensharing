@@ -58,7 +58,7 @@ docs/dev/relay.sh stop 14433
 
 `live.html` results now carry `receiver.frozen` (`{stalls, totalMs, maxMs, pctOfTime}`: gaps > 150 ms between shown frames, including a
 freeze that lasts to the end) and `receiver.nack` / `sender.nack` (`client.nackStats()`). A/B a peer with `&nack=0` (the kill switch
-reads the page URL). Recipe used for the tables in `superdoc/features/website.md` "Selective retransmission in the browser":
+reads the page URL). Recipe used for the tables in `superdoc/features/website/nack-and-big-keyframes.md` "Selective retransmission in the browser":
 a relay (own build, `relay.sh`), one UDP impairment proxy per browser leg (`lossproxy.py`, the #99/#104 throwaway that lives in the
 task scratchpads: per-client upstream socket, JSON control file with `loss`/`delay_ms`/`ge`, per direction), then
 `runPair({ relay: <sharer proxy>, viewerRelay: <viewer proxy>, extra: "&detail=2", sharerExtra: "&nack=0", viewerExtra: "&nack=0", ... })`.
@@ -79,7 +79,7 @@ No geckodriver/CDP needed: pages report back over HTTP like for Chromium. Facts 
 `VideoEncoder` accepts H.264 in `isConfigSupported` but fails at the first `encode()` ("EncodingError: The given encoding is not
 supported", no OpenH264 plugin in a fresh profile) and there is no `MediaStreamTrackProcessor`, so **Firefox cannot be the sharer**:
 `xbench.mjs` and `matrix.mjs` encode in Chromium. `optimizeForLatency: true` costs Firefox's software decoder 3.5-5x (see
-`superdoc/features/website.md` "Rendering above 60 fps"). Other workers load this machine (load average 15-40 seen): repeat a run that
+`superdoc/features/website/viewer-features.md` "Rendering above 60 fps"). Other workers load this machine (load average 15-40 seen): repeat a run that
 shows odd dips before believing it.
 
 ## End to end through the real UI and the native app (I20)
@@ -100,7 +100,7 @@ are unaffected.
 Every driver here is **video only by default**: `e2e-lib.mjs` `stubCapture` defaults to `audio: false` (it was `true`, so `browser-to-browser.mjs`, `links.mjs`,
 `sharer.mjs` and `ui-reconnect.mjs` ran the 440 Hz `AudioContext` tone in headless Chromium on the host), and `makePatternSource({ audio: true })`, `stubCapture({ audio: true })`,
 `e2e/audio-only.mjs`, `matrix.mjs --audio|--source tab` and `native.mjs --audio` throw unless **`SSS_E2E_AUDIO=1`**, which only a test-VM run sets
-(`testing-and-verification.md` "Audio tests in the VMs"). `scenarios.mjs` skips "audio follows video" and runs the stream-stop scenario without an audio stream unless
+(`superdoc/testing/vm-audio.md` "Audio tests in the VMs"). `scenarios.mjs` skips "audio follows video" and runs the stream-stop scenario without an audio stream unless
 `SSS_E2E_AUDIO=1` (it then adds `&audio=1` to the page). Chromium gets `--mute-audio` (`headless.mjs`, `cdp.mjs`) unless `SSS_E2E_AUDIO=1`. `probe.html` no longer constructs
 an `AudioContext`. `tests.js` only uses an `OfflineAudioContext` (no output device).
 *Why:* the user's no-audio-on-the-host rule; a created audio stream on the shared PipeWire can wedge it (task #48).
@@ -265,7 +265,7 @@ none; no sound is played). (190 checks when this part was added on 2026-11-04, n
 show up, decode, and with Webcam in picture the native webcam sits in the native screen's tile; then the browser shares a silent screen and its own (fake) webcam and holds them so the native viewer can watch both and show the
 browser's webcam in picture (`hs-drive.sh uclick 2 ctl.layout` + `menu.pip`). Run 2026-11-04: PASS both directions, screenshots in `E2E_OUT`.
 
-`e2e/audio-only.mjs <relay> <hash> --sender <audio-only-sender> --source <name>` **plays audio, so it runs only in a test VM** (arch-ssd, with `client/scripts/vm-audio/fakehw.sh` and `emu_src.py`; `testing-and-verification.md` "Audio
+`e2e/audio-only.mjs <relay> <hash> --sender <audio-only-sender> --source <name>` **plays audio, so it runs only in a test VM** (arch-ssd, with `client/scripts/vm-audio/fakehw.sh` and `emu_src.py`; `superdoc/testing/vm-audio.md` "Audio
 tests in the VMs"). It covers a native audio-only sender (a throwaway `audio-only-sender` package outside `client/`: `AppState::start_audio_share(room, None, ..)`, like the bar's audio button) heard by a browser (the tile, Listen,
 packets decoded, Stop listening), a browser audio-only share (`#btn-audio` with the harness' stubbed `getDisplayMedia`, only the audio kept) heard by a browser and by the native viewer (`listen` mode), and the webcam-plus-audio case.
 

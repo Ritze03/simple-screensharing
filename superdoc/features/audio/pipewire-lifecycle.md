@@ -2,6 +2,8 @@
 
 The private share sink, linking nodes by name, and surviving a source stream vanishing or being switched (#105, #117, #118, #121). Hub: `../audio-sharing.md`.
 
+The text moved here verbatim from the Audio sharing page: "above", "below", "this page" and "the #128 block" in it may point at a section that now lives in a sibling page of this folder (the hub lists them).
+
 ## 2026-11-03: the share captures a private, self-clocked null sink instead of a `pw-loopback` (task #121)
 
 > **Corrected by #128 (above):** the loopback's missing clock was not why the share broke; the null sink stays, but
@@ -159,7 +161,7 @@ have the same name, include them in the share (Combining multiple streams)."*
   after a reconnect restores the share by name). Before, a vanished source failed the start.
   Safe because the capture pipeline targets only the loopback's output serial and
   `wait_for_capture_link` still proves that link, so silence can never turn into the microphone
-  (the 2026-07-28 trap in `stream-control.md`).
+  (the 2026-07-28 trap in `features/stream/share-audio-attachment.md`).
 - **Why a name and not ids:** apps (browsers, games, music players, Discord) come and go and often hold
   several streams under one name; a node id is gone with the track or tab.
 - **Not covered:** a half-linked node (FL linked, FR `pw-link` failed) is retried and then fails

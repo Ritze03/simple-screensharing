@@ -536,7 +536,7 @@ pub fn list_audio_sources() -> Result<Vec<AudioSource>> {
     Ok(sources)
 }
 
-/// What `SSS_UI_FAKE_AUDIO_SOURCES=1` lists (`pw-dump` shaped; the replica's examples, `ui/STYLING-GUIDE.md`). Pid 777
+/// What `SSS_UI_FAKE_AUDIO_SOURCES=1` lists (`pw-dump` shaped; the replica's examples, `ui/REPLICA.md`). Pid 777
 /// stands for the process that has `SteamAppId` in its environment.
 const FAKE_SNAPSHOT: &str = r#"[
  {"id":901,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Skill Up!.exe","application.name":"Skill Up!.exe","application.process.binary":"wine64-preloader","application.process.id":777,"object.serial":1901}}},
@@ -1727,7 +1727,7 @@ impl AudioCaptureHandle {
 /// anything to the relay. It exists purely so the "Add audio"/"Switch"
 /// dropdown can show a live meter next to each option, so the user can tell
 /// which running application is actually making sound before picking it —
-/// see `superdoc/features/stream-control.md` for the feature this backs.
+/// see `superdoc/features/stream/share-audio-attachment.md` for the feature this backs.
 ///
 /// # Why a separate, much simpler pipeline than [`AudioCaptureHandle`]
 ///

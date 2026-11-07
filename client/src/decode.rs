@@ -216,7 +216,7 @@
 //! difference from the two streams' capture PTS (one sender clock, `sender_clock_epoch`), and the
 //! result is added to the lead: [`AudioTimeline`] re-bases once whenever the smoothed delay
 //! changes. Audio-only listening has no video peer and gets no extra delay. Why and limits:
-//! `superdoc/features/audio-sharing.md`.
+//! `superdoc/features/audio/sync-and-clocks.md`.
 //!
 //! ## Pipeline
 //!

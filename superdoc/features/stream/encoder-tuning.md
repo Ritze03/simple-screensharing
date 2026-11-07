@@ -49,7 +49,7 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   figure is only a self-heal ceiling, a shorter interval stays conformant, it costs bitrate and buys a
   faster join/recovery). The webcam (task I8) is fixed to Performance and 2000 ms (`EncodeChoice::webcam`, see
   "Webcam capture" above).
-- **Encoding and Keyframe are editable again (2026-11-04):** the modal shows Encoding (quality level) and Keyframe (`gop_millis`) as editable fields next to the Preset; reasoning in `ui/APP-SHELL.md` "Video card: Encoding and Keyframe".
+- **Encoding and Keyframe are editable again (2026-11-04):** the modal shows Encoding (quality level) and Keyframe (`gop_millis`) as editable fields next to the Preset; reasoning in `ui/SHARE-FLOW.md` "Video card: Encoding and Keyframe".
 - **Removed:** `EncoderProfile` (and `EncoderBackend::tune_applies`, `quality_effect`,
   `visible_quality_levels`, `display_quality_level`, `EncoderPreset::visible_for/detect_for`): the twin hiding
   they drove (#95) is moot with three presets that are distinct on every backend. The "hide a setting that

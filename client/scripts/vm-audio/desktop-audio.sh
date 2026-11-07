@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs INSIDE a test VM (task I7; superdoc testing-and-verification.md "Audio tests in the VMs"): desktop audio,
+# Runs INSIDE a test VM (task I7; superdoc/testing/vm-audio.md "Audio tests in the VMs"): desktop audio,
 # the exclusion list, audio-only shares and the source groups against real PipeWire streams.
 # usage: desktop-audio.sh LABEL SCENARIO         (Firefox must already play ~/t/tone.html: ff-setup.sh; fakehw.sh first)
 # SCENARIO

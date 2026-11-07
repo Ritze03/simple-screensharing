@@ -1006,7 +1006,7 @@ pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
 /// the green presence dot when `presence`. The strip, the hover card, tiles, menus and the user band all call
 /// this. `emoji` ("" = none; look it up with [`Cx::emoji_of`]) replaces the initial and sets the
 /// background from its own colour; otherwise the colours are a pure function of the display name
-/// (`theme::avatar_colors`, `APP-SHELL.md` "Avatar colour").
+/// (`theme::avatar_colors`, `STYLING-GUIDE.md` "Avatar colour").
 pub fn paint_person(ui: &Ui, rect: Rect, name: &str, emoji: &str, presence: bool) {
     let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
     widgets::paint_avatar_emoji(ui, rect, emoji, &initial, theme::avatar_colors(name), presence);

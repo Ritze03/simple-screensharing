@@ -42,7 +42,7 @@ restarts, branch flow errors, rate-control restarts, codec fallbacks, no-IDR, vi
 whether the viewer kept a picture. The rig must be up with `HS_PATTERN=none` plus a pattern started through `hs-rig.sh run -- python3 hs-pat-photo.py FPS PIDFILE`:
 `hs-pat-photo.py` is a detailed desktop of smooth colour with grain and a moving window (needs ~935 kB keyframes at 1080p 60 fps
 Quality: the hard case for `vaav1enc`'s coded buffer), `hs-pat-gray.py` the same with 7-gray 3x3 blocks, which a palette encoder
-shrinks 8x (see `features/stream-control.md` "Settings changes on a live share"). `SSS_VAENC_EXTRA="min-qp=90,mbbrc=1"` in a client's
+shrinks 8x (see `features/stream/encoder-failures.md` "Settings changes on a live share"). `SSS_VAENC_EXTRA="min-qp=90,mbbrc=1"` in a client's
 environment appends encoder properties (commas become spaces).
 `hs-rig.sh status` lists processes/outputs/windows, `hs-rig.sh run -- CMD...` runs CMD inside
 the rig's environment (`grim`, `swaymsg`, `wtype`, `busctl`, ...).
@@ -125,7 +125,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | --- | --- |
 | `launch-lib.sh` | build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language; `START_CODEC/FPS/KBPS` the stream form). Its monitor/window-placement functions (`hyprctl` on Hyprland, `mmsg` on MangoWC) are legacy. |
 | `gst-rate.py` | buffers/s per pad from the tracer log (`--summary`: capture / encode-branch input / encoder output) |
-| `portal-probe.py` | own ScreenCast portal session, rate of `pipewiresrc` into a chosen tail (run it with `hs-probe.sh`). `--src` adds pipewiresrc properties, `--watch` prints buffers/s of named tail elements. Use a tail that starts with a video caps filter (`video/x-raw ! ...`), never a bare `fakesink` (see its docstring). #39 found the 140 fps portal ceiling with it, see `superdoc/features/stream-control.md` "Capture/encode performance" |
+| `portal-probe.py` | own ScreenCast portal session, rate of `pipewiresrc` into a chosen tail (run it with `hs-probe.sh`). `--src` adds pipewiresrc properties, `--watch` prints buffers/s of named tail elements. Use a tail that starts with a video caps filter (`video/x-raw ! ...`), never a bare `fakesink` (see its docstring). #39 found the 140 fps portal ceiling with it, see `superdoc/features/stream/capture-pipeline.md` "Capture/encode performance" |
 | `enc-bench.sh` | raw `vah264enc`/`vah265enc`/`vaav1enc` throughput at 1080p (no desktop involved). Optional env (#92): `SRC=file.nv12` reads raw 1920x1080 NV12 instead of `videotestsrc` (which is CPU-bound at ~180 fps on a loaded box and caps every encoder; FRAMES must not exceed the file's frames * `SRC_REPEAT`; `SRC_FPS`, default 60, is the clip's rate), `SRC_REPEAT=N` plays the file N times, `OUT=file` also writes the encoded stream (for a PSNR/bitrate check against `SRC`). The recipe, with the `ffmpeg` PSNR line, is in the script header |
 | `pw-node-rate.sh` | rate of a PipeWire node (against whatever PipeWire the env points at) |
 | `stop-launch.sh` | stop what a legacy launch scratch dir started |
@@ -154,7 +154,7 @@ and `drive.sh`, still use `mmsg` and only work on MangoWC.
   found no matching target. Causes seen: a bare `fakesink` tail (caps ANY, see above); the portal
   node already gone because xdpw crashed (check `$SCRATCH/xdpw.log` for `Protocol error`).
 - Share hangs ~30 s on the user's shared PipeWire with a stuck native stream: see
-  `superdoc/features/stream-control.md` "Capture/encode performance" (task #48). The private
+  `superdoc/features/stream/capture-pipeline.md` "Capture/encode performance" (task #48). The private
   PipeWire of the rig is immune.
 - `hs-rig.sh up` failed half way: it tears itself down; logs stay in `$SCRATCH`
   (`sway.log`, `xdpw.log`, `xdp.log`, `wireplumber.log`, `client1.log`, `relay.err`).
@@ -165,4 +165,4 @@ never `pkill` by name (it matches other workers' processes), only recorded proce
 
 ## vm-audio/ (real audio tests, inside the test VMs only)
 
-Scripts for the shared-audio soak in the `arch-ssd` / `fedora-ssd` VMs (`host-run.sh`, `vm-sync.sh` on the host; `soak.sh`, `ff-setup.sh`, `fakehw.sh`, `emu_src.py`, `watch.py`, `probe.py` + `probe-run.sh` (the capture chain alone under graph changes, #128), `probe-view.py` + `probe-view-run.sh` (the viewer's playback tail) in the VM; `analyze.py`, `summary.py`, `phases.py`, `pps.py`, `pktdump.py` (decodes an `SSS_AUDIO_DUMP` packet file) on the recordings). Never run on the host (no audio streams there). Method: `superdoc/claude-instructions/testing-and-verification.md` "Audio tests in the VMs".
+Scripts for the shared-audio soak in the `arch-ssd` / `fedora-ssd` VMs (`host-run.sh`, `vm-sync.sh` on the host; `soak.sh`, `ff-setup.sh`, `fakehw.sh`, `emu_src.py`, `watch.py`, `probe.py` + `probe-run.sh` (the capture chain alone under graph changes, #128), `probe-view.py` + `probe-view-run.sh` (the viewer's playback tail) in the VM; `analyze.py`, `summary.py`, `phases.py`, `pps.py`, `pktdump.py` (decodes an `SSS_AUDIO_DUMP` packet file) on the recordings). Never run on the host (no audio streams there). Method: `superdoc/testing/vm-audio.md` "Audio tests in the VMs".
