@@ -153,7 +153,7 @@ impl HRow {
     }
 }
 
-/// Equal-width contained columns (the styling guide's `theme::columns`): `n` columns of
+/// Equal-width contained columns (the reference guide's `theme::columns`): `n` columns of
 /// `(avail − gap·(n−1)) / n`, each a child `Ui` clipped to its column; the parent
 /// advances by the tallest. Use for page splits, e.g. the stream-settings modal body.
 pub fn columns<R>(ui: &mut Ui, n: usize, gap: f32, add: impl FnOnce(&mut [Ui]) -> R) -> R {

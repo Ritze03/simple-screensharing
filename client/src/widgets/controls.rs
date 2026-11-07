@@ -597,7 +597,7 @@ enum Mark {
     Radio,
 }
 
-/// Shared checkbox/radio renderer (the styling guide's `mark_ui`, mockup `.cbx`): an 18 px
+/// Shared checkbox/radio renderer (the reference guide's `mark_ui`, mockup `.cbx`): an 18 px
 /// mark + 8 px gap + 12.5 px label, 32 px tall, whole row clickable with a hover wash
 /// that extends 8 px left/right. Content-sized (never wider than the space left).
 fn mark_ui(ui: &mut Ui, on: bool, label: &str, enabled: bool, shape: Mark) -> Response {
@@ -605,7 +605,7 @@ fn mark_ui(ui: &mut Ui, on: bool, label: &str, enabled: bool, shape: Mark) -> Re
     let text_w = if label.is_empty() { 0.0 } else { super::text_width(ui, label, f.clone(), 0.0) + theme::S2 };
     // Never wider than the space the row has; in a wrapping layout the limit is the
     // whole line, so an option that doesn't fit moves to the next line instead of
-    // truncating (the styling guide's `mark_ui` rule).
+    // truncating (the reference guide's `mark_ui` rule).
     let limit = if ui.layout().main_wrap { ui.max_rect().width() } else { ui.available_size_before_wrap().x };
     let w = (theme::MARK + text_w).min(limit.max(theme::MARK));
     let sense = if enabled { Sense::click() } else { Sense::hover() };
@@ -805,7 +805,7 @@ pub fn value_box_with<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// An editable numeric value box: looks like [`value_box`]; drag horizontally to change
 /// by `step`, click to type (Enter / focus loss commits, Escape cancels). The slider
-/// row's value preview — "the exact value can still be typed" (styling guide).
+/// row's value preview — "the exact value can still be typed" (reference guide).
 pub fn num_box<N: egui::emath::Numeric>(
     ui: &mut Ui,
     value: &mut N,
