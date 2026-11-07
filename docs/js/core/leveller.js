@@ -10,7 +10,7 @@
 //     callback is not;
 //   - no extra latency: the frame is already buffered (the playout delay), no lookahead is added.
 // Why not a loudness normaliser with seconds of lookahead: it would add that much delay to a live
-// stream with a picture. See superdoc/features/audio-sharing.md.
+// stream with a picture. See superdoc/features/audio/levelling-and-volume.md.
 
 /** Short-term RMS the AGC aims at, dBFS (about -16 LUFS for typical stereo content). */
 export const TARGET_DB = -18;

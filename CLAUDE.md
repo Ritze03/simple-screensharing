@@ -4,7 +4,7 @@ Friends screensharing platform, one monorepo (Cargo workspace on `master`):
 `client/` (native Rust/egui desktop app: capture, encode, decode, UI), `server/` (Rust QUIC/WebTransport
 relay with a ratatui TUI), `protocol/` (shared wire crate), `docs/` (the GitHub-Pages browser client,
 watch and share; `docs/js/core` protocol+media core, `docs/js/ui` UI, `docs/dev` test harness) and
-`superdoc/` (this knowledge base). Orientation: `README.md`, then `superdoc/architecture/overview.md`.
+`superdoc/` (this knowledge base). Orientation: `README.md`, then `superdoc/architecture/overview.md` (index of all pages: `superdoc/README.md`).
 
 <!-- superdoc:start v4 -->
 ## Docs: read before you touch, update after you change
@@ -17,6 +17,8 @@ Reference docs — plain links, read the one relevant to your task on demand:
 
 - **`superdoc/architecture/overview.md`** — codebase navigation map (module map, data flow,
   "where to look for X"). **Start here to navigate the code.**
+- **`superdoc/README.md`** — index of every doc page, folder by folder (architecture, features,
+  ui, testing, brainstorm, rules). Read it to find the page for a topic.
 
 ## Always in context (force-loaded, mandatory)
 

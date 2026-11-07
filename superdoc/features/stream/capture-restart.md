@@ -123,7 +123,7 @@ Option 2 is a later improvement.
 **UI (sharer).** The pill reads *Recovering* (`PillKind::Progress`, `ui.pill.recovering`) and
 the action bar title *Screen capture lost - Restarting the screen capture* (since I3 the same lines are the recovering pill and note in the Share menu, `share::share_menu`); the tooltip has the
 attempt number, the countdown to the next attempt and the last error. The room tile chip reads
-RECOVERING. `ui/APP-SHELL.md`.
+RECOVERING. `ui/SHARE-FLOW.md`.
 
 ### Sender keyframe redundancy (#97)
 
@@ -274,7 +274,7 @@ small too would mean taking over the GOP (`key-int-max` large, the pump forcing 
 absolute numbers understate the field problem; the 30-100 s recoveries were not reproduced.
 
 **Browser sharer** (`docs/js/core`): ported in #103 (rate pacing only; no repeats exist there, and WebCodecs
-has no equivalent of the `bitrate` write): `features/website.md` "Big keyframes in the browser sharer".
+has no equivalent of the `bitrate` write): `features/website/nack-and-big-keyframes.md` "Big keyframes in the browser sharer".
 
 ### Audio watch teardown no longer holds the video lock (#97, latent)
 

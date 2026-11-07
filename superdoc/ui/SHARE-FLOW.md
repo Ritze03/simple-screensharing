@@ -15,7 +15,7 @@ How a share starts, what the stream-settings modal shows, the screen-or-gamescop
   behaviour (LIVE and "Stop sharing" for the whole teardown, up to ~15 s on a stuck VA branch)
   was reported by a user as "it just stays open". No separate "Stopping..." indicator: the
   teardown is invisible by design, and the info-level `capture stopped in N ms` log line is how
-  a slow one is found. `features/stream-control.md` "Stop is instant".
+  a slow one is found. `features/stream/capture-restart.md` "Stop is instant".
 - **Recovering (2026-11-02, #99).** While `AppState::recovery(capture)` is `Some`, the sharer's
   pill for that capture's destinations is *Recovering* (`PillKind::Progress`, `ui::share::recovering_pill`, shown in the
   Share menu's header and per-room rows) and the Share menu carries a note made by `ui::share::recovering_tip`: the
@@ -36,7 +36,7 @@ shown), never gets it. *Why:* it used to fire inside `UiAction::GoLive`, so a sh
 start showed "Live in Test" above the "Share error" toast (a run on a machine with a missing
 GStreamer element). Test: `live_in_toast_fires_once_per_on_air_spell`.
 
-**Note (2026-11-04, plan D8; rewritten 2026-11-07):** the presets are **Text / Quality / Gaming** (they set the FPS once, the encoder mode and the keyframe interval); the Advanced tuning rows (Tune, Quality level, the Advanced disclosure) and the Balanced / Low-Latency presets are gone, and the modal's right-hand cards are Compression and Video (`features/stream-control.md` "Presets", `REPLICA.md` "Stream settings and webcam"). The 2026-11-01 reasoning about what to hide is under History at the end of this page; the rule it came from is "Hide anything that does nothing" in "Behavioural rules that carried over" (`APP-SHELL.md`).
+**Note (2026-11-04, plan D8; rewritten 2026-11-07):** the presets are **Text / Quality / Gaming** (they set the FPS once, the encoder mode and the keyframe interval); the Advanced tuning rows (Tune, Quality level, the Advanced disclosure) and the Balanced / Low-Latency presets are gone, and the modal's right-hand cards are Compression and Video (`features/stream/encoder-tuning.md` "Presets", `REPLICA.md` "Stream settings and webcam"). The 2026-11-01 reasoning about what to hide is under History at the end of this page; the rule it came from is "Hide anything that does nothing" in "Behavioural rules that carried over" (`APP-SHELL.md`).
 
 **Video card: Encoding and Keyframe (2026-11-04).** The card's order is Preset, FPS, Encoding, Keyframe, caption (FPS moved under Preset 2026-11-05). Encoding and Keyframe are the two values a preset sets besides the FPS:
 **Encoding** (`widgets::segmented`, Performance | Quality, `ui.stream.ql_*`; dump rects `quality.0` / `quality.1`, value `quality`) and
@@ -58,5 +58,5 @@ keeps the card's height.
 `Modal::SharePick { room, auto, node }` (`ui/modals.rs` `share_pick`, a small question in the `LeaveConfirm` style): body text naming the node, two
 body buttons **Screen** and **Gamescope** (dump rects `share_pick.screen`, `share_pick.gamescope`), footer Cancel. Raised by the Share main button
 (`auto`) and the menu entry alike, after a per-click `pw-dump` look-up (`Shell::gamescope_probe`, polled by `poll_staged`, repaint every 30 ms while it
-runs); no node means no modal and no visible delay. Answers push `UiAction::SharePicked`. Backend and *why*: `features/stream-control.md`
+runs); no node means no modal and no visible delay. Answers push `UiAction::SharePicked`. Backend and *why*: `features/stream/capture-sources.md`
 "Sharing gamescope directly". Rig: `hs-drive.sh sharepick screen|gamescope`, or `SHARE_PICK=` on `share`/`shareauto`.

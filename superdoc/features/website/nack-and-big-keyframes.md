@@ -4,7 +4,7 @@ Selective retransmission and big keyframes in the browser sharer. Part of the br
 
 ## Big keyframes in the browser sharer (task #103, 2026-11-03)
 
-The native sharer's #102 (`features/stream-control.md` "Big keyframes") applies here too: a frame is lost if any
+The native sharer's #102 (`features/stream/capture-restart.md` "Big keyframes") applies here too: a frame is lost if any
 fragment is, and a 1 MB IDR is ~1000 datagrams. `docs/js/core/fragment.js` `pacePlan` is a line-for-line port of
 native `pace_plan` (same constants and tests: keyframe window `max(min(60 ms, 4 frame periods), bytes / (2.5 x
 configured bitrate))`, deltas paced only above 2 frame periods, cap 600 ms, chunks every 2 ms); `RoomClient#sendMedia`
@@ -40,7 +40,7 @@ size, not survival odds), a hidden-tab sender, other browsers (Chromium only can
 
 ## Selective retransmission in the browser (NACK, task #111, 2026-11-03)
 
-The browser half of #104 (design and the why of every choice: `architecture/protocol-spec.md` 6.6, `features/video-pipeline.md`
+The browser half of #104 (design and the why of every choice: `architecture/protocol-spec.md` 6.6, `features/video/selective-retransmission.md`
 "Selective retransmission"; API and constants: `docs/js/core/README.md`). Why it matters more here than on native: before it,
 a browser viewer **never recovered** from random loss once the sharer's IDRs were ~1 MB (1000 datagrams): every keyframe it
 asked for died the same way. Measured below, a browser viewer at 0.1 % loss decoded 0 fps for 30 s.
@@ -105,7 +105,7 @@ waiting for its repair holds the stream, and the jitter buffer then grows. The o
 usual keyframe request. Extra upstream cost: the re-sent fragments, ~the loss rate.)
 
 Mixed versions (browser peers; "old relay" = the pre-#104 server built from `facc373`; 0.3 % / 0.5 % loss, 30 s):
-see `features/video-pipeline.md` "Mixed versions" for the table with the native rows.
+see `features/video/selective-retransmission.md` "Mixed versions" for the table with the native rows.
 
 Native interop in the headless rig (relay + native clients built from this branch; the browser peer joins the rig's room
 through a loss proxy; evidence in `w111/`):

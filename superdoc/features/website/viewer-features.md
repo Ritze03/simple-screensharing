@@ -6,7 +6,7 @@ Sounds, emoji avatars, decode-error clearing, double-click fullscreen, own-tile 
 
 Settings > **Sounds** has one volume (0-100, step 5, default 50, `settings.soundVol` in `localStorage`, applied live while the slider is dragged) and a Test button per
 sound, like native. The four sounds (someone joins / leaves one of my streams, someone else starts / stops one), their edge rules and the *why* are on
-`features/audio-sharing.md` "Notification sounds"; the browser code is `docs/js/ui/sounds.js` (`SOUNDS`, `soundPlan`, `RoomSounds`, `Gate`, `SoundOut`), a port of native
+`features/audio/desktop-audio.md` "Notification sounds"; the browser code is `docs/js/ui/sounds.js` (`SOUNDS`, `soundPlan`, `RoomSounds`, `Gate`, `SoundOut`), a port of native
 `client/src/sounds.rs` with the same tests in `dev/tests.js`. Rules specific to the browser:
 
 - **An `AudioContext` is created only when a sound is really played**, never at boot or on a click, so a page that a script drives never touches the audio output (the dev
@@ -50,7 +50,7 @@ The native viewer has no such tile message, so nothing changed there.
 
 ## Double-click fullscreen and avatar colours (task #77, 2026-10-15)
 
-Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`, `superdoc/ui/STYLING-GUIDE.md`).
+Both user requests, mirrored from the native client (`superdoc/ui/STAGE.md`, `superdoc/ui/STYLING-GUIDE.md`).
 
 - **Double-click a watched tile = fullscreen** (`app.js` `doFullscreen`), double-click again or Esc = back. It was "pop out"
   before (the button still pops out). It reuses the pop-out's fullscreen *stage* (`popout.js` `popOut(w, onBack, "fullscreen")`):

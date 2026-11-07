@@ -22,7 +22,7 @@ settings out of the way until asked. Its tokens are under "stage redesign" at th
 constants (`STAGE_*`, `STRIP_*`, `STAGE_CHROME`, `OVL_NUM`). Decisions worth keeping: a popped-out stream shows **only** as a
 badge on its owner's avatar (click brings it back); the green ring means audible shared audio, because the app has no voice
 chat; Split and Crop share one grid (row count that shows the most picture area), Crop only fills the cells; resizing in
-those two is by splitters, so an even grid stays one double-click away. Where the code lives: `APP-SHELL.md` "The stage",
+those two is by splitters, so an even grid stays one double-click away. Where the code lives: `STAGE.md` "The stage",
 "The control bar", "The people strip and hover card", "Menus and dropdowns", "The whole stage can pop out". The **Classic**
 views (the pre-stage layout) are not in the app any more: the replica keeps them only for side-by-side comparison.
 

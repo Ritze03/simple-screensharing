@@ -6,7 +6,7 @@
 //! left, with the numbers of the Layout menu's "Show stats" (one switch for every stream) appended in reserved, tabular slots, and three round buttons at the
 //! top right: Pop out, Fullscreen and `⋯` (the stream menu, [`tile_menu`]). "Always show names" keeps the tag
 //! without hovering; the numbers and the buttons never stay. A right click on any tile opens the same menu.
-//! Volume, level loudness and Stop watching live in that menu, not in a pill over the picture.
+//! Volume and Stop watching live in that menu (level loudness is the control-bar button), not in a pill over the picture.
 //! *Why:* the user's call from the replica (the stage should be a clean picture until asked), and "a stream's
 //! buttons and stats show only while it is hovered" (D1).
 //! Decoder stats (and the decoder lock for the bitrate) are only read while the numbers are visible.

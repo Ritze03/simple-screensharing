@@ -23,7 +23,7 @@ Found by I19 in a real two-client run.
   card. `Why only 30 s (not the reconnect's 60 s):` a deliberate stop is not an outage; minutes later an
   automatic subscribe would be a surprise. A user's own "stop watching" never queues a resume.
   Separate from `rewatch` because each entry has its own deadline and a different cause.
-- **AV1 1080p arrives as 1082 lines.** See `features/video-pipeline.md` ("Visible size"): the
+- **AV1 1080p arrives as 1082 lines.** See `features/video/decode-and-display.md` ("Visible size"): the
   sender (VCN4) really encodes 1082 lines with no render size; the receiver crops to the announced
   size.
 - **Staged "Set up your stream" modal: the meter never moved.** Level taps exist only after

@@ -2,7 +2,7 @@
 # HOST side: run one soak in a test VM and analyze it.
 # usage: host-run.sh PORT LABEL SCENARIO [SECS]     PORT: 2223 = fedora-ssd, 2224 = arch-ssd (libvirt portForward)
 # Needs the source in the VM (vm-sync.sh) built there, Firefox playing the tone page (ff-setup.sh), see
-# superdoc/claude-instructions/testing-and-verification.md "Audio tests in the VMs".
+# superdoc/testing/vm-audio.md "Audio tests in the VMs".
 port=$1; label=$2; scen=$3; secs=${4:-60}
 D=$(cd "$(dirname "$0")" && pwd); O=${OUT_DIR:-$PWD/.tl-scratch/vm-audio}/$label
 mkdir -p "$O"

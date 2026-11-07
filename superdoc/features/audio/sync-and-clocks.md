@@ -2,6 +2,8 @@
 
 Keeping audio aligned with video (viewer-side delay) and why shared audio broke after a pause/resume (two clocks #128, dither #129, #125, #123). Hub: `../audio-sharing.md`.
 
+The text moved here verbatim from the Audio sharing page: "above", "below", "this page" and "the #128 block" in it may point at a section that now lives in a sibling page of this folder (the hub lists them).
+
 ## 2026-11-03: "static when nothing is playing" was the sender's dither (task #129)
 
 User report after #128 ("Nice now it's really fixed", but "there's some static when nothing is playing"). Measured
@@ -284,7 +286,7 @@ Two user reports on master with #121: *"selecting my browser as an audio source 
 and *"pausing and unpausing still breaks"* the shared audio (viewers hear broken audio until the source is
 re-selected). Both were reproduced and measured for real, in the two test VMs (Arch: PipeWire 1.6.10 /
 WirePlumber 0.5.18; Fedora 44: PipeWire 1.6.2 / WirePlumber 0.5.13; both GNOME/Wayland, Firefox 159, EasyEffects
-8.2.8 on the Fedora one), see `claude-instructions/testing-and-verification.md` "Audio tests in the VMs".
+8.2.8 on the Fedora one), see `testing/vm-audio.md` "Audio tests in the VMs".
 
 ### 1. The video paused because WirePlumber pauses players when a sink goes away
 

@@ -1,5 +1,5 @@
 // Viewer-side audio/video sync, the browser twin of client/src/decode/avsync.rs (same constants, same maths).
-// Write-up with the why: superdoc/features/audio-sharing.md.
+// Write-up with the why: superdoc/features/audio/sync-and-clocks.md.
 //
 // All of one sender's streams stamp wire PTS from one clock (capture time), so a video frame and an audio packet
 // captured together have equal PTS. The viewer does not know that clock's offset to its own, and does not need to:

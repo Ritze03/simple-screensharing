@@ -44,7 +44,8 @@ Spec: `protocol-spec.md` §11. What was decided while building it, and why:
   reporting the old hash until it reconnects (no protocol message announces rotation).
 - **Relay cleanup done in passing:** `server/src/protocol.rs` no longer wraps
   `MediaHeader`/`PreviewHeader` — the relay uses the shared crate's types directly.
-- **Verification gap noticed:** `client/src/end_to_end_test.rs::server_repo_candidates` still
-  looks for the relay binary under the old multi-repo layout
-  (the old per-repo `simple-screensharing-server/target/...`), so its
-  `--ignored` tests cannot find the monorepo's `target/` binary without help.
+- **Verification gap noticed, since closed:** `end_to_end_test.rs::server_repo_candidates` looked for the
+  relay binary under the old multi-repo layout (the old per-repo `simple-screensharing-server/target/...`), so
+  its `--ignored` tests could not find the monorepo's `target/` binary. It no longer exists: `server_binary_path`
+  takes `SSSHARE_SERVER_BIN` if set, otherwise the newer of `release`/`debug` under `server_target_dir`
+  (`CARGO_TARGET_DIR`, else `<workspace>/target`), and fails with a "build it first" error.

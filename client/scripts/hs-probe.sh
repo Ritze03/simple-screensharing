@@ -9,7 +9,7 @@
 #   default TAIL: "video/x-raw ! fakesink sync=false". The caps filter matters: with a bare
 #   `fakesink` pipewiresrc negotiates ANY caps, its PipeWire node gets media.class
 #   Stream/Input/Unknown and WirePlumber refuses to link it to the Video/Source ("target not
-#   found"). Default --src is "min-buffers=8" (see stream-control.md: the 2-buffer default pool
+#   found"). Default --src is "min-buffers=8" (see features/stream/capture-pipeline.md: the 2-buffer default pool
 #   halves the rate once anything holds a buffer).
 # Needs a running rig with HS_PATTERN=vkcube (an idle output delivers no frames).
 

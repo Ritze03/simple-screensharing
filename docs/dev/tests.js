@@ -820,7 +820,7 @@ test("video receiver: on the first decoder overload a Gecko-style receiver re-co
 });
 
 // A MOCK of an unforgiving decoder, for regression tests only: it proves what reaches decode(), not how a phone behaves. It fails for good on
-// every broken reference, where real ones do so on some (see website.md "Phone decoder failures"). `timestamp` is its oracle, independent of the parser:
+// every broken reference, where real ones do so on some (see features/website/phone.md "Phone decoder failures"). `timestamp` is its oracle, independent of the parser:
 // frames are numbered 1 ms apart, so a delta that is not exactly one step after the last submitted frame stands on a broken reference.
 function strictDecoder() {
   const log = { errors: [], configs: [], decoded: [], created: 0 };

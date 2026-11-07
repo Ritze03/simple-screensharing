@@ -6,7 +6,7 @@ Part of the Stream Control reference, hub: `superdoc/features/stream-control.md`
 
 ## Sharing audio: an attachment on a screen share's card
 
-> **Superseded in part 2026-11-04 (task I7, plan D9; `features/audio-sharing.md`):** audio is no longer an attachment on a screen share. The audio button of the
+> **Superseded in part 2026-11-04 (task I7, plan D9; `features/audio/desktop-audio.md`):** audio is no longer an attachment on a screen share. The audio button of the
 > control bar is independent of the screen: no "+ Add audio on a card", no "paired with video" invariant (`start_audio_share(room, None, ..)` is what the UI
 > always passes; `for_capture: Some(..)` survives for a share paired with a screen, whose Stop then stops the audio too). Stopping the screen leaves the audio
 > running. A viewer sees an audio-only sender as a **Listen** tile (`Watch` is for video; a sender with a screen still gets its audio with the watch,
@@ -125,7 +125,7 @@ its *presentation* is bundled.)
   dropout.
 - **Boost (#114):** `volume name=gain` + `rglimiter name=limiter` in F32 *before* the mute and the meter
   (`audio::GAIN_STAGE`), set live by `AudioCaptureHandle::set_gain` from the audio settings menu (Settings > Shared audio until 2026-11-04); an
-  `audioconvert` after the meter takes it back to S16 for `opusenc`. `features/audio-sharing.md` (2026-11-03,
+  `audioconvert` after the meter takes it back to S16 for `opusenc`. `features/audio/levelling-and-volume.md` (2026-11-03,
   task #114): why sender-side, why the limiter is bypassed at 100 %. The calibration was removed and the boost capped at 200 % in #119; viewers level loudness themselves (`leveller.rs`).
 - **Stop:** plain `stop_destination(<audio destination id>)`; an audio capture always has exactly
   one destination, so it stops that capture only and the screen share is untouched.
@@ -147,7 +147,7 @@ its *presentation* is bundled.)
   logic in `link_diff`). One loopback, one pipeline, one encoder: nothing restarts. Zero matching
   streams = a silent share (the capture only ever reads the loopback output, so never the
   microphone). The choice is not persisted anywhere (the `AudioChoice` is
-  in-memory), so there is no settings back-compat. Details and *Why*: `features/audio-sharing.md`.
+  in-memory), so there is no settings back-compat. Details and *Why*: `features/audio/desktop-audio.md`.
 - **Real playback measurement** (viewer volume 0/100/200 % gave +0.0/+2.7/+6.5 dB at the speakers)
   is recorded with its decorrelated-noise rationale in `superdoc/features/video-pipeline.md`
   ("Audio follows video").

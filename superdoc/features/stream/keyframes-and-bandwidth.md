@@ -68,7 +68,7 @@ holds nothing back (on loopback it is ~37 kB, harmless at RTT 0); loss and the N
 | Keyframe 1000 ms | 600-700 kB | 140-180 ms | 1/s | a longer stall: the size grows with the interval |
 | Keyframe 8 s (H.264, temporary override, 0.1 % loss) | 0.9-1.5 MB | 291 ms | every 8 s | much longer stall; fall-back to 2.5x makes it worse |
 | squeeze every IDR (#102's `bitrate` write) | 27-57 kB (#102) | about 10-20 ms, estimated | 4/s | -2 dB static, -4..-6 dB detail on each keyframe: a visible pulse; radeonsi quirk, not measured here |
-| playout buffer on the viewer | unchanged | hidden | | added latency of about the stall (~70 ms at Gaming on this line, ~180 ms at 1000 ms), dynamic; **built in row 136**, measured in `video-pipeline.md` "Playout buffer" |
+| playout buffer on the viewer | unchanged | hidden | | added latency of about the stall (~70 ms at Gaming on this line, ~180 ms at 1000 ms), dynamic; **built in row 136**, measured in `features/video/playout-buffer.md` |
 
 A faster uplink fixes it too: at 100 Mbit/s the same keyframe costs ~20 ms plus decode.
 
@@ -80,7 +80,7 @@ so an AV1 frame too big for the encoder looks like the trigger; a `bitrate` writ
 **`video timing` log lines (permanent, info, one per 10 s and stream, near-zero cost).** Sender (`SendTiming`,
 `capture.rs`): the settings in use, keyframe interval, sizes of keyframes / the 3 frames behind them / other deltas,
 `pts_gap_ms`, `enc_gap_ms`, `enc_late_ms` (pulled minus capture PTS above the window's floor: an IDR's extra encode time),
-`pump_hold_ms`, `quinn_queue_max_kB`, path stats. Viewer: `features/video-pipeline.md` "Timing report". Every figure is
+`pump_hold_ms`, `quinn_queue_max_kB`, path stats. Viewer: `features/video/decode-and-display.md` "Timing report". Every figure is
 `median/p99/max`, split `key` / `after` (3 frames behind a keyframe) / `other`. `pts_unix_floor_us` on both sides: with both clients on one
 machine their difference is the shortest capture-to-complete time.
 

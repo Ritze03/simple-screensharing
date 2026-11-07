@@ -44,7 +44,7 @@ SW: appsrc ! {h264,h265,av1}parse ! {avdec_h264,avdec_h265,av1dec} ! videoconver
   **playout buffer** below holds encoded access units for a measured delay. `PacingState` stays
   unwired as a `pub` building block.
 
-**A keyframe is a freeze, not a latency step (row 129, 2026-11-04).** The viewer cannot show a keyframe's picture before its last fragment arrives and the presenter is latest-only, so the sharer's keyframe pacing window shows up 1:1 as a freeze of the picture (decoder-output gap = pump hold + ~13 ms IDR decode; relay, upload and the rest measured at 1-2 ms on loopback). On a real line the sender's uplink sets that window, not the pump (row 133): `features/stream-control.md` "Keyframe stutter on the real machine".
+**A keyframe is a freeze, not a latency step (row 129, 2026-11-04).** The viewer cannot show a keyframe's picture before its last fragment arrives and the presenter is latest-only, so the sharer's keyframe pacing window shows up 1:1 as a freeze of the picture (decoder-output gap = pump hold + ~13 ms IDR decode; relay, upload and the rest measured at 1-2 ms on loopback). On a real line the sender's uplink sets that window, not the pump (row 133): `features/stream/keyframes-and-bandwidth.md` "Keyframe stutter on the real machine".
 
 **Output:** zero-copy `Arc<DecodedFrame>` (Y and UV slices of the mapped buffer, strides,
 `pts_us`, `YuvMatrix`, `full_range`) published into a latest-only slot. Consumers hold a
@@ -121,7 +121,7 @@ The leading suspect is the video engine, shared with the viewer's own share: the
 AV1, Quality, 120 fps (the running share's settings and the remote sharer's codec and resolution were not read),
 and on VCN 4.0 hardware the kernel moves every AV1 encode and decode job to instance 0
 (`drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c`, `vcn_v4_0_limit_sched`; H.264/H.265/VP9 may use either).
-Quality is AV1's half-speed band (~152 fps raw, `stream-control.md` "`target-usage` is a bitfield
+Quality is AV1's half-speed band (~152 fps raw, `features/stream/vaapi-target-usage.md` "`target-usage` is a bitfield
 on Mesa AMD"), so 120 fps would be ~80 % of that instance.
 
 - For: the encoder thread was ~95 % in GPU waits in the same stretches, and slow stretches happened
@@ -175,7 +175,7 @@ frame's figure, the compositor's own delay does not.
 
 **Added 2026-10-14 (I9).** Replaces "HTTP relay + WebCodecs in a `<canvas>`" (see History). The
 module doc comment in `render.rs` is the authority; the points below are the ones an agent needs
-before touching it. The UI side (`VideoViews`, tiles, hover chrome) is in `superdoc/ui/APP-SHELL.md`.
+before touching it. The UI side (`VideoViews`, tiles, hover chrome) is in `superdoc/ui/STAGE.md` "Video".
 
 - **NV12 stays NV12 until the shader.** `queue.write_texture` uploads straight from the decoder's
   mapped slices (`bytes_per_row = stride`): Y as `R8Unorm` (w x h), UV as `Rg8Unorm`

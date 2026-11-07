@@ -37,7 +37,7 @@ Reading it: "their session on the relay ended" or "they stopped it" on every vie
 
 ## Phone decoder failures: frames lost whole (row 150, 2026-11-05)
 
-**2026-11-07 (row 151): gaps are now repaired first.** A frame lost whole is re-requested by its `frame_id` (a NACK Request for an unseen frame, `protocol-spec.md` §6.6 "A frame never seen"), later frames are held, and only if no answer comes does the keyframe wait below start. See `video-pipeline.md` "A frame lost whole". The Connection log gained fields for it (list after the example below).
+**2026-11-07 (row 151): gaps are now repaired first.** A frame lost whole is re-requested by its `frame_id` (a NACK Request for an unseen frame, `protocol-spec.md` §6.6 "A frame never seen"), later frames are held, and only if no answer comes does the keyframe wait below start. See `features/video/selective-retransmission.md` "A frame lost whole". The Connection log gained fields for it (list after the example below).
 
 *Why:* row 146 ruled the browser decoder out, and that was wrong: its runs used random loss in software decoders on a desktop, which proves nothing about a phone's decoder, and they never removed a frame whole. The user's Connection log from an iPhone 15 Pro Max (Chrome, so WebKit), 5 minutes at 1080p 60, shows no relay session line and no stream-gone line, only this, every 2-60 s, mostly not right after a logged loss:
 

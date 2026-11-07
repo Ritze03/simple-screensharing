@@ -24,7 +24,7 @@
 //! # Process model: real server child process, in-process client tasks
 //!
 //! - The **relay server** runs as a real, separate OS child process (the
-//!   actual `simple-screensharing-server` binary from the sibling repo) —
+//!   actual `simple-screensharing-server` binary built in this workspace) —
 //!   this is the piece whose real network behavior (accepting two distinct
 //!   QUIC connections, routing datagrams between them) is most important to
 //!   prove for real, so it gets real process isolation.
@@ -1405,8 +1405,8 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
 /// Reran 14/14 clean (2 + 12 iterations) at this investigation's tip; the
 /// original 1/2 smoke-test failure was concluded to be residual flakiness
 /// in the (since removed) multi-window Electron/portal harness, not a regression in
-/// this mechanism (see the 2026-07-28 entry in
-/// `superdoc/features/video-pipeline.md` for the full writeup).
+/// this mechanism (the 2026-07-28 writeup is in the history of
+/// `superdoc/features/video-pipeline.md`).
 ///
 /// Loops `E2E_BRANCH_SWAP_LATE_WATCH_ITERATIONS` times (default 10),
 /// reusing one relay server process but a fresh random room id/key and a
@@ -2216,7 +2216,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
 }
 
 /// Regression test for the 2026-07-28 "Go live" bugs — see
-/// `superdoc/features/stream-control.md`'s dated note.
+/// `superdoc/features/stream/go-live-and-destinations.md`'s dated note.
 ///
 /// Reproduces `AppState::go_live` attaching the **first** destination to an
 /// already-running, zero-destination capture (exactly `stage_video_share`'s
@@ -2784,7 +2784,7 @@ async fn a_window_resized_at_random_keeps_streaming() {
 }
 
 /// Regression test for the "orphan audio stream" bug (2026-07-29 — see
-/// this task's dispatch notes / `superdoc/features/stream-control.md`):
+/// this task's dispatch notes / `superdoc/features/stream/share-audio-attachment.md`):
 /// `AppState::start_audio_share` used to announce a live audio stream
 /// against **any** `for_capture` id that merely existed, without checking
 /// whether that capture was actually live (had a destination). Clicking
@@ -3641,7 +3641,7 @@ mod session_logic {
 /// level and the viewer's packet count once a second, so a script that pauses/resumes/mutes the
 /// application meanwhile (MPRIS) can line the events up with what was sent. The viewer's real
 /// `autoaudiosink` plays to whatever sink `PULSE_SINK` / `PIPEWIRE_NODE` names; recording that
-/// sink's monitor is how the *heard* result is measured (`testing-and-verification.md`, VM audio
+/// sink's monitor is how the *heard* result is measured (`superdoc/testing/vm-audio.md`, VM audio
 /// tests). Run it only in a VM (audio streams are not allowed on the dev host).
 ///
 /// Task I7 knobs: `SSS_LIVE_CHOICE=desktop` shares the whole desktop (`AudioChoice::Desktop`) instead of the app

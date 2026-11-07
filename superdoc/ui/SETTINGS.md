@@ -26,15 +26,15 @@ sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift
 **Boost slider** (2026-11-03, task #114; since #119 without the Calibrate row and capped at 200 %; **moved on 2026-11-04 (I7) from Settings > Shared audio to the audio settings menu's Volume card**, the Settings card is gone): a `ctrl_row_value` (Boost: `widgets::slider`
 in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%`; applied live on every changed frame of a drag as
 `UiAction::PreviewAudioGain`, saved on pointer release as `UiAction::SetAudioGain`, #135). The calibration was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
-How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`. Rig dump: `audio.boost`, `boost N`.
+How it works, and why: `features/audio/levelling-and-volume.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`. Rig dump: `audio.boost`, `boost N`.
 
 **Level loudness** (2026-11-03, task #119; user: "the auto levelling should happen on the viewers
 side"). Since 2026-11-04 (row 134) a **control-bar button** (below); it was a checkbox on the Playback tab. **On by default**; `UiAction::SetLevelLoudness` -> `AppState::set_level_loudness` (persists
 `level_loudness`, flips the process-wide `leveller::ENABLED`, live for every watched stream). The browser has the same
-bar button (`#btn-level`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
+bar button (`#btn-level`). Design and numbers: `features/audio/levelling-and-volume.md` (2026-11-03, #119). Tests:
 `ui::tests::audio_boost::level_loudness_defaults_on_persists_and_drives_the_leveller_switch`.
 
-**Settings > Sounds** (2026-11-04, task I9; `modals.rs`): a card with one **Volume** row (slider 0-100 %, default 50, applied live while dragged, saved on release; `UiAction::PreviewSoundVolume` / `SetSoundVolume`) and one **Test** button per notification sound (join / leave my stream, someone starts / stops a stream; `UiAction::TestSound`). Separate from every stream's volume. Design, edge rules and why: `features/audio-sharing.md` "Notification sounds". Rig dump: `sound.volume`, `sound.test.*`, `sound_volume N`.
+**Settings > Sounds** (2026-11-04, task I9; `modals.rs`): a card with one **Volume** row (slider 0-100 %, default 50, applied live while dragged, saved on release; `UiAction::PreviewSoundVolume` / `SetSoundVolume`) and one **Test** button per notification sound (join / leave my stream, someone starts / stops a stream; `UiAction::TestSound`). Separate from every stream's volume. Design, edge rules and why: `features/audio/desktop-audio.md` "Notification sounds". Rig dump: `sound.volume`, `sound.test.*`, `sound_volume N`.
 
 **Level-loudness button next to every viewer volume slider** (2026-11-03, task #126; user: "make sure the dynamic volume is
 something the viewer can actually select, whether he wants it or not ... next to the volume slider, have a little button
@@ -94,7 +94,7 @@ wraps by CSS so it needed no rule.
 The native viewer had no playout pacing, so the Settings > Playback sliders "Jitter buffer" and "Catch-up speed" did
 nothing. **Why removed:** the user was told so and said "Remove them", under their rule "If a setting doesn't do
 anything, hide it" (#125). **Why back (row 136, the same day):** the native viewer got a playout buffer
-(`decode/playout.rs`, `features/video-pipeline.md` "Playout buffer"); the user: "Also add the settings back to the
+(`decode/playout.rs`, `features/video/playout-buffer.md`); the user: "Also add the settings back to the
 Settings menu." Restored: both sliders (Settings > **Playback** tab, between Interface and Diagnostics; the tab row is
 four `FILL` slots, rig rects `settings.tab.profile|interface|playback|diagnostics`), `UiAction::SetJitterBuffer` /
 `SetCatchUpSpeed`, `AppState::set_max_jitter_buffer_ms` / `set_catch_up_speed_percent`, `AppSettings.max_jitter_buffer_ms`

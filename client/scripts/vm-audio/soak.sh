@@ -1,4 +1,4 @@
-# Runs INSIDE a test VM (client/scripts/vm-audio/README in superdoc testing-and-verification.md).
+# Runs INSIDE a test VM (client/scripts/vm-audio/README in superdoc/testing/vm-audio.md).
 # usage: soak.sh LABEL SCENARIO   (SECS = how long the in-process share runs; Firefox must already play ~/t/tone.html)
 # SCENARIO: pause (pause/resume x3, 15 s apart), pause1 (one cycle, graph dumps before/after), idle (30 s, then
 #           the share stops: shows whether stopping the share pauses the player), flap (10 short cycles),

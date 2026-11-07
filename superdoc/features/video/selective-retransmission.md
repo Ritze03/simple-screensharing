@@ -86,7 +86,7 @@ Of the repairs about half came from the relay cache (relay -> viewer loss) and h
 The old peers need no change and see no NACK traffic (undersized datagrams are dropped), which is the point
 of the datagram design.
 
-**The browser** (#111, 2026-11-03) now speaks it too, both as viewer and as sharer: `features/website.md` "Selective
+**The browser** (#111, 2026-11-03) now speaks it too, both as viewer and as sharer: `features/website/nack-and-big-keyframes.md` "Selective
 retransmission in the browser" (design differences are mechanical: no `connection.rtt` in Chromium 153, so a fixed 150 ms
 RTT; re-sends bypass the #103 pacing loop) with its own loss tables and the mixed rows above. Without NACK a browser
 viewer decoded **0 fps** at 0.1 % random loss with ~1 MB IDRs (no keyframe ever completes); with it 49.4 fps and 0 loss events up
@@ -98,7 +98,7 @@ only), audio.
 
 ### A frame lost whole (browser viewer, row 150, 2026-11-05)
 
-NACK repairs a frame it knows about. A frame with no fragment left is known to nobody, and `frame_id` cannot show it (nonce counter, shared by every stream). Native still has this blind spot (`fragment.rs` `FrameLoss`). In a browser it can be fatal: Chromium's AV1 decoder fails on such a frame (measured), and WebKit closes the decoder on one undecodable frame. So the browser follows the picture numbering in the bitstream (`codec.js` `RefChain`) and treats a jump like any loss. Detail, evidence and what is still inference: `features/website.md` "Phone decoder failures".
+NACK repairs a frame it knows about. A frame with no fragment left is known to nobody, and `frame_id` cannot show it (nonce counter, shared by every stream). Native still has this blind spot (`fragment.rs` `FrameLoss`). In a browser it can be fatal: Chromium's AV1 decoder fails on such a frame (measured), and WebKit closes the decoder on one undecodable frame. So the browser follows the picture numbering in the bitstream (`codec.js` `RefChain`) and treats a jump like any loss. Detail, evidence and what is still inference: `features/website/phone.md` "Phone decoder failures".
 
 **Repaired by its id (row 151, 2026-11-07).** `Why:` the user: "There are still hiccups when watching from mobile." Row 150 turned decoder failures into a wait for the next keyframe, about 70 times in 6 minutes on an iPhone, and keyframes can be 1-2 s apart. A gap now costs one round trip instead:
 

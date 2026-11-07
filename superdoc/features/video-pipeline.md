@@ -20,10 +20,11 @@ Where each side lives:
 
 ## Capture side (summary; detail lives in `stream-control.md`)
 
-The decoder only sees what the capture pipeline produces. Everything below is in `stream-control.md`:
-"Capture/encode performance" (#39: 120-240 fps of unique frames, `min-buffers`, `RateCap`, GPU/System capture domain),
-"Idle monitors" and "Silence watchdog" (#32), "Live-verified: rotated outputs (#35)" and "AV1 branch deaths read as a lost portal
-source" (#137: the coded buffer, the 4x keyframe-pacing cap that keeps keyframes from overflowing the uplink and forcing an
+The decoder only sees what the capture pipeline produces. Everything below is in the `stream/` pages of `stream-control.md`:
+"Capture/encode performance" (#39: 120-240 fps of unique frames, `min-buffers`, `RateCap`, GPU/System capture domain) and
+"Live-verified: rotated outputs (#35)" in `stream/capture-pipeline.md`, "Idle monitors" and "Silence watchdog" (#32) in
+`stream/capture-sources.md`, and "AV1 branch deaths read as a lost portal
+source" in `stream/encoder-failures.md` (#137: the coded buffer, the 4x keyframe-pacing cap that keeps keyframes from overflowing the uplink and forcing an
 L1 recovery, see `video/viewer-recovery.md`). Two facts a decode-side reader meets that are not on that page:
 
 - **Orientation (#35).** `pipewiresrc` turns `SPA_META_VideoTransform` into an `image-orientation` tag and the pipeline follows
@@ -33,7 +34,7 @@ L1 recovery, see `video/viewer-recovery.md`). Two facts a decode-side reader mee
 
 ## Audio follows video (current rule; the playback path is native)
 
-*A/V sync (audio delayed to match video latency, 2026-11-01): `features/audio-sharing.md`.*
+*A/V sync (audio delayed to match video latency, 2026-11-01): `features/audio/sync-and-clocks.md`.*
 
 Product requirement, from the project owner: "the shared audio should be connected to the
 screenshare ... The streamer should be able to enable audio on his share and the viewer should
@@ -65,7 +66,7 @@ automatically hear that. No (visual) separate 'stream' for Audio."
   (`volume=0.02`) synthetic source and asserts the sharer's capture level and the viewer's
   `AudioDecoder::packets_received()` are > 0. An earlier all-silence version passed while the
   sharer was broadcasting the microphone instead of the app (the capture-targeting bug is in
-  `stream-control.md`, "The 2026-07-28 audio bugs"). Volume measurements need decorrelated noise,
+  `stream/share-audio-attachment.md`, "The 2026-07-28 audio bugs"). Volume measurements need decorrelated noise,
   not a sine: the viewer's copy plays ~100 ms late, so a tone sums at a drifting phase.
 
 ## History: the Electron-era display path (removed)

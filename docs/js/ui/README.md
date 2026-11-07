@@ -74,13 +74,13 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 ## Phones (row 145, 2026-11-05)
 
 One breakpoint (`store.js` `PHONE_Q` = the last `@media` block of `css/app.css`): the rooms list is a drawer (`S.drawer`), touch gets 40 px targets and always-visible tile buttons,
-Floating and the resize bars are hidden, long-press on a room opens its menu (`dom.js` `longPress`). Detail, the browser table and the *why*: `superdoc/features/website.md` "The website on a phone".
+Floating and the resize bars are hidden, long-press on a room opens its menu (`dom.js` `longPress`). Detail, the browser table and the *why*: `superdoc/features/website/phone.md` "The website on a phone".
 
 ## The stage (task I6, 2026-11-04)
 
 The room's centre and the Watched view are the native client's stage: Split / Crop / Floating, resize bars, a people strip with a hover card, a control bar with split
 buttons, one menu style, stage pop-out, fullscreen auto-hide, emoji avatars. The detail, the D1 behaviours and the *why* of every call are in
-`superdoc/features/website.md` "The stage" and "Emoji avatars"; the short rules for working on it:
+`superdoc/features/website/stage.md` "The stage" and `superdoc/features/website/viewer-features.md` "Emoji avatars"; the short rules for working on it:
 
 * **Port, do not re-derive.** The geometry (`stage-geom.js`) and the fullscreen rule (`chrome.js`) are line-for-line ports of `client/src/ui/stage/{geom,chrome}.rs`; change
   both together and keep the ported tests (`dev/tests.js` "stage geometry", "fullscreen chrome") green. The CSS is the replica's (`superdoc/ui/replica/index.html`).

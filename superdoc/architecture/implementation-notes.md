@@ -45,8 +45,9 @@ has the current map).
   client's. The old nested repo directories and the empty `simple-screensharing-website/` were
   deleted. `Why:` server, desktop client and the upcoming browser client must change in
   lockstep, and the project owner asked for one repo. Consequences still visible in the tree:
-  `end_to_end_test.rs::server_repo_candidates` and a few older entries in this file still use
-  the pre-monorepo paths (see "Verification gap" in the block below).
+  a few older entries in this file still use the pre-monorepo paths
+  (`end_to_end_test.rs::server_repo_candidates`, which looked for them, was replaced by `server_binary_path`;
+  see "Verification gap" in `webtransport-cert.md`).
 - **I2, shared protocol crate.** New `protocol/` (`simple-screensharing-protocol`) is the
   single definition of the wire types and constants; `client/src/protocol.rs` and
   `server/src/protocol.rs` re-export it. I6 then deleted the relay-only header wrappers and moved
@@ -69,7 +70,7 @@ has the current map).
   `latest_frame()`. Legacy `latest_frame() -> ColorImage` stays for the old UI. 1080p
   benchmark (`client/examples/decode_bench.rs`): H.264 541 HW / 250 SW fps, H.265 488 / 166,
   AV1 463 / 110. `Why:` the sender already encoded H.265/AV1 but the Rust decoder could only do
-  software H.264, which cannot reach 120-240 fps. Detail: `features/video-pipeline.md` "Native
+  software H.264, which cannot reach 120-240 fps. Detail: `features/video/decode-and-display.md` "Native
   decode".
 - **I4, sidecar logic moved into the lib.** What only lived in
   `client/src-tauri/src/commands.rs` (since deleted) now lives on `session::AppState`; the sidecar kept only thin wrappers:
@@ -84,9 +85,9 @@ has the current map).
   | Quality | BestQuality | Quality | 2000 ms |
   | Gaming | LowLatency | Performance | 750 ms |
 
-  (Table as of 2026-10-15, #88: the rate-control column is gone, every encode is Dynamic/VBR; before that LowLatency and Gaming were `Cqp` (UI "Static"), see `features/stream-control.md` "Rate control".)
+  (Table as of 2026-10-15, #88: the rate-control column is gone, every encode is Dynamic/VBR; before that LowLatency and Gaming were `Cqp` (UI "Static"), see `features/stream/rate-control.md`.)
 
-  Current presets are Text / Quality / Gaming (2026-11-04, D8): `client/src/presets.rs`, `features/stream-control.md` "Presets: Text, Quality, Gaming".
+  Current presets are Text / Quality / Gaming (2026-11-04, D8): `client/src/presets.rs`, `features/stream/encoder-tuning.md` "Presets: Text, Quality, Gaming".
 
   `Why:` the Electron/Tauri layers were deleted in the egui rework, and the new egui UI must stay a thin view
   over `AppState` rather than re-implement what the sidecar did.
@@ -147,7 +148,7 @@ element the way `bitrate` is (`launch_fragment` bakes them into the construction
 "change one" is definitionally "build a new encoder", which is what a branch swap is. Routing
 them through the existing `classify_change` / `swap_to_new_branch` machinery gives them
 make-before-break, the wait-for-first-IDR gate and the `KeptOld`-on-failure net for free
-(`superdoc/features/stream-control.md`). The regression test for the profile/level change a swap
+(`superdoc/features/stream/go-live-and-destinations.md`). The regression test for the profile/level change a swap
 can cause lives at the `capture`/`net` layer, `end_to_end_test.rs`
 (`late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`).
 
@@ -162,13 +163,13 @@ can cause lives at the `capture`/`net` layer, `end_to_end_test.rs`
 - Screen capture on Linux (portal + PipeWire) with H.264 / H.265 / AV1 VA-API hardware
   encode and software fallback; per-application audio capture and Opus encode (PipeWire).
 - **240 fps end to end**: H.265 with VA encode and decode; AV1 and the H.264 Gaming
-  presets reach about 240 with the Performance setting (`features/stream-control.md`
+  presets reach about 240 with the Performance setting (`features/stream/capture-pipeline.md`
   "Capture/encode performance").
 - Native video decode (VA with software fallback) and the wgpu renderer, in the room view
   and in pop-out viewports (`features/video-pipeline.md`, `features/viewer-window.md`).
 - **Multi-destination fan-out, transfer and the bandwidth modes**, with sender-side
   idle-pause and forced-keyframe-on-subscribe per destination; live encoder edits
-  (presets, Quality level) through the tier-2 `BranchSwap` machinery (`features/stream-control.md`).
+  (presets, Quality level) through the tier-2 `BranchSwap` machinery (`features/stream/go-live-and-destinations.md`).
   Proven against a real relay and capture pipeline by
   `ui::tests::fan_out_transfer_and_absolute_bandwidth_across_three_rooms`.
 - **Auto-reconnect and clean exit** (task #36/#37): a dropped connection becomes a

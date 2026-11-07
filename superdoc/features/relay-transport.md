@@ -26,7 +26,7 @@ connection open for 45 s with old (60 s/15 s) and new (20 s/5 s) on either end, 
 A new client against the old relay still gets its 20 s (the minimum) and its own 5 s pings; an old
 client against the new relay gets the relay's 20 s and 5 s pings. The congestion controller is purely
 sender-local. The **relay change only takes effect when the user redeploys the relay**
-(the deployed relay, `<relay host>`, runs the old build; see `.claude/local/relay.md` in the main checkout): the client change alone already fixes the sharer's
+(the deployed relay, `<relay host>`, runs the old build; see `.claude/local/relay.md` in the main checkout, if present): the client change alone already fixes the sharer's
 uplink (BBR) and shortens dead-path detection, but relay -> viewer keeps Cubic (and its collapse
 under loss) until then.
 
@@ -277,7 +277,7 @@ has `lost` / `congestion` / `evicted` > 0 while the stream line is healthy. View
 `resubs` high. Everything healthy but the viewer still sees stutter: the problem is in the viewer's
 decode/render (ask for that client's log).
 
-**On the deployed relay** (`<relay host>`; log directory and host in `.claude/local/relay.md` in the main checkout). `grep -h 'diag ' <relay log dir>/relay.log.*`; narrow with `diag stream` / `diag conn`,
+**On the deployed relay** (`<relay host>`; log directory and host in `.claude/local/relay.md` in the main checkout, if present). `grep -h 'diag ' <relay log dir>/relay.log.*`; narrow with `diag stream` / `diag conn`,
 `owner_name="Name"` / `name="Name"`, `end=1`, `evicted=[1-9]`, or e.g.
 `grep -h 'diag stream' <relay log dir>/relay.log.2026-11-03 | grep -v 'resubs=0'`.
 
@@ -313,7 +313,7 @@ deleted at start and then hourly (`client_logs::prune_at`; only directories name
 under `logs/clients` is touched). The relay logs `dropping client diagnostics: limit reached` (WARN) and
 `client diagnostics uploads (...) enabled=... dir=...` at start.
 
-**On the deployed relay** (see `.claude/local/relay.md` in the main checkout). `ls <relay log dir>/clients/$(date -u +%F)/`, then e.g.
+**On the deployed relay** (see `.claude/local/relay.md` in the main checkout, if present). `ls <relay log dir>/clients/$(date -u +%F)/`, then e.g.
 `less -R <relay log dir>/clients/2026-11-03/Name-<conn id>.log`,
 `grep -h 'WARN\|recover' <relay log dir>/clients/2026-11-03/Name-*.log`, or follow a live session with
 `tail -f`. The relay has to be redeployed for any of this to work (an older relay never acks).

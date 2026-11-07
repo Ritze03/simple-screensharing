@@ -719,7 +719,7 @@ pub struct AudioWatch {
     /// backend query (`RoomSession::volume`) can tell a viewer's "muted at
     /// 40%" apart from "explicitly dragged to 0%" — both windows (View tab
     /// and any pop-out) need that distinction to restore the right slider
-    /// state. See `superdoc/features/video-pipeline.md`'s 2026-07-29 entry.
+    /// state. See `superdoc/features/video-pipeline.md` "Audio follows video" (volume is backend state).
     pub muted: bool,
     /// `true` when this watch exists only because we're watching the same
     /// sender's *video* (`sync_audio_watches` owns it, and will tear it down
@@ -1343,7 +1343,7 @@ impl RoomSession {
     /// This is the whole "audio follows video" feature. One user action
     /// (Watch) gets both media; there is no separate audio subscribe/watch
     /// step, and no viewer-facing audio stream to click. See
-    /// `superdoc/features/video-pipeline.md`'s 2026-07-28 block.
+    /// `superdoc/features/video-pipeline.md` "Audio follows video".
     ///
     /// `Why a reconcile pass instead of doing this once inside toggle_watch:`
     /// the naive version (latch `sibling_audio_stream(owner)` at the instant
@@ -2458,8 +2458,7 @@ impl AppState {
     }
 
     /// "Share Screen"/"Share another screen" clicked: the staged half of the
-    /// "Go live" flow (see `superdoc/features/stream-control.md`'s
-    /// 2026-07-28 note). Allocates a capture and spawns
+    /// "Go live" flow (see `superdoc/features/stream/go-live-and-destinations.md`). Allocates a capture and spawns
     /// [`capture::start_capture`] — same portal prompt, same real GStreamer
     /// pipeline `start_video_share` starts, but with **zero destinations**:
     /// nothing is sent to any room, and no `AnnounceStream` fires, until
@@ -4231,7 +4230,7 @@ impl AppState {
 
     /// Set the `RoomStore` entry for `join_string`'s `auto_connect` flag —
     /// the room-detail panel's "Auto-Connect" checkbox (see
-    /// `superdoc/features/stream-control.md`'s 2026-07-28 entry). Rooms
+    /// `superdoc/features/stream-control.md` "Auto-Connect"). Rooms
     /// flagged this way get rejoined automatically in `main.rs`'s
     /// `.setup()`.
     ///

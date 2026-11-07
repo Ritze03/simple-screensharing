@@ -2,7 +2,7 @@
 //! measured, per-stream delay so a burst of late frames (a keyframe's transfer) reaches the decoder
 //! evenly, and plays a little faster than live to shrink the delay again.
 //!
-//! Full write-up with the `Why:` notes: `superdoc/features/video-pipeline.md` "Playout buffer".
+//! Full write-up with the `Why:` notes: `superdoc/features/video/playout-buffer.md`.
 //!
 //! # The model
 //!

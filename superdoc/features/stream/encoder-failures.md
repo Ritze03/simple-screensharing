@@ -215,7 +215,7 @@ queue / 0.1 % loss, same build, AV1 120 fps 25.7 Mbit/s, ~500 kB keyframes, 70 s
 | adaptive up to 4x (this change) | 0 and 1 (two runs) |
 
 `PacePolicy::MAX` is now **4.0** (row 133 had already measured "anything above about 3.7x buys nothing" on this line). A 500 kB keyframe
-at 25.7 Mbit/s takes ~39 ms instead of 12 ms to leave the pump; the playout buffer (row 136, `video-pipeline.md` "Playout buffer") absorbs
+at 25.7 Mbit/s takes ~39 ms instead of 12 ms to leave the pump; the playout buffer (row 136, `features/video/playout-buffer.md`) absorbs
 that, which is what made the 12x window worth having in row 129. In the user's log the single viewer episode (14:02:47, 107/331
 fragments) came right after the factor had been halved to 6x and then 2.5x by two resume requests, with 330-700 kB keyframes: so the 12x
 climb is not the only way to lose a keyframe on that line, but it was the one that made it happen again and again in the rig.

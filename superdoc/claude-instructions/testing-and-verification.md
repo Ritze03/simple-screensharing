@@ -60,7 +60,7 @@ A VA encoder under window-resize stress or rapid restarts caused VCN page faults
   SSS_CAPTURE_PATH=system` in `CLIENT_ENV_1`/`_2`; the log must say `using software encoder`).
 - At the first `mmhub page fault` or `vcn_unified` line in `journalctl -k`, **stop the run and report**; do not continue.
 
-Measurements: `testing/gpu-safety-incidents.md`, `features/stream-control.md` "Resize recovery verified".
+Measurements: `testing/gpu-safety-incidents.md`, `features/stream/capture-sources.md` "Resize recovery verified".
 
 ## No audio tests on the host (hard rule, user request 2026-10-14; the test VMs are the exception)
 

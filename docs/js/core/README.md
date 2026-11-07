@@ -104,7 +104,7 @@ new RoomClient({
 | `findStreamByStableKey(stableKey, { exceptKeys })` | The stream now in the room with that identity, or `null` (see "Stable stream identity"). |
 | `disconnect()` | Stops shares and watches, sends `Leave`, lets queued datagrams flush, closes. |
 | `watch(key, { canvas?, onFrame?, audio = true })` | Subscribe. Returns a `WatchHandle`. Watching a video stream also subscribes the owner's audio stream ("audio follows video", re-evaluated when that audio stream appears or disappears), **except a webcam** (`isWebcamLabel`: a label starting with `Webcam`; a webcam brings no audio and is no video for the audio that follows video, native `owner_has_video`). `watch()` of an **audio** key is "Listen": no canvas, a standalone audio receiver for a sender that shares audio with no screen (task I10). |
-| *(A/V sync)* | The followed audio is delayed to line up with the owner's video (`avsync.js`: per-stream latency floors, deadband steps, 0-2 s; none for audio-only). Needs the sender to stamp audio and video PTS from one clock (native: since 2026-11-01; browser sender: always). `features/audio-sharing.md`. |
+| *(A/V sync)* | The followed audio is delayed to line up with the owner's video (`avsync.js`: per-stream latency floors, deadband steps, 0-2 s; none for audio-only). Needs the sender to stamp audio and video PTS from one clock (native: since 2026-11-01; browser sender: always). `features/audio/sync-and-clocks.md`. |
 | `unwatch(key)` | Unsubscribes the stream and its followed audio. |
 | `setVolume(key, 0..5)`, `setMuted(key, bool)` | Per-stream playback gain (0-500 %) and mute. `key` may be the video key (applies to its audio) or an audio key. Persists across re-watch. |
 | `resumeAudio()` | Call from a user gesture if the autoplay policy left the `AudioContext` suspended. |
@@ -158,13 +158,13 @@ The core hands you decoded `VideoFrame`s; two ways to consume them:
   `desynchronized:true`); either way draws are spaced so they use at most half of the main thread.
   *Why (user report 2026-10-15, "hangs and skips above 60 fps" in Firefox/Floorp):* Firefox's 2D `drawImage(VideoFrame)` is a
   CPU read-back + convert on the main thread (13 ms at 1440p), which starved the decoder's callbacks. See
-  `superdoc/features/website.md` "Rendering above 60 fps". Pass `new CanvasRenderer(canvas, { webgl: false })` to force 2D,
+  `superdoc/features/website/viewer-features.md` "Rendering above 60 fps". Pass `new CanvasRenderer(canvas, { webgl: false })` to force 2D,
   `{ preserveDrawingBuffer: true }` if you need `canvas.toDataURL()`. Moving the canvas into another document (pop-out) is fine.
 * **Decoder latency mode (Gecko only):** `VideoReceiver` starts with `optimizeForLatency: true` and, the first time the
   decode-queue backstop drops frames (the decoder is slower than the stream), re-configures without it (Firefox's low-latency
   software decode is single-threaded, 3.5-5x slower). Emits media event `decoder-mode { lowLatency: false }`; watch stat
   `throughputMode`. Constructor options `lowLatency`, `adaptiveLatency` (default: true only on Gecko).
-* **A frame lost whole** (no fragment arrived) is invisible to the reassembler, so `VideoReceiver` follows the bitstream's picture numbering (`codec.js` `RefChain`: H.264, AV1 with order hints) and waits for a keyframe on a jump, because a decoder may close on the broken delta (Chromium's AV1 decoder does, measured). `pushFrame` needs `frameId` for this: no `frameId`, no check. See `superdoc/features/website.md` "Phone decoder failures".
+* **A frame lost whole** (no fragment arrived) is invisible to the reassembler, so `VideoReceiver` follows the bitstream's picture numbering (`codec.js` `RefChain`: H.264, AV1 with order hints) and waits for a keyframe on a jump, because a decoder may close on the broken delta (Chromium's AV1 decoder does, measured). `pushFrame` needs `frameId` for this: no `frameId`, no check. See `superdoc/features/website/phone.md` "Phone decoder failures".
 * `watch(key, { onFrame })` / `handle.setFrameCallback(fn)`: you receive each `VideoFrame` and **must `close()` it** (hardware
   decoders have a small surface pool; holding frames stalls decoding).
 
@@ -286,7 +286,7 @@ Behaviour that matches the native sender:
   its own ConnId with the same datagrams plus `flags` bit2 (retransmit), sent directly (not through the pacing loop: a repair
   is a few datagrams, and the sender skips it when `MAX_PENDING_DATAGRAMS` are already queued). Audio is never NACKed or kept.
   A frame lost whole (row 151) has left no fragment, so `VideoReceiver` asks for it by the `frame_id`s skipped in front of the frame that showed the
-  jump (`requestFrames`, `first 0, count 256`) and holds later frames until `RefChain` is satisfied: `superdoc/features/video-pipeline.md` "A frame lost whole".
+  jump (`requestFrames`, `first 0, count 256`) and holds later frames until `RefChain` is satisfied: `superdoc/features/video/selective-retransmission.md` "A frame lost whole".
   The poll runs on a 5 ms timer only while a frame is incomplete (`#scheduleNackPoll`). Kill switch (mirrors native
   `SSS_DISABLE_NACK=1`): `?nack=0` in the page URL, `localStorage["sss-nack"]="0"`, or `new RoomClient({ nack: false })`: the client
   then never says Hello, so the relay neither forwards requests to it nor does it ever ask. `client.nackStats()` =

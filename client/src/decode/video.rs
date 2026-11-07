@@ -168,7 +168,7 @@ struct LagEpisode {
 /// more (slow motion, up to [`BACKLOG_MAX_AUS`]) and then plays the queue out at decoder speed when
 /// it catches up (fast-forward). The user reported exactly that ("the share keeps going faster and
 /// slower", 2026-11-03), and nothing in the log showed it: the only trace was a `debug!` on a
-/// trim. Why the decoder slowed down there is still open (`features/video-pipeline.md` "Decoder
+/// trim. Why the decoder slowed down there is still open (`features/video/decode-and-display.md` "Decoder
 /// falling behind"); this line is what the next report needs. Pure (`now` injected) so the rules
 /// are unit-tested without sleeping.
 #[derive(Debug, Default)]

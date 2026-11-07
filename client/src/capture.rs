@@ -186,7 +186,7 @@
 //! for real: wire PTS, IDR caching, first-IDR `Starting` → `Live`, and the
 //! stall keepalive.
 //!
-//! See `superdoc/architecture/overview.md`'s "Per-destination lifecycle"
+//! See `superdoc/architecture/session-model.md`'s "Per-destination lifecycle"
 //! section for the full model.
 
 #[cfg(unix)]
@@ -315,7 +315,7 @@ fn va_driver_is_mesa_amd() -> bool {
 /// (`radeon_vcn_enc.c:15-60` maps these onto the VCN encoder modes; high
 /// quality needs VCN 4.0+, older parts clamp it to quality.) Pairs of
 /// values give bit-identical output (same bytes, same PSNR). Measured on the
-/// RX 7900 XTX, table in `superdoc/features/stream-control.md`: the balance
+/// RX 7900 XTX, table in `superdoc/features/stream/vaapi-target-usage.md`: the balance
 /// preset (2/3) is the fast band on all codecs (AV1 ~300 fps on a busy box),
 /// the quality preset (4/5) halves AV1 and costs H.264 a third for +0.0-0.3 dB,
 /// the high-quality preset (6/7) halves AV1 again for ~0 dB more, and 1
@@ -453,7 +453,7 @@ impl EncoderBackend {
                 // `rate-control=vbr`, not the literal `qvbr`: a measured Mesa
                 // radeonsi driver bug means `qvbr` silently ignores the
                 // bitrate ceiling, `vbr`'s is genuinely honored (see
-                // `superdoc/features/stream-control.md` "Rate control").
+                // `superdoc/features/stream/rate-control.md`).
                 // `vah265enc`/`vaav1enc` both expose the exact same
                 // `rate-control`/`bitrate`/`key-int-max`/`target-usage`/
                 // `target-percentage`/`cpb-size` property names, ranges and
@@ -695,7 +695,7 @@ pub enum QualityLevel {
 // used to be a `RateControlMode { Cqp, Qvbr }` (UI "Static"/"Dynamic"); Static
 // (constant quantizer, bitrate uncapped) froze streams on motion and the user
 // asked for it to go. History and the measurements:
-// `superdoc/features/stream-control.md` "Rate control".
+// `superdoc/features/stream/rate-control.md`.
 
 /// the Dynamic mode's `target-percentage` on `vah264enc`'s
 /// `rate-control=vbr` ([`EncoderBackend::launch_fragment`]) — "the percentage
@@ -703,10 +703,10 @@ pub enum QualityLevel {
 /// encode target is `bitrate * target-percentage / 100`. Left at the
 /// element's own default of 66%, this is exactly the previously-removed
 /// `Adaptive` mode's diagnosed pop-in cause (see
-/// `superdoc/features/stream-control.md` "Rate control"). Set high (close to the 50-100
+/// `superdoc/features/stream/rate-control.md`). Set high (close to the 50-100
 /// range's ceiling) so the real target sits near the configured `bitrate`
 /// ceiling rather than swinging down toward two-thirds of it — measured live
-/// (see `superdoc/features/stream-control.md`'s 2026-07-30 follow-up entry)
+/// (see `superdoc/features/stream/rate-control.md`'s 2026-07-30 follow-up entry)
 /// to hold real output bitrate stable over changing content, unlike the
 /// unset-default 66% baseline.
 const VBR_TARGET_PERCENTAGE: u32 = 95;
@@ -722,7 +722,7 @@ const VBR_TARGET_PERCENTAGE: u32 = 95;
 /// frequent, finer-grained rate adjustment, smoothing out the bitrate swings
 /// that caused the original pop-in complaint, rather than letting bitrate
 /// swing dramatically between infrequent large-buffer refill cycles.
-/// Measured live (see `superdoc/features/stream-control.md`'s 2026-07-30
+/// Measured live (see `superdoc/features/stream/rate-control.md`'s 2026-07-30
 /// follow-up entry) to reduce achieved-bitrate variance relative to the
 /// untuned (default `cpb-size`, default `target-percentage`) VBR baseline.
 const VBR_CPB_SIZE_NUMERATOR: u32 = 3;
@@ -2651,7 +2651,7 @@ pub struct CaptureHandle {
     /// A `Vec` rather than a map: N is the number of rooms a user is
     /// simultaneously broadcasting into — a handful at most. Empty for a
     /// **staged** capture (`start_capture`/"Go live" flow, see
-    /// `superdoc/features/stream-control.md`'s 2026-07-28 note): the tee is
+    /// `superdoc/features/stream/go-live-and-destinations.md`): the tee is
     /// running with zero branches until the first destination is attached.
     destinations: Vec<DestinationHandle>,
     /// The tee's low-rate RGB branch, held here **unconsumed** until the
@@ -2790,7 +2790,7 @@ pub async fn start_webcam_sharing(
 }
 
 /// **Staged capture, no destination yet** — the "Go live" flow's first half
-/// (see `superdoc/features/stream-control.md`'s 2026-07-28 note). Acquires
+/// (see `superdoc/features/stream/go-live-and-destinations.md`). Acquires
 /// the capture source and starts the GStreamer pipeline exactly like
 /// [`start_sharing`] does, but returns before adding any destination branch:
 /// the resulting [`CaptureHandle::destinations`] is empty. Real
@@ -4122,7 +4122,7 @@ const AV1_RESET_MIN_GAP: Duration = Duration::from_secs(2);
 /// only ~37 % of 984-fragment frames survive), and every failed one made it
 /// ask for another, so recoveries took 30-100 s. radeonsi's VBR ignores
 /// `cpb-size`, `target-percentage` and `min-qp` for an IDR (measured, table in
-/// `superdoc/features/stream-control.md` "Big keyframes": 620 kB IDR with
+/// `superdoc/features/stream/capture-restart.md` "Big keyframes": 620 kB IDR with
 /// `cpb-size` 800 or 3112, `min-qp=20`; CBR does cap it but pads a static
 /// screen to ~4 Mbit/s, which the owner rejected in #88). What does shrink it: *any* write of the
 /// `bitrate` property restarts the rate control, and the IDR coded right after
@@ -5719,7 +5719,7 @@ fn send_stall_keepalive(client: &ScreenshareClient, stream_id: u8, runtime: &des
 /// branch this state describes — lives in [`branch`], and the two are joined
 /// by [`branch::swap_to_new_branch`]/[`branch::rebuild_after_source_restart`].
 ///
-/// See `superdoc/architecture/overview.md`'s "Per-destination lifecycle"
+/// See `superdoc/architecture/session-model.md`'s "Per-destination lifecycle"
 /// section and `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`.
 pub mod destination {
     use super::*;
@@ -11820,7 +11820,7 @@ mod tests {
     }
 
     /// Rate control is always Dynamic: vah264enc gets `rate-control=vbr` (not
-    /// literal `qvbr`, see `superdoc/features/stream-control.md` "Rate control")
+    /// literal `qvbr`, see `superdoc/features/stream/rate-control.md`)
     /// with the tuned `target-percentage`/`cpb-size`; x264enc keeps its plain
     /// untouched `bitrate=` (`pass` unset, read back as its default nick).
     #[test]

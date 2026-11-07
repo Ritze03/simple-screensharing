@@ -12,7 +12,7 @@ kept next to the code, so read them instead of re-deriving anything:
 
 Wire spec (binding for both clients): `superdoc/architecture/protocol-spec.md`, section 11 is the
 browser leg. How to test safely on this machine (headless vs headed inside the headless sway rig, relay):
-`superdoc/claude-instructions/testing-and-verification.md` "Website (browser viewer) checks".
+`superdoc/testing/relay-and-website-checks.md` "Website (browser viewer) checks".
 
 ## Shape
 
@@ -49,8 +49,8 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
   kind + label); a reconnect gives the sharer a fresh ConnId and so a new stream key, and the core
   cannot tell that from stop + restart. Resume policy is therefore UI-side (60 s list in
   `docs/js/ui/rooms.js`, same window as the native `REWATCH_GRACE`).
-- **Watched merges one name across rooms** (2026-11-04, user: "the list of participants should be filtered/condensed, so every person is only shown once"; native twin `ui/APP-SHELL.md`). `peopleOf` for the Watched view groups by room + ConnId, then merges groups of one `owner` name from DIFFERENT rooms into one person (`conns`, `key` = the first): one avatar, the count of all their streams, one card with a row per stream (the row's third line already names its room in Watched), `audible` / LIVE if any stream is. Two same-named connections of ONE room stay two. *Why:* a name is the only identity across rooms, but two of one name in a room are provably two (#127); a person never takes a second connection of a room it has. Merged emoji: the first connection's. A single room's strip is unchanged. Tests: `dev/tests.js` (merge rule), `e2e/stage.mjs` "Watched: one person in two rooms".
-- **A person is a connection** (2026-11-04, #127; native twin in `ui/APP-SHELL.md` "The stage"). A stage item carries `conn` (its
+- **Watched merges one name across rooms** (2026-11-04, user: "the list of participants should be filtered/condensed, so every person is only shown once"; native twin `ui/STAGE.md`). `peopleOf` for the Watched view groups by room + ConnId, then merges groups of one `owner` name from DIFFERENT rooms into one person (`conns`, `key` = the first): one avatar, the count of all their streams, one card with a row per stream (the row's third line already names its room in Watched), `audible` / LIVE if any stream is. Two same-named connections of ONE room stay two. *Why:* a name is the only identity across rooms, but two of one name in a room are provably two (#127); a person never takes a second connection of a room it has. Merged emoji: the first connection's. A single room's strip is unchanged. Tests: `dev/tests.js` (merge rule), `e2e/stage.mjs` "Watched: one person in two rooms".
+- **A person is a connection** (2026-11-04, #127; native twin in `ui/STAGE.md` "The stage"). A stage item carries `conn` (its
   owner's ConnId) and `peopleOf`, `sameOwner`, `audibleFor`, the hover card (`S.card.person`, `data-person` = room + ConnId; `data-user`
   stays the name, for tests only), the emoji (`r.emojiOf(id)`, `emojiByName` is gone) and the viewers dropdown (`viewersOf`, from
   `share.viewerIds`) go by it, never by name. `stableKey` stays what it is, so two same-named sharers of one label have one
@@ -86,7 +86,7 @@ Watch and share both work. Differences from native, all platform limits:
   settings and the native app keep the setting. Details and the "why": `ui/APP-SHELL.md` (2026-11-01).
 - **Viewer volume is 0-500 %** (task #96, 2026-11-02): a WebAudio `GainNode` (`core/audio.js` `MAX_VOLUME = 5`), the slider in the stream menu (since I6; before
   that on the tile's audio pill) with a tick and a snap at 100 % (`ui/dom.js` `snapVolumePct`, `.vol` in `app.css`). Loud audio hard-clips at the device, no
-  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, the control bar's Level loudness button (`#btn-level`, left of the people button; was Settings > Playback and, from I6 to 2026-11-04, a stream-menu row), default on, #119; user 2026-11-04: "move level loudness (since its global) to the left of the \"Hide the people\" button"). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
+  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, the control bar's Level loudness button (`#btn-level`, left of the people button; was Settings > Playback and, from I6 to 2026-11-04, a stream-menu row), default on, #119; user 2026-11-04: "move level loudness (since its global) to the left of the \"Hide the people\" button"). Details and the why: `features/audio/levelling-and-volume.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns (a tab's audio, or the system's where the browser offers it); the audio control is
   mute plus an audio-only share (I10, `superdoc/features/website/webcam-and-audio.md`). Native has the per-application picker, Desktop audio, source groups and the exclusion list (D9: *"native Linux only: a
   browser can't list apps"*).
