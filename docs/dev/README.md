@@ -265,7 +265,7 @@ none; no sound is played). (190 checks when this part was added on 2026-11-04, n
 show up, decode, and with Webcam in picture the native webcam sits in the native screen's tile; then the browser shares a silent screen and its own (fake) webcam and holds them so the native viewer can watch both and show the
 browser's webcam in picture (`hs-drive.sh uclick 2 ctl.layout` + `menu.pip`). Run 2026-11-04: PASS both directions, screenshots in `E2E_OUT`.
 
-`e2e/audio-only.mjs <relay> <hash> --sender <audio-only-sender> --source <name>` **plays audio, so it runs only in a test VM** (arch-ssd, with `client/scripts/vm-audio/fakehw.sh` and `emu_src.py`; `superdoc/testing/vm-audio.md` "Audio
+`e2e/audio-only.mjs <relay> <hash> --sender <audio-only-sender> --source <name>` **plays audio, so it runs only in a test VM** (the Arch VM, with `client/scripts/vm-audio/fakehw.sh` and `emu_src.py`; `superdoc/testing/vm-audio.md` "Audio
 tests in the VMs"). It covers a native audio-only sender (a throwaway `audio-only-sender` package outside `client/`: `AppState::start_audio_share(room, None, ..)`, like the bar's audio button) heard by a browser (the tile, Listen,
 packets decoded, Stop listening), a browser audio-only share (`#btn-audio` with the harness' stubbed `getDisplayMedia`, only the audio kept) heard by a browser and by the native viewer (`listen` mode), and the webcam-plus-audio case.
 

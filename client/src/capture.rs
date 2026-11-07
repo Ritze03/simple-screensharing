@@ -219,13 +219,13 @@ use crate::protocol::StreamKind;
 /// version. GStreamer has shipped two generations of VAAPI plugin with
 /// different element names across versions (`vaapih264enc` from the old
 /// `gstreamer-vaapi` plugin, `vah264enc` from the newer `va` plugin in
-/// `gst-plugins-bad`) — confirmed via `gst-inspect-1.0` on this dev machine
+/// `gst-plugins-bad`) — confirmed via `gst-inspect-1.0` on an AMD RDNA3 GPU
 /// (GStreamer 1.28.5) that only `vah264enc` is present.
 const VAAPI_ENCODER_ELEMENT: &str = "vah264enc";
 
 /// [`EncoderBackend::Vaapi`]'s H.265 encoder element — confirmed present via
-/// `gst-inspect-1.0 vah265enc` on this dev machine (AMD RX 7900 XTX, RDNA3,
-/// GStreamer 1.28.5, `va` plugin). Its `rate-control` (`cbr`/`vbr`/`cqp`),
+/// `gst-inspect-1.0 vah265enc` on an AMD RDNA3 GPU
+/// (GStreamer 1.28.5, `va` plugin). Its `rate-control` (`cbr`/`vbr`/`cqp`),
 /// `bitrate`, `key-int-max` and `target-usage` properties have the exact same
 /// names/ranges/semantics as [`VAAPI_ENCODER_ELEMENT`]'s (re-verified by
 /// direct `gst-inspect-1.0` comparison, not assumed) — see
@@ -233,7 +233,7 @@ const VAAPI_ENCODER_ELEMENT: &str = "vah264enc";
 const VAAPI_H265_ENCODER_ELEMENT: &str = "vah265enc";
 
 /// [`EncoderBackend::Vaapi`]'s AV1 encoder element — confirmed present via
-/// `gst-inspect-1.0 vaav1enc` on this dev machine. Its `rate-control`/
+/// `gst-inspect-1.0 vaav1enc` on an AMD RDNA3 GPU. Its `rate-control`/
 /// `bitrate`/`key-int-max`/`target-usage` properties are also
 /// name-and-semantics-compatible with [`VAAPI_ENCODER_ELEMENT`]'s — but its
 /// SRC caps are `video/x-av1` with `stream-format=obu-stream,alignment=tu`
@@ -315,7 +315,7 @@ fn va_driver_is_mesa_amd() -> bool {
 /// (`radeon_vcn_enc.c:15-60` maps these onto the VCN encoder modes; high
 /// quality needs VCN 4.0+, older parts clamp it to quality.) Pairs of
 /// values give bit-identical output (same bytes, same PSNR). Measured on the
-/// RX 7900 XTX, table in `superdoc/features/stream/vaapi-target-usage.md`: the balance
+/// an AMD RDNA3 GPU, table in `superdoc/features/stream/vaapi-target-usage.md`: the balance
 /// preset (2/3) is the fast band on all codecs (AV1 ~300 fps on a busy box),
 /// the quality preset (4/5) halves AV1 and costs H.264 a third for +0.0-0.3 dB,
 /// the high-quality preset (6/7) halves AV1 again for ~0 dB more, and 1
@@ -429,7 +429,7 @@ impl EncoderBackend {
                 // radeonsi reads `target-usage` as a preset/pre-encode/VBAQ
                 // bitfield, not the VA spec's 1..7 ordinal; the decoded table
                 // and the source citations are on [`vaapi_target_usage`].
-                // Measured on the dev machine (RX 7900 XTX, Mesa 26.2.5,
+                // Measured on an AMD RDNA3 GPU (Mesa 26.2.5,
                 // GStreamer 1.28.8, `client/scripts/enc-bench.sh`, 1080p NV12
                 // screen recording, VBR 8 Mbit/s, fps of raw encoder
                 // throughput on a loaded machine, median of 3):
@@ -459,7 +459,7 @@ impl EncoderBackend {
                 // `target-percentage`/`cpb-size` property names, ranges and
                 // enum values as `vah264enc` — all three derive from the same
                 // GStreamer VA-plugin base encoder class — confirmed via
-                // `gst-inspect-1.0` on this dev machine (see
+                // `gst-inspect-1.0` on an AMD RDNA3 GPU (see
                 // [`VAAPI_H265_ENCODER_ELEMENT`]/[`VAAPI_AV1_ENCODER_ELEMENT`]'s
                 // doc comments) — so only the element name varies by codec.
                 let element = match codec {
@@ -4114,7 +4114,7 @@ const AV1_RESET_MIN_GAP: Duration = Duration::from_secs(2);
 /// Size control for the IDRs a destination forces (#102): a viewer's request, a
 /// resume, a branch swap, the repeats.
 ///
-/// `Why:` field case (Fedora/GNOME, RX 9070 XT, `vah264enc`, 1080p 120 fps
+/// `Why:` field case (Fedora/GNOME, an AMD RDNA4 GPU, `vah264enc`, 1080p 120 fps
 /// 8300 kbps, 40 Mbit/s uplink): under motion the encoder emitted IDRs of
 /// 0.5-1.2 MB (400-985 datagrams, ~1 s of bitrate), the viewer almost never
 /// received all of them (`a keyframe never completed (981/984 fragments

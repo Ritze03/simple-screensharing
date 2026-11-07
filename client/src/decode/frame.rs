@@ -212,7 +212,7 @@ const MAX_PADDING: u32 = 64;
 ///    frame is at most [`MAX_PADDING`] larger than it in each direction (and
 ///    not smaller): the padding sits at the bottom/right.
 ///
-/// `Why 2 exists:` the AMD VCN4 AV1 encoder (`vaav1enc` on an RX 7900 XTX)
+/// `Why 2 exists:` the AMD VCN4 AV1 encoder (`vaav1enc` on an AMD RDNA3 GPU)
 /// codes 1920x1080 as 1920x1082 and signals nothing else: the sequence and
 /// frame headers say 1082 and `render_and_frame_size_different` is 0, so
 /// neither the decoder caps nor a crop meta nor the bitstream knows the

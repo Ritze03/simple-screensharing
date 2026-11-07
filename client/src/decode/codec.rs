@@ -196,7 +196,7 @@ fn sniff_av1(au: &[u8]) -> Option<VideoCodec> {
 mod tests {
     use super::*;
 
-    // Real encoder output, captured on this machine (AMD RX 7900 XTX, GStreamer
+    // Real encoder output, captured on an AMD RDNA3 GPU (GStreamer
     // 1.28.x) with `videotestsrc ! <enc> ! <byte-stream|obu-stream caps> !
     // filesink` — first bytes of the first access unit. Real hardware / library
     // output, not synthesised.

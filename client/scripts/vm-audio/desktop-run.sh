@@ -1,6 +1,6 @@
 #!/bin/bash
 # HOST side (task I7): run one desktop-audio scenario in a test VM and analyze the recordings (analysis only reads files).
-# usage: desktop-run.sh PORT LABEL SCENARIO    PORT: 2223 = fedora-ssd, 2224 = arch-ssd; SCENARIO: desktop | named | only
+# usage: desktop-run.sh PORT LABEL SCENARIO    PORT: the VM's forwarded SSH port (real values: .claude/local/test-machine.md); SCENARIO: desktop | named | only
 # Needs the source in the VM (vm-sync.sh) built there (`cargo test -p simple-screensharing-client --release --lib --no-run`
 # and `cargo build --release -p simple-screensharing-server`), Firefox playing the tone page (fakehw.sh, ff-setup.sh).
 port=$1; label=$2; scen=${3:-desktop}

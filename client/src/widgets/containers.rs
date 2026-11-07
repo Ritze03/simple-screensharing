@@ -1,7 +1,7 @@
 //! Containers: card, well, band, card/tile grid, modal shell + footer. Frames only
 //! paint and pad; the layout inside is always a vbox (`ui.vertical` semantics) whose
 //! width is fixed to the container's inner width and clipped to it, so a too-wide row
-//! is cut at the container edge instead of widening it (the Forza guide's pane rule).
+//! is cut at the container edge instead of widening it (the styling guide's pane rule).
 
 use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Stroke, Ui, UiBuilder, pos2, vec2};
 

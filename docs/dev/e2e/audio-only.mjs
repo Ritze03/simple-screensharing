@@ -1,6 +1,6 @@
 // Task I10, AUDIO: audio-only shares and the Listen tile through the real UI, headless Chromium. THIS RUN PLAYS AUDIO (a tone, an AudioContext, Opus):
 // never run it on the host (superdoc/claude-instructions/testing-and-verification.md "No audio tests on the host"), only inside a test VM
-// ("Audio tests in the VMs": arch-ssd / fedora-ssd, with `client/scripts/vm-audio/fakehw.sh` and an `emu_src.py` tone source running).
+// ("Audio tests in the VMs": the Arch VM and the Fedora VM, with `client/scripts/vm-audio/fakehw.sh` and an `emu_src.py` tone source running).
 //
 //   node docs/dev/e2e/audio-only.mjs <relay host:port> <certhash> --sender <audio-only-sender binary> --source <PipeWire source name>
 //
