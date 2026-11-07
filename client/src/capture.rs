@@ -3807,6 +3807,16 @@ impl CaptureHandle {
     /// seconds. Nothing in this capture recovers from that: the session starts
     /// a replacement ([`start_capture_restoring`]) and moves the destinations
     /// over. Never reset.
+    /// Declares the source dead for a reason the pumps cannot see (a destination that would not come up on it): the
+    /// session restarts the capture. `false` if it was already lost or the source is not one that can be restarted.
+    pub fn declare_lost(&self, reason: String) -> bool {
+        if !self.capture_errors.silence_is_loss || self.capture_errors.lost().is_some() {
+            return false;
+        }
+        self.capture_errors.mark_lost(reason);
+        true
+    }
+
     pub fn source_lost(&self) -> Option<String> {
         self.capture_errors.lost()
     }

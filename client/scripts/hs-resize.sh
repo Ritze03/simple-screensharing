@@ -53,6 +53,22 @@ set_size() {
     swaymsg output HEADLESS-1 resolution "$1" >/dev/null
 }
 
+# ostress SECS SEED MINW MINH MIN_GAP_MS [BURST]: random output sizes from MINWxMINH up to 1920x1080, one every MIN_GAP_MS to
+# 2x that (row 148's staged runs: software 144x80/80 ms in bursts; VA never below 320x180 nor faster than 500 ms), BURST = sizes
+# per burst before a 1-3 s rest (default 1000 = never rest). RESIZE_TARGET=win resizes the vkcube window (HS_PATTERN=window) instead. Ends on 1280x720 (win: 1000x600). Prints one line per change.
+if [ "${1:-}" = ostress ]; then
+    secs="${2:?usage: ostress SECS SEED MINW MINH MIN_GAP_MS [BURST]}"; RANDOM="$3"; minw="$4"; minh="$5"; gap="$6"; burst="${7:-1000}"
+    end=$((SECONDS + secs)); n=0; k=0
+    while [ $SECONDS -lt $end ]; do
+        w=$((minw + RANDOM % (1920 - minw + 1))); h=$((minh + RANDOM % (1080 - minh + 1)))
+        (( RANDOM % 3 == 0 )) && { w=$((minw + RANDOM % 200)); h=$((minh + RANDOM % 120)); }
+        if [ "${RESIZE_TARGET:-out}" = win ]; then win_size "${w}x${h}"; else set_size "${w}x${h}"; fi; n=$((n + 1)); k=$((k + 1))
+        sleep "$(awk "BEGIN{print ($gap + $RANDOM % ($gap + 1))/1000}")"
+        (( k >= burst )) && { k=0; sleep $((1 + RANDOM % 3)); }
+    done
+    if [ "${RESIZE_TARGET:-out}" = win ]; then win_size 1000x600; else set_size 1280x720; fi; echo "ostress done: $n size changes"; exit 0
+fi
+
 if [ "${1:-}" = burst ]; then
     n="${2:-12}"; gap="${3:-80}"; final="${4:-1600x900}"
     for ((i = 0; i < n; i++)); do

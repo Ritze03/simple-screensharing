@@ -1620,6 +1620,9 @@ pub struct PendingDestination {
     pub room: RoomHandle,
     pub role: PendingRole,
     pub rx: oneshot::Receiver<Result<capture::DestinationHandle, String>>,
+    /// Added back by a capture restart ([`AppState::finish_recovery`]): a failed bring-up is the source's doing, not
+    /// the user's, so it restarts the capture again instead of ending the share (row 148).
+    pub from_recovery: bool,
 }
 
 /// The state/logic layer behind the UI: every room, capture and destination
@@ -2623,12 +2626,17 @@ impl AppState {
     /// sibling, or fall back to session defaults" rule that's right for a
     /// genuinely new fan-out but wrong for resurrecting one that already had
     /// its own tuning — see that method's `Why:` note.
-    fn add_destination_with_params(
+    fn add_destination_with_params(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle, role: PendingRole, params: capture::destination::VideoParams) {
+        self.add_destination_inner(capture_id, room_handle, role, params, false);
+    }
+
+    fn add_destination_inner(
         &mut self,
         capture_id: CaptureSourceId,
         room_handle: RoomHandle,
         role: PendingRole,
         params: capture::destination::VideoParams,
+        from_recovery: bool,
     ) {
         // The capture's source is dead and being restarted (#99): the dead
         // pipeline cannot take a branch, so wait for the replacement.
@@ -2699,6 +2707,7 @@ impl AppState {
             room: room_handle,
             role,
             rx,
+            from_recovery,
         });
         self.share_error = None;
     }
@@ -2844,6 +2853,25 @@ impl AppState {
                         .captures
                         .get(&pending.capture_id)
                         .is_some_and(|c| c.destinations.contains_key(&pending.destination_id));
+                    // Row 148: the source died under this bring-up (a window resized again right after a restart) and a
+                    // recovery is running: the destination stays in the capture so `finish_recovery` re-adds it. Dropping
+                    // it here left a recovered capture with no destination, a share that silently ended.
+                    if still_wanted && self.recoveries.contains_key(&pending.capture_id) {
+                        tracing::info!("destination {:?} failed to come up while its capture is being restarted ({e}); the restart re-adds it", pending.destination_id);
+                        continue;
+                    }
+                    // The same, one step earlier: the restart's own re-add fails before the source reads as dead (the
+                    // 2 s silence rule comes after the 5 s IDR wait). Declaring it lost starts the next restart, which
+                    // re-adds the destination; the restart schedule bounds the loop (a visible failure at its end).
+                    if still_wanted
+                        && pending.from_recovery
+                        && let Some(capture) = self.captures.get(&pending.capture_id)
+                        && let ShareStatus::Active(ShareHandle::Video(h)) = &capture.status
+                        && h.declare_lost(format!("a destination could not come up after the capture restart: {e}"))
+                    {
+                        tracing::warn!("destination {:?} failed to come up after a capture restart ({e}); restarting the capture again", pending.destination_id);
+                        continue;
+                    }
                     if still_wanted {
                         note_share_error(&mut self.share_error, e);
                     }
@@ -2853,6 +2881,7 @@ impl AppState {
                 Err(oneshot::error::TryRecvError::Empty) => {
                     still_pending.push(pending);
                 }
+                Err(oneshot::error::TryRecvError::Closed) if self.recoveries.contains_key(&pending.capture_id) => {}
                 Err(oneshot::error::TryRecvError::Closed) => {
                     note_share_error(&mut self.share_error, t!("errors.share_start_task_ended").to_string());
                     self.forget_destination(pending.capture_id, pending.destination_id);
@@ -3924,10 +3953,10 @@ impl AppState {
         for (old_id, room, params) in readd {
             self.forget_destination(capture_id, old_id);
             let params = rescale_for_new_source(params, old_source, new_source);
-            self.add_destination_with_params(capture_id, room, PendingRole::GoingLive, params);
+            self.add_destination_inner(capture_id, room, PendingRole::GoingLive, params, true);
         }
         for (room, role, params) in recovery.deferred {
-            self.add_destination_with_params(capture_id, room, role, params);
+            self.add_destination_inner(capture_id, room, role, params, true);
         }
         tracing::info!("capture {capture_id:?}: recovered after {} attempt(s), {} ms", recovery.attempt, now.saturating_duration_since(recovery.since).as_millis());
         // `Why `start_pos + 1` and not the attempts used (a recovery that needed
@@ -6557,6 +6586,44 @@ mod ui_ops_tests {
         let recovery = state.recovery(capture_id).expect("the schedule goes on");
         assert!(recovery.retry_in(t0).is_some(), "the hung attempt is over and the next one is waiting");
         assert!(recovery.last_error().contains("did not start"), "{}", recovery.last_error());
+    }
+
+    /// Row 148: a destination whose bring-up fails while its capture is being restarted (the source died again under
+    /// it) is re-added by the restart, not dropped: before, the capture "recovered" with no destination and the share
+    /// ended silently (found by a 120 s window-resize stress).
+    #[tokio::test]
+    async fn a_destination_that_fails_during_a_capture_restart_is_kept_for_the_restart() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, dest_id) = insert_destination(&mut state);
+        let t0 = Instant::now();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: "boom".to_string(),
+                since: t0,
+                phase: RecoveryPhase::Waiting { until: t0 + Duration::from_secs(5) },
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+        let (tx, brx) = oneshot::channel();
+        state.pending_destinations.push(PendingDestination { capture_id, destination_id: dest_id, room: RoomHandle(0), role: PendingRole::GoingLive, rx: brx, from_recovery: false });
+        let _ = tx.send(Err("encode branch produced no IDR within 5s".to_string()));
+        state.poll_pending_destinations();
+        assert!(state.captures[&capture_id].destinations.contains_key(&dest_id), "the destination must survive for the restart to re-add");
+        assert!(state.share_error.is_none(), "no error toast for a failure the restart repairs");
+        // And without a restart running the failure is still the user's to hear about.
+        state.recoveries.shift_remove(&capture_id);
+        let (tx, brx) = oneshot::channel();
+        state.pending_destinations.push(PendingDestination { capture_id, destination_id: dest_id, room: RoomHandle(0), role: PendingRole::GoingLive, rx: brx, from_recovery: false });
+        let _ = tx.send(Err("encode branch produced no IDR within 5s".to_string()));
+        state.poll_pending_destinations();
+        assert!(!state.captures[&capture_id].destinations.contains_key(&dest_id));
+        assert!(state.share_error.is_some());
     }
 
     /// Task I8, "a camera unplugged mid-share should end the webcam share cleanly with a toast, not a portal restart

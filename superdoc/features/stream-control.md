@@ -123,6 +123,67 @@ CS has cancelled because the context is lost`): the encoder was busy while the o
 not the restart; `SizeWatch` hangs on the tee and works unchanged for any source. Frames there must be fresh buffers, not keepalive
 resends, or `poll_resize` reads it as dead.
 
+### Resize recovery verified on software, one silent share death fixed, VA still faults on a gentle window resize (2026-11-07, row 148)
+
+**Why this was done.** The user: "Frequent resolution changes (for example, when sharing a window), kills the screenshare (stalls). Make the
+recovery reliable. Right now it sometimes trips out and just stalls forever", then "Push and test it (crashes shouldnt happen anymore)".
+The code under test is the row-148 WIP: `poll_resize` reshape retries (`RESHAPE_RETRY`/`RESHAPE_TRIES`), `FIRST_FRAME_LOST`,
+`Watchdog` (rebuild, restart the capture, fail; 20 s per step, `WATCHDOG_AFTER`), `RESTART_ATTEMPT_MAX`, `MIN_ENCODE_DIM` = 144
+(`clamp_to_source` raises each axis to 144, so a sliver window is stretched on that axis only; the VA encoders refuse to link below 128/144).
+
+**What was exercised.** Real window share: `HS_PATTERN=window` puts a floating `vkcube` window on the captured output, xdpw 0.8.4 picks it
+with `chooser_type=dmenu` (`grep -m1 '^Window: vkcube'`), the sharer runs with `SSS_PORTAL_SOURCES=window` (test knob in
+`portal_source_types`; the product asks for monitors only), `hs-resize.sh winstress|ostress` resize it with `swaymsg resize`. Also the output
+mode change (`hs-resize.sh ostress` without `RESIZE_TARGET=win`). Software = `LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system` in
+`CLIENT_ENV_1` and `_2` (the log then says `VAAPI encoder element 'vah264enc' is not available`, `capture started in the System domain`, the
+viewer `H.264 decoding via avdec_h264 (software)`).
+
+**Finding 1: stock xdpw never follows a resize in place, for a window too.** Every settled window size ends in `the capture source delivers
+nothing since it changed size`, a portal restart (about 0.5 s, up to 3 s when the start-up flap repair runs) and a fresh branch. So against this
+portal the `poll_resize` branch-swap path (the in-place one) is almost never taken; the restart path carries the load. The swap path is
+covered by `end_to_end_test::a_window_resized_at_random_keeps_streaming` (test source, software, 40 s: 69 sizes, 13 swap rounds, longest gap
+2.0 s, final aspect right). Run: `E2E_FORCE_BACKEND=software SSS_STRESS_SECS=40 SSSHARE_SERVER_BIN=... cargo test -p simple-screensharing-client
+--lib --release -- --ignored a_window_resized_at_random --nocapture`.
+
+**Finding 2 (bug, fixed): a destination that failed to come up during a restart ended the share silently.** A restart re-adds the
+destinations on the new capture (`finish_recovery`), the bring-up takes up to 5 s (`no IDR within 5s`), and a window dragged again meanwhile
+kills the new source under it. `poll_pending_destinations` treated that `Err` as the user's problem: `forget_destination`, a toast, and a
+capture that "recovered" with zero destinations (UI `Not sharing`, portal session left running, nothing ever retried). Two orderings were
+caught in 120 s window stresses (seeds 11 and 21, each one in about three runs): the error arrives while the recovery runs (fixed: the
+destination stays in the capture, `finish_recovery` re-adds it, log `failed to come up while its capture is being restarted`), and it arrives
+0.5 s before the 2 s silence rule notices the dead source (fixed: a destination added by a restart carries `PendingDestination::from_recovery`,
+its failure calls `CaptureHandle::declare_lost`, the next restart re-adds it, log `restarting the capture again`; the restart schedule
+bounds the loop and ends in a visible failure). Without a restart and without `from_recovery` the old behaviour stands (the user's own
+Go live failing is still an error). Test: `session::ui_ops_tests::a_destination_that_fails_during_a_capture_restart_is_kept_for_the_restart`
+(the first ordering; the second needs a real capture and is covered by the stress runs).
+
+**Software stress results (x264, rig, release, 30 fps, viewer = client 2; viewer evidence = hash of the viewer tile's pixels every 0.2 s and
+the tile aspect from `SSS_UI_DUMP`):**
+
+| Run | Sizes | Longest frozen picture | End state |
+| --- | --- | --- | --- |
+| output mode changes, one at a time (1280x720, 640x360, 1920x1080) | 3 | 1.5 s | live |
+| output, 180 changes in 90 s down to 40x30, bursts of 6 at 80-160 ms | 180 | 3.7 s | live at 1280x720 (`Decoded 30 fps, 0 dropped`) |
+| window, `winstress` 90 s seed 5 (40x30 up to 1800x1000, bursts of 3-8 every 60-250 ms) | 159 | 4.8 s | live, aspect of 1000x600 |
+| window, 120 s seed 11, before the fix | 185 | **61.9 s and never ended**: share gone (finding 2) | `Not sharing` |
+| window, 120 s seeds 21 (before fix: 76.5 s, never ended; after: 7.3 s), 11 and 33 (after) | 219 / 204 / 195 | 7.6 s / 7.3 s / 10.1 s | live every time |
+
+The longest freezes sit inside bursts (each settled size is a restart); after the last change every run showed a moving picture again within
+about 2 s, no `StartFailed`, no watchdog step (`watchdog 1/3` never logged: the faster paths always won), no `share error`.
+
+**Finding 3: VA, window share, gentle sizes: the GPU faulted on the second change (HARD STOP, run ended).** Stage B (VA encoder `vah264enc`
+60 fps, `vapostproc` GPU capture, viewer `vah264dec`, window sizes >= 640x360, one change every 3-6 s): the 4th change (858x977, 3.5 s after the
+previous one) was followed within 1.5 s by `amdgpu: [mmhub] page fault (src_id:0 ring:56 vmid:15 pasid:1402) ... in page starting at address
+0x0000000000000000 from client 18 ... Faulty UTCL2 client ID: VCN0` in the sharer's encoder thread (`simple-scr:cs0`), then `ring vcn_unified_0
+timeout`, `Starting vcn_unified_0 ring reset`, `Ring vcn_unified_0 reset succeeded` (no full GPU reset this time). The client log shows what
+ran: the previous restart's VA branch torn down (`capture pipeline did not reach EOS within 1s; forcing it to Null anyway`) while the next
+restart built a new VA encoder; two such restarts 2.1 s apart. Stages B and C were stopped there and nothing more ran on the GPU.
+So even sizes of 640x360 and up at one change per 3 s are not safe on this machine's VA encoder when each change is a capture restart
+(the only kind this portal gives). Untested: whether `MIN_ENCODE_DIM` matters (the fault came at a normal size), whether the odd height 977
+is the trigger (the clamp does not round to even), and whether slower changes or a longer EOS wait avoid it. Candidate fixes (not done, they
+need GPU runs that this machine cannot take safely): wait for the old pipeline's real EOS or Null before building the next VA encoder, and
+space restarts further apart.
+
 ---
 
 ## Settings changes on a live share, and the coded-buffer deaths that were left (2026-11-04, task #139)

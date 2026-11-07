@@ -34,6 +34,14 @@ gamescope. So **no resize stress or rapid encoder restarts on a VA encoder on th
 software encoding (x264, `CaptureDomain::System`) for that logic. At the first `mmhub page fault` or `vcn_unified` line in
 `journalctl -k`, stop the run and report; do not continue.
 
+**Measured again 2026-11-07 (row 148, user: "Push and test it (crashes shouldnt happen anymore)"): a *gentle* VA run still faults.** Window share
+in the rig, `vah264enc`, window sizes >= 640x360, one change per 3-6 s: the 4th change (858x977) produced `[mmhub] page fault ... address
+0x0 ... Faulty UTCL2 client ID: VCN0` in the sharer's encoder thread, then `ring vcn_unified_0 timeout` and `Ring vcn_unified_0 reset
+succeeded` (no full reset). A kernel-log watcher (`.tl-scratch/kwatch`-style: poll `journalctl -k` every 2 s, `hs-rig.sh down` on a hit) ended
+the run at once. So **no VA resize test at all** (not even gentle) until the capture-restart teardown is fixed; software encoding
+(`LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system` in `CLIENT_ENV_1`/`_2`, the log must say `using software encoder`) took 120 s window
+stresses with sizes down to 40x30 and bursts every 60 ms without a kernel message. Details: `features/stream-control.md` "Resize recovery verified".
+
 What does **not** count as verification of app behaviour:
 
 - **`--gallery`** (`simple-screensharing-client --gallery`, `client/src/widgets/gallery.rs`).
