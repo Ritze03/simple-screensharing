@@ -890,6 +890,13 @@ pub const MAX_FRAMERATE: u32 = 280;
 /// See [`MAX_FRAMERATE`].
 pub const MIN_FRAMERATE: u32 = 1;
 
+/// The smallest width and height an encode branch is asked for. Measured on this machine's VA encoders (row 148,
+/// `vah264enc`/`vah265enc`/`vaav1enc` on `videotestsrc`): `vah264enc` and `vaav1enc` refuse (`could not link`) below 128
+/// on either axis and `vah265enc` below 144 in width, so a window dragged small made every swap fail its VA build,
+/// land on x264 (a 10 s freeze each time, CPU encoding for the rest of the share) and leave the viewer's hardware
+/// decoder to fail on the tiny picture. 144 is the largest of them, rounded to even.
+pub const MIN_ENCODE_DIM: u32 = 144;
+
 /// `pipewiresrc` `min-buffers` for the portal stream. See
 /// [`CaptureSource::launch_fragment`]: with `keepalive-time` set, one buffer is
 /// always held back, and the portal's default pool of two then halves the
@@ -1283,6 +1290,17 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 
 /// [`open_portal_capture`] with an optional token to restore.
 ///
+/// The source types the portal is asked for: monitors, plus windows when `SSS_PORTAL_SOURCES` contains `window`
+/// (a test knob, row 148: lets the headless rig's xdpw offer a window to share so a window resize can be measured; the
+/// product asks for monitors only).
+fn portal_source_types() -> ashpd::enumflags2::BitFlags<SourceType> {
+    let mut types = ashpd::enumflags2::BitFlags::from(SourceType::Monitor);
+    if std::env::var("SSS_PORTAL_SOURCES").is_ok_and(|v| v.contains("window")) {
+        types |= SourceType::Window;
+    }
+    types
+}
+
 /// `Why `PersistMode::ExplicitlyRevoked` and the token (#99):` when the
 /// capture source dies (portal restarted, monitor hotplug, mode change) the
 /// session restarts the capture by itself, and an unattended restart must not
@@ -1307,7 +1325,7 @@ async fn open_portal_capture_restoring(restore_token: Option<&str>) -> Result<Po
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Embedded)
-                .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
+                .set_sources(portal_source_types())
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
                 .set_restore_token(restore_token),
@@ -1720,6 +1738,21 @@ const SOURCE_GAP_LOST: Duration = Duration::from_millis(2000);
 pub const SOURCE_RESIZED_TEXT: &str = "the capture source stopped after it changed size";
 /// Frames that must arrive at the `tee` after a size change for the source to count as alive.
 const RESIZE_ALIVE_FRAMES: u64 = 3;
+/// A capture that replaced a lost one ([`CaptureHandle::expect_frames`]) and has still produced no frame after this
+/// long is lost again, so the restart schedule runs on to either a picture or a visible failure (row 148). A first
+/// capture is exempt: an idle monitor legitimately delivers its first frame only when something repaints.
+const FIRST_FRAME_LOST: Duration = Duration::from_secs(20);
+/// After a size change a destination whose shape (aspect) is still not the source's is swapped again, at most this
+/// often and this many times per size (a swap can fail, or land inside another swap).
+const RESHAPE_RETRY: Duration = Duration::from_secs(3);
+const RESHAPE_TRIES: u32 = 3;
+
+/// What [`CaptureHandle::poll_resize`] has tried for the source's current size.
+#[derive(Default)]
+struct Reshape {
+    tries: u32,
+    tried_at: Option<Instant>,
+}
 
 /// Frame size at the `tee` as the caps events report it (the live size; `source_caps()` is the size the
 /// destinations were built for), the time of its last change and the buffers seen since.
@@ -2641,6 +2674,12 @@ pub struct CaptureHandle {
     /// replacement capture of a restart so a portal that persists permission
     /// re-grants the same source without a picker (#99).
     restore_token: Option<String>,
+    /// When this capture started, for [`FIRST_FRAME_LOST`].
+    started: Instant,
+    /// Set by the session on a capture that replaces a lost one: see [`FIRST_FRAME_LOST`].
+    expect_frames: std::sync::atomic::AtomicBool,
+    /// See [`Reshape`].
+    reshape: Mutex<Reshape>,
 }
 
 impl Drop for CaptureHandle {
@@ -3036,6 +3075,9 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         destinations: Vec::new(),
         stopped: false,
         restore_token,
+        started: Instant::now(),
+        expect_frames: std::sync::atomic::AtomicBool::new(false),
+        reshape: Mutex::new(Reshape::default()),
     })
 }
 
@@ -3825,52 +3867,90 @@ impl CaptureHandle {
         *state
     }
 
+    /// Marks this capture as the replacement of a lost one: if it never produces a frame it is lost again
+    /// ([`FIRST_FRAME_LOST`]).
+    pub fn expect_frames(&self) {
+        self.expect_frames.store(true, Ordering::Relaxed);
+    }
+
     /// Per-frame check for a source that changed size (a window resized, a monitor mode change, a game
     /// changing resolution). Waits until the size has been stable for [`RESIZE_SETTLE`], so a drag rebuilds once.
     /// Then, if frames kept arriving, every destination is swapped to the new shape ([`rescale_for_new_source`],
     /// the same [`Self::change_destination`] branch swap as a settings edit) and the new size becomes
     /// [`Self::source_caps`]; if the source went silent (stock xdpw does, after a mode change) the capture is
     /// declared lost at once, which the session answers with its restart (no 5 s silence wait).
+    /// A destination that is still not in the source's shape afterwards (its swap failed, or landed inside
+    /// another swap) is swapped again every [`RESHAPE_RETRY`], [`RESHAPE_TRIES`] times per size (row 148).
     ///
     /// Why not swap on the caps event itself: a drag sends dozens of sizes; each swap is an encoder build.
     /// Why the branches meanwhile keep their fixed size: the picture is briefly scaled (stretched) into it,
     /// never a stall.
-    // ponytail: a destination whose swap is already in flight when the size settles answers Err and is not
-    // retried (the next resize does it); ceiling: a resize landing inside a user's Apply.
     pub fn poll_resize(&self, now: Instant) -> Vec<(DestKey, ChangeRequest)> {
         let basis = self.source_caps();
         let last = self.capture_errors.size.last_ms.load(Ordering::Relaxed);
-        if self.capture_errors.silence_is_loss
-            && last > 0
-            && now.saturating_duration_since(watch_base()) > Duration::from_millis(last) + SOURCE_GAP_LOST
+        // Silence at the tee: no frame for SOURCE_GAP_LOST since the last one, or (a capture that replaced a lost
+        // one) none for FIRST_FRAME_LOST since it started.
+        let silent = if last > 0 {
+            let gap = now.saturating_duration_since(watch_base()).saturating_sub(Duration::from_millis(last));
+            (gap > SOURCE_GAP_LOST).then(|| format!("no frame reached the capture tee for {gap:?}"))
+        } else if self.expect_frames.load(Ordering::Relaxed) {
+            let gap = now.saturating_duration_since(self.started);
+            (gap > FIRST_FRAME_LOST).then(|| format!("the restarted capture produced no frame in {gap:?}"))
+        } else {
+            None
+        };
+        if let Some(why) = silent
+            && self.capture_errors.silence_is_loss
             && self.capture_errors.lost().is_none()
         {
-            tracing::warn!("no frame reached the capture tee for {SOURCE_GAP_LOST:?}; the source is dead, restarting the capture");
+            tracing::warn!("{why}; the source is dead, restarting the capture");
             self.capture_errors.mark_lost("the capture source stopped delivering frames".to_string());
         }
         let Some((w, h, at)) = *self.capture_errors.size.changed.lock().unwrap() else { return Vec::new() };
-        if basis.width == 0 || (w, h) == (basis.width, basis.height) || now.saturating_duration_since(at) < RESIZE_SETTLE {
+        if basis.width == 0 || now.saturating_duration_since(at) < RESIZE_SETTLE {
             return Vec::new();
         }
         let (frames, fresh) = (self.capture_errors.size.frames(), self.capture_errors.size.fresh.load(Ordering::Relaxed));
-        tracing::debug!("source resized to {w}x{h}: {frames} frames, {fresh} fresh since");
+        if (w, h) != (basis.width, basis.height) {
+            tracing::debug!("source resized to {w}x{h}: {frames} frames, {fresh} fresh since");
+        }
         if fresh < RESIZE_ALIVE_FRAMES {
-            if self.capture_errors.silence_is_loss && self.capture_errors.lost().is_none() {
+            if (w, h) != (basis.width, basis.height) && self.capture_errors.silence_is_loss && self.capture_errors.lost().is_none() {
                 tracing::warn!("the capture source delivers nothing since it changed size to {w}x{h}; restarting the capture");
                 self.capture_errors.mark_lost(SOURCE_RESIZED_TEXT.to_string());
             }
             return Vec::new();
         }
         let new = destination::SourceCaps { width: w, height: h, framerate: basis.framerate };
-        *self.source_state.lock().unwrap() = new;
-        tracing::info!("capture source resized {}x{} -> {w}x{h}; rebuilding {} destination(s) at the new shape", basis.width, basis.height, self.destinations.len());
-        self.destinations
-            .iter()
-            .filter_map(|d| {
-                let target = destination::rescale_for_new_source(d.params(), basis, new);
-                self.change_destination(d.key, target).ok().map(|c| (d.key, c))
-            })
-            .collect()
+        let mut reshape = self.reshape.lock().unwrap();
+        let first = (w, h) != (basis.width, basis.height);
+        if first {
+            *self.source_state.lock().unwrap() = new;
+            *reshape = Reshape::default();
+            tracing::info!("capture source resized {}x{} -> {w}x{h}; rebuilding {} destination(s) at the new shape", basis.width, basis.height, self.destinations.len());
+        } else if reshape.tries >= RESHAPE_TRIES || reshape.tried_at.is_some_and(|t| now.saturating_duration_since(t) < RESHAPE_RETRY) {
+            return Vec::new();
+        }
+        let mut requested = Vec::new();
+        for d in &self.destinations {
+            let params = d.params();
+            let live = matches!(d.runtime.lock().unwrap().state(), destination::DestinationState::Live);
+            // The first round asks everyone (a swap in flight defers the command); a retry only a destination that is
+            // idle and still not in shape.
+            if (first || (live && !destination::in_shape(params, new)))
+                && let Ok(c) = self.change_destination(d.key, destination::rescale_for_new_source(params, basis, new))
+            {
+                requested.push((d.key, c));
+            }
+        }
+        if !requested.is_empty() {
+            reshape.tries += 1;
+            reshape.tried_at = Some(now);
+            if !first {
+                tracing::warn!("a destination is still not in the shape of the {w}x{h} source; swapping it again (try {} of {RESHAPE_TRIES})", reshape.tries);
+            }
+        }
+        requested
     }
 
     /// Raise the rate this capture is considered to be running at, so a
@@ -4482,6 +4562,8 @@ async fn destination_pump(
     let mut branch_failures: VecDeque<Instant> = VecDeque::new();
     // Set once this pump declared the capture source dead, to log it once.
     let mut declared_source_lost = false;
+    // The no-video watchdog on top of everything above (row 148, see [`Watchdog`]).
+    let mut dog = Watchdog::new(Instant::now());
 
     loop {
         // A handle on the current branch's failure latch that does not borrow `branch` (the sample arm
@@ -4558,7 +4640,10 @@ async fn destination_pump(
                                 Err(e) => Err(e),
                             };
                             match result {
-                                Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
+                                Ok(()) => {
+                                    record_sent_frame(&mut sent_frame_times, &sent_fps);
+                                    dog.fed(Instant::now());
+                                }
                                 Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
                             }
                         }
@@ -4682,6 +4767,53 @@ async fn destination_pump(
                     }
                     send_stall_keepalive(&client, stream_id, &runtime);
 
+                    // The watchdog: whatever the reason (a swap that never ends, a branch that ended, a source that
+                    // resends but is dead, a stall nothing above resolves), a destination on air that hands no encoded
+                    // frame to the network for WATCHDOG_AFTER climbs a ladder that always makes progress.
+                    {
+                        let state = runtime.lock().unwrap().state();
+                        let armed = !paused
+                            && capture_errors.silence_is_loss
+                            && capture_errors.lost().is_none()
+                            && matches!(
+                                state,
+                                destination::DestinationState::Live
+                                    | destination::DestinationState::Stalled { .. }
+                                    | destination::DestinationState::Rebuilding { .. }
+                            );
+                        let can_rebuild = swapping.is_none() && branch.is_some();
+                        match armed.then(|| dog.due(now, can_rebuild)).flatten() {
+                            None => {
+                                if !armed {
+                                    dog.idle(now);
+                                }
+                            }
+                            Some(0) => {
+                                tracing::warn!(
+                                    "stream {stream_id}: watchdog 1/3: no encoded frame was sent for {WATCHDOG_AFTER:?} (destination {}); rebuilding the encode branch",
+                                    state.label()
+                                );
+                                let params = runtime.lock().unwrap().params();
+                                let old = branch.take().expect("can_rebuild");
+                                let id = branch::BranchId(next_branch_id);
+                                next_branch_id = next_branch_id.wrapping_add(1);
+                                swapping = Some(PendingSwap::spawn(&pipeline, &tee, &runtime, old, id, params, branch::SwapMode::Recovery, None));
+                            }
+                            Some(1) => {
+                                tracing::warn!(
+                                    "stream {stream_id}: watchdog 2/3: still no encoded frame after {WATCHDOG_AFTER:?} more (destination {}); declaring the capture source lost so it is restarted",
+                                    state.label()
+                                );
+                                declared_source_lost = true;
+                                capture_errors.mark_lost("no video could be sent".to_string());
+                            }
+                            Some(_) => {
+                                tracing::error!("stream {stream_id}: watchdog 3/3: the capture restart did not bring video back either; failing the destination");
+                                runtime.lock().unwrap().fail("no video could be sent, and restarting the capture did not help");
+                            }
+                        }
+                    }
+
                     // The stall is never open-ended (#99): diagnose what is
                     // silent and act, on a schedule that ends in either a
                     // recovered stream or a Failed one the user can retry.
@@ -4690,10 +4822,14 @@ async fn destination_pump(
                         (r.state(), r.params())
                     };
                     match state {
-                        destination::DestinationState::Live => {
+                        // Live only counts as recovered after it stayed Live (row 148): a rebuilt branch emits its IDR,
+                        // goes Live, then stays silent again; resetting at that first Live made the rebuilds endless
+                        // and the escalation to a capture restart unreachable.
+                        destination::DestinationState::Live if last_wedge_rebuild.is_none_or(|t| now.saturating_duration_since(t) >= WATCHDOG_HEALTHY) => {
                             wedge_rebuilds = 0;
                             last_wedge_rebuild = None;
                         }
+                        destination::DestinationState::Live => {}
                         destination::DestinationState::Stalled { since, .. }
                             if swapping.is_none() && !paused && branch.is_some() && capture_errors.lost().is_none() =>
                         {
@@ -5013,6 +5149,60 @@ const BRANCH_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 /// How long [`destination_pump`]'s `Stop` waits for the relay to accept the
 /// `StopStream` before moving on to the branch teardown regardless.
 const STOP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a destination on air may hand no encoded frame to the network before [`Watchdog`] acts, per step.
+/// Above the 3 s silence + 3 s stall + 5 s IDR deadline of the faster paths, which stay the first answer; this is the
+/// net under them, so a swap that cannot finish, a branch that ended, a source that only resends: any stall ends.
+const WATCHDOG_AFTER: Duration = Duration::from_secs(20);
+/// Frames must keep flowing this long after a watchdog (or wedge-rebuild) step for it to count as recovered, i.e. for
+/// the escalation counters to start again at the first step.
+const WATCHDOG_HEALTHY: Duration = Duration::from_secs(10);
+
+/// The destination pump's no-video ladder (row 148): rebuild the branch, then declare the capture lost (the session
+/// restarts it), then fail the destination, each after another [`WATCHDOG_AFTER`] without a frame sent. The counter only
+/// goes back to the first step after [`WATCHDOG_HEALTHY`] of real frames, so a restart that yields one IDR and then
+/// nothing still climbs. Pure, so it is unit-tested with injected times.
+struct Watchdog {
+    base: Instant,
+    steps: u32,
+    stepped_at: Option<Instant>,
+}
+
+impl Watchdog {
+    fn new(now: Instant) -> Self {
+        Self { base: now, steps: 0, stepped_at: None }
+    }
+
+    /// An encoded frame went to the network.
+    fn fed(&mut self, now: Instant) {
+        self.base = now;
+        if self.stepped_at.is_some_and(|t| now.saturating_duration_since(t) >= WATCHDOG_HEALTHY) {
+            self.steps = 0;
+            self.stepped_at = None;
+        }
+    }
+
+    /// Not expected to send (paused, starting, the source is already lost): the clock does not run.
+    fn idle(&mut self, now: Instant) {
+        self.base = now;
+    }
+
+    /// The step to take now (0 rebuild, 1 restart the capture, 2 fail), if the silence has lasted [`WATCHDOG_AFTER`].
+    /// Without a branch to rebuild (a swap in flight, a branch taken away) step 0 is skipped.
+    fn due(&mut self, now: Instant, can_rebuild: bool) -> Option<u32> {
+        if now.saturating_duration_since(self.base) < WATCHDOG_AFTER {
+            return None;
+        }
+        if self.steps == 0 && !can_rebuild {
+            self.steps = 1;
+        }
+        let step = self.steps;
+        self.steps += 1;
+        self.base = now;
+        self.stepped_at = Some(now);
+        Some(step)
+    }
+}
 
 /// A branch swap running as its own task (see the pump's `ApplyParams` arm).
 /// Both a user's settings change and the encoder-wedge recovery rebuild use
@@ -5950,7 +6140,7 @@ pub mod destination {
     /// picture geometrically correct, which matters because the branch's
     /// `videoscale` will happily distort otherwise.
     pub fn clamp_to_source(params: VideoParams, source: SourceCaps) -> VideoParams {
-        let mut out = VideoParams {
+        let out = VideoParams {
             framerate: params.framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE),
             ..params
         };
@@ -5960,7 +6150,24 @@ pub mod destination {
             // "whatever the source is"): nothing to clamp against.
             return out;
         }
+        let out = clamp_never_upscale(out, source);
+        // The one exception to "never upscale": the encoders' floor (see `MIN_ENCODE_DIM`). Per axis, so a sliver
+        // window is stretched on that axis only.
+        VideoParams { width: out.width.max(MIN_ENCODE_DIM), height: out.height.max(MIN_ENCODE_DIM), ..out }
+    }
 
+    /// Whether `params` has the aspect of `source` (within 4 %, the floor of [`MIN_ENCODE_DIM`] applied to the source
+    /// first): a destination that is not has to be swapped after the source changed size.
+    pub fn in_shape(params: VideoParams, source: SourceCaps) -> bool {
+        if params.width == 0 || params.height == 0 || source.width == 0 || source.height == 0 {
+            return true;
+        }
+        let (sw, sh) = (u64::from(source.width.max(MIN_ENCODE_DIM)), u64::from(source.height.max(MIN_ENCODE_DIM)));
+        let (w, h) = (u64::from(params.width), u64::from(params.height));
+        (w * sh).abs_diff(h * sw) * 100 <= 4 * h * sw
+    }
+
+    fn clamp_never_upscale(mut out: VideoParams, source: SourceCaps) -> VideoParams {
         if out.width > source.width || out.height > source.height {
             // Rational arithmetic in u64 rather than floats: exact, and no
             // rounding surprise that could leave a dimension one pixel over.
@@ -13343,5 +13550,91 @@ mod tests {
             );
         }
         built.pipeline.set_state(gst::State::Null).expect("null");
+    }
+}
+
+/// Row 148: the no-video ladder, the encoder floor and the shape check.
+#[cfg(test)]
+mod resize_recovery_tests {
+    use super::*;
+    use destination::{SourceCaps, VideoParams};
+
+    fn params(w: u32, h: u32) -> VideoParams {
+        VideoParams {
+            width: w,
+            height: h,
+            framerate: 30,
+            bitrate_kbps: 4000,
+            backend: EncoderBackend::Software,
+            tune: TuneMode::default(),
+            quality_level: QualityLevel::default(),
+            gop_millis: DEFAULT_GOP_MILLIS,
+            codec: VideoCodec::default(),
+        }
+    }
+
+    #[test]
+    fn the_watchdog_climbs_one_step_per_silence_and_never_starts_over_on_one_frame() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        assert_eq!(dog.due(t0 + WATCHDOG_AFTER - Duration::from_secs(1), true), None);
+        assert_eq!(dog.due(t0 + WATCHDOG_AFTER, true), Some(0), "rebuild first");
+        // the rebuilt branch emits one IDR and goes quiet again: that must not reset the ladder
+        dog.fed(t0 + WATCHDOG_AFTER + Duration::from_millis(500));
+        let t1 = t0 + WATCHDOG_AFTER * 2 + Duration::from_millis(500);
+        assert_eq!(dog.due(t1, true), Some(1), "then restart the capture");
+        assert_eq!(dog.due(t1 + WATCHDOG_AFTER, true), Some(2), "then a visible failure");
+        assert_eq!(dog.due(t1 + WATCHDOG_AFTER * 2, true), Some(3), "and it keeps counting past the end");
+    }
+
+    #[test]
+    fn the_watchdog_starts_over_only_after_sustained_frames() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        assert_eq!(dog.due(t0 + WATCHDOG_AFTER, true), Some(0));
+        let mut t = t0 + WATCHDOG_AFTER;
+        while t < t0 + WATCHDOG_AFTER + WATCHDOG_HEALTHY + Duration::from_secs(1) {
+            t += Duration::from_millis(33);
+            dog.fed(t);
+        }
+        assert_eq!(dog.due(t + WATCHDOG_AFTER, true), Some(0), "healthy for long enough: the ladder is reset");
+    }
+
+    #[test]
+    fn the_watchdog_skips_the_rebuild_when_there_is_no_branch_to_rebuild() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        assert_eq!(dog.due(t0 + WATCHDOG_AFTER, false), Some(1), "a swap that never ends goes straight to a capture restart");
+    }
+
+    #[test]
+    fn an_idle_destination_does_not_run_the_clock() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        dog.idle(t0 + WATCHDOG_AFTER * 3);
+        assert_eq!(dog.due(t0 + WATCHDOG_AFTER * 3 + Duration::from_secs(1), true), None);
+    }
+
+    #[test]
+    fn a_tiny_source_is_encoded_at_the_encoders_floor_not_at_its_own_size() {
+        let source = SourceCaps { width: 80, height: 60, framerate: 30 };
+        let out = destination::clamp_to_source(params(80, 60), source);
+        assert_eq!((out.width, out.height), (MIN_ENCODE_DIM, MIN_ENCODE_DIM));
+        let source = SourceCaps { width: 1920, height: 100, framerate: 30 };
+        let out = destination::clamp_to_source(params(1920, 100), source);
+        assert_eq!((out.width, out.height), (1920, MIN_ENCODE_DIM), "only the short axis is raised");
+        let source = SourceCaps { width: 1920, height: 1080, framerate: 30 };
+        assert_eq!(destination::clamp_to_source(params(3840, 2160), source).width, 1920, "never upscale above the floor");
+    }
+
+    #[test]
+    fn in_shape_follows_the_aspect_and_the_floor() {
+        let wide = SourceCaps { width: 1600, height: 900, framerate: 30 };
+        assert!(destination::in_shape(params(1600, 900), wide));
+        assert!(destination::in_shape(params(800, 450), wide));
+        assert!(!destination::in_shape(params(1280, 720), SourceCaps { width: 900, height: 1000, framerate: 30 }));
+        let tiny = SourceCaps { width: 60, height: 50, framerate: 30 };
+        assert!(destination::in_shape(params(MIN_ENCODE_DIM, MIN_ENCODE_DIM), tiny), "the floored size is the right shape for a tiny source");
+        assert!(destination::in_shape(params(0, 0), wide), "a destination that follows the source is always in shape");
     }
 }
