@@ -1,7 +1,7 @@
 # Windows client
 
 > **Status (2026-10-14).** The egui client builds and its networking, crypto, capture-encode and
-> decode paths run on Windows 11 (verified in the WinBoat test VM, over SSH only). What is **not**
+> decode paths run on Windows 11 (verified in a Windows test VM, over SSH only). What is **not**
 > verified: the window on a real desktop session and `d3d11screencapturesrc` capture (the VM had
 > no interactive session at the time), and every GPU path (the VM has no GPU, see "Verified").
 > Windows has no audio capture or sharing; the viewer side plays audio through `autoaudiosink`
@@ -82,12 +82,12 @@ binaries for `cargo run`. Consequences, all handled in `main.rs`:
   inherited handle is used; attaching in that case replaced the handles and lost the output (seen over SSH).
   Exit codes are unchanged (`--help` 0, bad argument 2). `--gallery` is unaffected.
 
-Why: the user double-clicked the exe in the WinBoat VM on 2026-10-15 and a black Windows Terminal tab opened next to
+Why: the project owner double-clicked the exe in the Windows test VM on 2026-10-15 and a black Windows Terminal tab opened next to
 the window. A shipped GUI app must not show a console.
 
-Where the output lands for the user: after `package.ps1`, the folder and the zip are also copied to the VM user's
-Desktop (`C:\Users\mo\Desktop\simple-screensharing-windows\` and `...\simple-screensharing-windows.zip`) so it can be
-started by double-click; the zip is also copied back to the Linux repo's `dist\` (gitignored).
+Where the output lands for the user: after `package.ps1`, the folder and the zip are also copied to the test VM user's
+Desktop so it can be started by double-click; the zip is also copied back to the Linux repo's `dist\` (gitignored).
+Exact locations: `.claude/local/windows-vm.md` in the main checkout.
 
 **A missing GStreamer element breaks every share (2026-10-15, task #73).** The first real share in the VM
 failed with `failed to construct encode branch bin: ... no element "capssetter"`: the `debug` plugin was not in
@@ -113,7 +113,7 @@ installer, otherwise SmartScreen warns on first start. The zip is the "friends" 
 | `client/src/main.rs` | `use_bundled_gstreamer` | see Package |
 | `client/src/decode/video.rs` | hardware decoder is `d3d11h264dec` / `d3d11h265dec` / `d3d11av1dec` (const fn `hw`) instead of the VA ones; software AV1 is `dav1ddec` | The same probation logic demotes an unusable hardware decoder to software. The official Windows build has no libaom `av1dec`, only dav1d. D3D11 rather than D3D12 (`d3d12h264dec`): shipped in every 1.2x build, works on every vendor |
 | `client/src/rooms.rs`, `session.rs` | config dir = `$SSS_CONFIG_HOME` if set, else `dirs::config_dir()` | `dirs` ignores `XDG_CONFIG_HOME` on Windows (Roaming AppData comes from the shell API), so the unit tests could not be isolated from the real config: 42 tests failed their own safety assertion (good: nothing was overwritten). Also gives scratch runs a way to avoid a user's saved rooms on every platform |
-| `client/src/capture.rs` | test source path in gst-launch syntax uses `/` | a backslash is an escape in `gst-launch` syntax, so `filesrc location=C:\Users\...` pointed nowhere (2 orientation tests) |
+| `client/src/capture.rs` | test source path in gst-launch syntax uses `/` | a backslash is an escape in `gst-launch` syntax, so `filesrc location=C:\dir\...` pointed nowhere (2 orientation tests) |
 | `client/src/capture.rs`, `Cargo.toml` | cargo feature `test-source` exposes the `videotestsrc` capture seam | for the headless `test_sender` example, see below |
 
 `capture.rs` already had the Windows capture source from the Electron era (`d3d11screencapturesrc
@@ -136,31 +136,27 @@ The viewer prints one line per second (decoder element, codec, decoded fps, rece
 sender's display name: a killed sender leaves a stale stream in the room until the relay times it out, and the
 viewer would otherwise pick that one.
 
-## Reaching the VM and syncing the sources (agents; SSH only, never the WinBoat window)
+## The Windows test VM and syncing the sources (agents; SSH only, never the VM's window)
 
-- **SSH**: `ssh -i ~/.ssh/winboat mo@172.18.0.2` (the WinBoat container's address; it NATs port 22 on to the guest;
-  `172.30.0.2` refuses). The user/password are in `~/.winboat/docker-compose.yml` (`USERNAME`). The login shell is
-  **cmd.exe**; the host key changes with the VM, so use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`.
-  `scp` works the same (`scp -i ~/.ssh/winboat file mo@172.18.0.2:C:/Users/mo/tmp/file`). `tar`, `git` and `scp`
-  are on the VM.
-- **Sources**: `C:\sss-src` is a plain copy of the workspace, **not a git checkout**. Refresh it with
+How to reach the VM (address, login, key, paths, network topology) is local setup: `.claude/local/windows-vm.md` in the
+main checkout (not committed). What is generally true:
+
+- The login shell is **cmd.exe**; `tar`, `git` and `scp` are on the VM.
+- **Sources**: the VM holds a plain copy of the workspace, **not a git checkout**. Refresh it with
   `tar -cf src.tar client protocol server Cargo.toml Cargo.lock` on Linux (from the repo/worktree root), `scp` it,
-  then `rmdir /s /q C:\sss-src & mkdir C:\sss-src & tar -xf <tar> -C C:\sss-src`. A single changed file can just be
-  `scp`-ed over its twin.
-- **Build and package**: `cd /d C:\sss-src` then `build.ps1 -TargetDir C:\sss-target`, `package.ps1` (output
-  `C:\sss-src\dist\`). Long commands are easiest as a `.cmd` file `scp`-ed over and run in one `ssh` call (quoting
-  through two shells is fragile). Check `tasklist` first: do not overwrite an exe the user is running
-  (`C:\sss-target`); build into another `-TargetDir` then.
+  then recreate the source directory from the tar. A single changed file can just be `scp`-ed over its twin.
+- **Build and package**: from the source directory run `build.ps1 -TargetDir <target dir>` and `package.ps1` (output
+  `dist\` under the source directory). Long commands are easiest as a `.cmd` file `scp`-ed over and run in one `ssh` call
+  (quoting through two shells is fragile). Check `tasklist` first: do not overwrite an exe the user is running; build
+  into another `-TargetDir` then.
 - Do not start the GUI over SSH expecting a window (session 0, no display): it logs to `client.log` and exits 101 at
   swapchain creation (`0x887A0022`), which is also the quickest way to check that logging works.
 
-## Running a relay for a Windows VM (WinBoat network facts)
+## Running a relay on Windows
 
-- The guest (172.30.0.2) cannot reach the Linux host: the host firewall drops everything arriving from the docker
-  bridge (TCP and UDP, to 172.18.0.1 and to the LAN address), so a relay on the host is unreachable from the guest.
-- The other direction works: the WinBoat container NATs **all UDP** sent to 172.18.0.2 on to the guest
-  (`iptables -t nat -S PREROUTING` in the container), and TCP except a few ports. So the relay runs **inside the VM**
-  and the Linux side connects to `172.18.0.2:4433`. Inside the VM the Windows firewall needs an inbound UDP rule
+- A VM behind a NAT may not reach the host (a host firewall can drop what arrives from the VM bridge) while the host can
+  reach the VM: then the relay runs **inside the VM** and the Linux side connects to it. The topology of the test VM is in
+  `.claude/local/windows-vm.md`. Inside the VM the Windows firewall needs an inbound UDP rule
   (`New-NetFirewallRule -Direction Inbound -Protocol UDP -LocalPort 4433 -Action Allow`).
 - The relay's TUI needs a console: started through `Win32_Process.Create` (a hidden session 0 console) or a
   scheduled task in the interactive session.
@@ -176,7 +172,7 @@ viewer would otherwise pick that one.
 
 ## Windows virtual NIC: UDP send offload loses QUIC datagrams
 
-In the WinBoat VM (Red Hat VirtIO Ethernet Adapter, UDP segmentation offload on), a Windows quinn endpoint
+In the Windows test VM (VirtIO Ethernet adapter, UDP segmentation offload on), a Windows quinn endpoint
 that **sends** media to a peer outside the VM loses most datagrams: the relay forwarded a 1080p30 stream to a
 Linux viewer at about 1 frame per second instead of 30 (control streams are fine; loopback is fine). Mechanism:
 quinn-udp uses `UDP_SEND_MSG_SIZE` (GSO) on Windows and batches same-size datagrams; in this VM the batches
@@ -195,7 +191,7 @@ confirmed on real Windows hardware (physical NICs are likely unaffected).
 
 ## Verified
 
-All numbers from the WinBoat VM: Windows 11 24H2, 4 vCPU (i9-10900K), 12 GB, Red Hat VirtIO GPU (no GPU video
+All numbers from the Windows test VM: Windows 11 24H2, 4 vCPU, 12 GB, VirtIO GPU (no GPU video
 decode, no Vulkan), release builds, GStreamer 1.26.9. Linux sender/viewer are the headless examples above on the
 host; the relay runs in the VM.
 
@@ -226,7 +222,7 @@ webcam stubs, `CaptureSource::Windows`) but proves nothing about linking, the MS
 
 ## Known limits
 
-- No Windows audio capture/sharing: `audio.rs` is PipeWire-only (`#[cfg(not(target_os = "linux"))]` stubs).
+- No Windows audio capture/sharing: the audio capture code is PipeWire-based and nothing starts an audio share off Linux. Only `die_with_parent` in `audio.rs` is cfg-gated (`#[cfg(target_os = "linux")]` / `not`, `audio.rs:765,787`); the rest of the file compiles on Windows.
 - **Linux only since 2026-11-04 (stage tasks I7, I8):** **Desktop audio**, the source groups and the exclusion list (all of the audio button: it can only turn on a PipeWire source), audio-only shares, and the **webcam** (`v4l2src`: `capture::webcam::list_cameras` returns nothing off Linux, the bar's Webcam button is disabled with that reason). A Windows client still *receives* all of it: an audio-only sender's Listen tile, a webcam as one more stream, a webcam in picture, emoji avatars and the notification sounds (`sounds.rs` plays through `autoaudiosink`, so they work, unverified on Windows). Compile status of these paths on the Windows target: the last I11 check, below.
 - Software H.264 encode only; a full-HD 60 fps Windows share with `x264enc` costs real CPU.
 - A `SSS_CONFIG_HOME`-less run uses `%APPDATA%\simple-screensharing\` (`rooms.toml`, `settings.toml`).

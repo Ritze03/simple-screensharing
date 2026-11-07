@@ -25,7 +25,7 @@ resolves to) every present blocks until *that window's own* vblank. With a pop-o
 and a stream faster than the monitor's refresh, the windows starve each other: measured on a
 120 Hz monitor with a 240 fps stream, the **main window fell to 69 fps**. Mailbox never blocks
 on vblank and held **240/240 fps in both windows**, and unlike Immediate it does not tear.
-(Pop-outs: `superdoc/features/viewer-window.md`; renderer: `superdoc/features/video-pipeline.md`
+(Pop-outs: `superdoc/features/viewer-window.md`; renderer: `superdoc/features/video/decode-and-display.md`
 "Native display".)
 
 Only settings files **without** a stored mode get the new default: every save writes the whole
@@ -50,7 +50,7 @@ Only settings files **without** a stored mode get the new default: every save wr
 
 In the **Settings modal** (`ui/modals.rs`, `PRESENTATION_MODES`, locale keys
 `ui.settings.mode_*`), beside the language select. It is a global rendering setting, not per
-room or per stream. (Before the egui rebuild it was a card on the Settings nav tab; see
+room or per stream. A mode the surface lacked in a run that fell back to Vsync (below) is not drawn at all (`presentation_choices` in `ui/modals.rs`: "hide what does nothing", user rule 2026-11-01); Vsync, the mode really in use, shows as selected and the stored value is left alone. (Before the egui rebuild it was a card on the Settings nav tab; see
 `superdoc/ui/APP-SHELL.md` for the current shell.)
 
 ## If the mode is unsupported: relaunch with Vsync
@@ -69,7 +69,7 @@ stored setting is left alone.
 Removing the vsync ceiling means nothing throttles repaints any more, so the shell caps idle
 polling itself: `request_repaint_after` of 50 ms focused / 500 ms unfocused
 (`IDLE_REPAINT_INTERVAL` / `UNFOCUSED_REPAINT_INTERVAL`, `ui/mod.rs`). Video repaints are separate
-and frame-driven (a waker thread per view, `video-pipeline.md` "Native display"), so a backgrounded
+and frame-driven (a waker thread per view, `video/decode-and-display.md` "Native display"), so a backgrounded
 window with no video does not spin the GPU in any mode. `decode::PacingState` is unrelated: it
 decides *which frame* is shown, not how fast the surface can present, and it is not on the display
 path today.
