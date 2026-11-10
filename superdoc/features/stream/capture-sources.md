@@ -55,6 +55,11 @@ camera; any hit raises `Modal::SharePick`, which shows "Screen" plus one button 
 `Kind` (`Gamescope`, `ObsCamera`) and, for the camera, the webcam `Spec`. Listing the cameras opens each device, so it runs off the UI thread with a 3 s timeout
 beside the `pw-dump` look-up.
 
+Why `list_cameras` shows hidden providers (`set_show_all_devices(true)`): PipeWire's device provider hides GStreamer's v4l2 one, and PipeWire
+makes no node for a v4l2loopback device that was output-only when WirePlumber enumerated it, so OBS Virtual Camera (e.g. 5760x1080 YUY2 @ 120) only
+exists in the v4l2 provider. A real webcam then appears in both; PipeWire's entry sorts first and the per-path dedupe keeps it. The `videorate`
+downstream of the tee drops the 120 fps to the share's rate.
+
 **Capture.** `CaptureSource::Gamescope(Node)` with `Kind::ObsCamera` launches `webcam::source_fragment(spec)` (`v4l2src`, pinned to the mode)
 into the ordinary System-domain pipeline (`videoconvert` takes any raw format). The share is **not** a webcam: label `OBS Virtual Camera`
 (`gamescope::OBS_LABEL`, no `Webcam` prefix), so every viewer shows it as a screen. Restart token `obs:OBS Virtual Camera` (`Kind::from_token`):

@@ -11268,10 +11268,15 @@ pub mod webcam {
             }
             let monitor = gst::DeviceMonitor::new();
             monitor.add_filter(Some("Video/Source"), None);
+            // PipeWire's provider hides GStreamer's v4l2 one, and PipeWire makes no node for a v4l2loopback device that
+            // was output-only when WirePlumber enumerated it (OBS Virtual Camera): show the hidden providers too.
+            monitor.set_show_all_devices(true);
             if monitor.start().is_err() {
                 return Vec::new();
             }
-            let devices = monitor.devices();
+            let mut devices: Vec<_> = monitor.devices().into_iter().collect();
+            // PipeWire's entries (no `device.path`) first, so a webcam both providers show keeps its PipeWire entry.
+            devices.sort_by_key(|d| d.properties().is_some_and(|p| p.has_field("device.path")));
             monitor.stop();
             let mut out: Vec<Camera> = Vec::new();
             for d in devices {
@@ -11322,6 +11327,15 @@ pub mod webcam {
 
         fn mode(format: &str, w: u32, h: u32, n: u32, d: u32) -> Mode {
             Mode { format: format.into(), width: w, height: h, fps_num: n, fps_den: d }
+        }
+
+        /// Host enumeration (probes caps only, opens no pipeline): `cargo test -p simple-screensharing-client list_cameras_host -- --ignored --nocapture`.
+        #[test]
+        #[ignore = "depends on the host's cameras"]
+        fn list_cameras_host() {
+            for c in list_cameras() {
+                println!("{} {} modes={} first={:?}", c.name, c.device, c.modes.len(), c.modes.first());
+            }
         }
 
         /// What a C920's monitor lists, cut down: a rate list, a fraction, a DMA-BUF twin, raw, H.264.
