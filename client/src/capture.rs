@@ -1026,7 +1026,7 @@ impl CaptureSource {
             #[cfg(target_os = "linux")]
             CaptureSource::Webcam(_) => webcam::LABEL,
             #[cfg(target_os = "linux")]
-            CaptureSource::Gamescope(_) => gamescope::LABEL,
+            CaptureSource::Gamescope(node) => node.kind.label(),
             #[allow(unreachable_patterns)]
             _ => "Screen",
         }
@@ -1038,7 +1038,7 @@ impl CaptureSource {
             CaptureSource::Portal(portal) => portal.restore_token.clone(),
             // What a restart needs to find the same source again, see [`gamescope::TOKEN_PREFIX`].
             #[cfg(target_os = "linux")]
-            CaptureSource::Gamescope(node) => Some(format!("{}{}", gamescope::TOKEN_PREFIX, node.name)),
+            CaptureSource::Gamescope(node) => Some(format!("{}{}", node.kind.token_prefix(), node.name)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -1101,6 +1101,12 @@ impl CaptureSource {
                     portal._pipewire_fd.as_raw_fd(),
                     portal.node_id
                 )
+            }
+            #[cfg(target_os = "linux")]
+            // The OBS virtual camera is a v4l2loopback device (no PipeWire node, see [`gamescope`]): the webcam's source.
+            CaptureSource::Gamescope(gamescope::Node { camera: Some(spec), .. }) => {
+                let _ = framerate;
+                webcam::source_fragment(spec)
             }
             #[cfg(target_os = "linux")]
             CaptureSource::Gamescope(node) => {
@@ -1559,7 +1565,7 @@ impl CaptureDomain {
         }
         // Gamescope offers DMA-BUF too; a failed GPU start falls back to the CPU path like the portal's.
         #[cfg(target_os = "linux")]
-        if matches!(source, CaptureSource::Gamescope(_)) && gpu_capture_available() {
+        if matches!(source, CaptureSource::Gamescope(n) if n.kind == gamescope::Kind::Gamescope) && gpu_capture_available() {
             return Self::Gpu;
         }
         let _ = source;
@@ -2821,8 +2827,8 @@ pub async fn start_capture_restoring(framerate: u32, restore_token: Option<Strin
     ensure_gstreamer_initialized()?;
     // A gamescope capture's "token" names its node: look it up again (its id may have changed) and never ask the portal.
     #[cfg(target_os = "linux")]
-    if let Some(name) = restore_token.as_deref().and_then(|t| t.strip_prefix(gamescope::TOKEN_PREFIX)) {
-        return start_gamescope_capture(framerate, Some(name.to_string())).await;
+    if let Some((kind, name)) = restore_token.as_deref().and_then(gamescope::Kind::from_token) {
+        return start_gamescope_capture(framerate, kind, Some(name.to_string())).await;
     }
     let capture_source = acquire_capture_source_restoring(restore_token.clone()).await?;
     match start_capture_with_source(framerate, capture_source).await {
@@ -2853,17 +2859,19 @@ pub async fn start_capture_restoring(framerate: u32, restore_token: Option<Strin
     }
 }
 
-/// [`start_capture`] for a gamescope node (row 142): the node called `name`, or the first gamescope node when `None`.
+/// [`start_capture`] for a gamescope or OBS-camera node (rows 142, 173): the node of `kind` called `name`, or the first
+/// one of that kind when `None`.
 /// No portal and no picker, on a restart too. Fails with a plain error (not a portal error) when there is no such
 /// node; the session's restart schedule retries it, so a gamescope that comes back is picked up again.
 #[cfg(target_os = "linux")]
-pub async fn start_gamescope_capture(framerate: u32, name: Option<String>) -> Result<CaptureHandle> {
+pub async fn start_gamescope_capture(framerate: u32, kind: gamescope::Kind, name: Option<String>) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
-    let node = gamescope::find(name.as_deref()).await.ok_or_else(|| match &name {
-        Some(n) => anyhow!("the gamescope capture \"{n}\" is gone"),
-        None => anyhow!("no gamescope capture found"),
+    let what = kind.label();
+    let node = gamescope::find(kind, name.as_deref()).await.ok_or_else(|| match &name {
+        Some(n) => anyhow!("the {what} capture \"{n}\" is gone"),
+        None => anyhow!("no {what} capture found"),
     })?;
-    tracing::info!("capturing gamescope node {:?} (object.serial {:?})", node.name, node.serial);
+    tracing::info!("capturing {what} node {:?} (object.serial {:?})", node.name, node.serial);
     start_capture_with_source(framerate, CaptureSource::Gamescope(node)).await
 }
 
@@ -10826,23 +10834,68 @@ pub mod branch {
 /// and whose `node.name` or `media.name` contains "gamescope", ignoring case. A custom build names itself
 /// `gamescope-ritz` (`media.name = gamescope`), stock gamescope `gamescope`; audio nodes of the same name and webcams
 /// (`Video/Source`, `v4l2_input...`) never match.
+///
+/// The OBS virtual camera (row 173) is **not** found there: it is a v4l2loopback device, and WirePlumber enumerates it
+/// while it is still output-only, so PipeWire has a `Video/Device` for it but never a `Video/Source` node. It is a camera
+/// of [`webcam::list_cameras`] named "OBS Virtual Camera" (listed only while OBS writes to it) and is read through the
+/// webcam source ([`webcam::source_fragment`]), but labelled and announced as a screen, not as the person's webcam.
 pub mod gamescope {
     use super::*;
     use crate::audio::{PwObject, prop_str, prop_u64, run_pw_dump};
 
     /// The wire label of a gamescope share (any label that is not `Webcam...` is a screen to every viewer).
     pub const LABEL: &str = "Gamescope";
+    /// The wire label of an OBS virtual camera share (row 173); like [`LABEL`] it is a screen to every viewer.
+    pub const OBS_LABEL: &str = "OBS Virtual Camera";
+    /// The same as [`TOKEN_PREFIX`] for an OBS virtual camera capture.
+    pub const OBS_TOKEN_PREFIX: &str = "obs:";
     /// A gamescope capture's [`CaptureHandle::restore_token`] is this + the node's `node.name`, so the session's
     /// restart (which only carries that string) finds the node again instead of asking the portal.
     pub const TOKEN_PREFIX: &str = "node:";
     /// How long a `pw-dump` may take before the answer is "no gamescope": a stuck daemon must not stall the Share button.
     const DETECT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// The same for listing the cameras (it opens every device).
+    const CAMERA_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// What a directly read node is: a gamescope session or the OBS virtual camera (row 173). Both take the same
+    /// `pipewiresrc target-object=` path; only label, restart token and detection differ.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Gamescope,
+        ObsCamera,
+    }
+
+    impl Kind {
+        pub fn label(self) -> &'static str {
+            match self {
+                Kind::Gamescope => LABEL,
+                Kind::ObsCamera => OBS_LABEL,
+            }
+        }
+        pub fn token_prefix(self) -> &'static str {
+            match self {
+                Kind::Gamescope => TOKEN_PREFIX,
+                Kind::ObsCamera => OBS_TOKEN_PREFIX,
+            }
+        }
+        /// The kind and node name a [`CaptureHandle::restore_token`] stands for.
+        pub fn from_token(token: &str) -> Option<(Kind, &str)> {
+            [Kind::Gamescope, Kind::ObsCamera].into_iter().find_map(|k| token.strip_prefix(k.token_prefix()).map(|n| (k, n)))
+        }
+        /// The kind a wire/stage label stands for.
+        pub fn from_label(label: &str) -> Option<Kind> {
+            [Kind::Gamescope, Kind::ObsCamera].into_iter().find(|k| k.label() == label)
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Node {
+        pub kind: Kind,
         /// `node.name`: what `pipewiresrc target-object=` takes and what survives a restart of the game.
         pub name: String,
         pub serial: Option<u64>,
+        /// An OBS camera's device and mode (the device number can change, so only `name` survives a restart).
+        pub camera: Option<webcam::Spec>,
     }
 
     /// Every gamescope video node of a `pw-dump` snapshot, in graph order.
@@ -10857,18 +10910,46 @@ pub mod gamescope {
                 }
                 let name = prop_str(props, "node.name")?;
                 let hit = |s: &str| s.to_ascii_lowercase().contains("gamescope");
-                (hit(name) || prop_str(props, "media.name").is_some_and(hit)).then(|| Node { name: name.to_string(), serial: prop_u64(props, "object.serial") })
+                (hit(name) || prop_str(props, "media.name").is_some_and(hit))
+                    .then(|| Node { kind: Kind::Gamescope, name: name.to_string(), serial: prop_u64(props, "object.serial"), camera: None })
             })
             .collect()
     }
 
-    /// The gamescope node called `name`, or the first one when `None`. Runs `pw-dump` off the async threads and
+    /// The V4L2 card name of the OBS virtual camera.
+    const OBS_CARD: &str = "OBS Virtual Camera";
+
+    /// The OBS virtual cameras among `cams`: a camera whose name contains "OBS Virtual Camera", ignoring case, read in
+    /// its biggest mode.
+    pub(crate) fn obs_cameras_in(cams: &[webcam::Camera]) -> Vec<Node> {
+        cams.iter()
+            .filter(|c| c.name.to_ascii_lowercase().contains(&OBS_CARD.to_ascii_lowercase()))
+            .filter_map(|c| {
+                let mode = c.modes.iter().max_by_key(|m| (m.pixels(), m.framerate()))?.clone();
+                Some(Node { kind: Kind::ObsCamera, name: OBS_CARD.to_string(), serial: None, camera: Some(webcam::Spec { device: c.device.clone(), mode }) })
+            })
+            .collect()
+    }
+
+    /// The node of `kind` called `name`, or the first one of that kind when `None`. Runs `pw-dump` off the async threads and
     /// answers `None` for a missing node, a failing `pw-dump` and a timeout alike.
     // ponytail: two gamescopes at once: the first listed wins (a restart keeps its name, so it stays on the same one).
-    pub async fn find(name: Option<&str>) -> Option<Node> {
+    pub async fn find(kind: Kind, name: Option<&str>) -> Option<Node> {
+        find_all().await.into_iter().find(|n| n.kind == kind && name.is_none_or(|w| n.name == w))
+    }
+
+    /// Every such node now (empty for a failing `pw-dump` or a timeout): what a Share click asks.
+    pub async fn find_all() -> Vec<Node> {
+        // The device monitor opens each camera: off the async threads and under a timeout, like `pw-dump`.
+        let cams = tokio::time::timeout(CAMERA_TIMEOUT, tokio::task::spawn_blocking(webcam::list_cameras)).await;
+        let mut nodes = probe().await.unwrap_or_default();
+        nodes.extend(obs_cameras_in(&cams.ok().and_then(Result::ok).unwrap_or_default()));
+        nodes
+    }
+
+    async fn probe() -> Option<Vec<Node>> {
         let dump = tokio::time::timeout(DETECT_TIMEOUT, tokio::task::spawn_blocking(run_pw_dump)).await.ok()?.ok()?;
-        let nodes = nodes_in(&dump.map_err(|e| tracing::debug!("gamescope detection: {e:#}")).ok()?);
-        nodes.into_iter().find(|n| name.is_none_or(|w| n.name == w))
+        Some(nodes_in(&dump.map_err(|e| tracing::debug!("gamescope detection: {e:#}")).ok()?))
     }
 
     #[cfg(test)]
@@ -10883,7 +10964,8 @@ pub mod gamescope {
           {"id":52,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Audio/Sink","node.name":"gamescope"}}},
           {"id":53,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Source","node.name":"v4l2_input.pci-0000_00_14.0-usb-0_5_1.0","media.name":"Webcam"}}},
           {"id":54,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Source","node.name":"stream.7","media.name":"Gamescope"}}},
-          {"id":55,"type":"PipeWire:Interface:Port","info":{"direction":"output","props":{"port.name":"capture_1","node.name":"gamescope-ritz"}}}
+          {"id":55,"type":"PipeWire:Interface:Port","info":{"direction":"output","props":{"port.name":"capture_1","node.name":"gamescope-ritz"}}},
+          {"id":56,"type":"PipeWire:Interface:Device","info":{"props":{"media.class":"Video/Device","device.description":"OBS Virtual Camera","api.v4l2.cap.driver":"v4l2 loopback"}}}
         ]"#;
 
         #[test]
@@ -10893,8 +10975,8 @@ pub mod gamescope {
             assert_eq!(
                 nodes,
                 vec![
-                    Node { name: "gamescope-ritz".into(), serial: Some(777) },
-                    Node { name: "stream.7".into(), serial: None },
+                    Node { kind: Kind::Gamescope, name: "gamescope-ritz".into(), serial: Some(777), camera: None },
+                    Node { kind: Kind::Gamescope, name: "stream.7".into(), serial: None, camera: None },
                 ]
             );
             assert!(nodes_in(&[]).is_empty());
@@ -10902,12 +10984,42 @@ pub mod gamescope {
 
         #[test]
         fn a_gamescope_capture_restarts_on_its_node_by_name() {
-            let source = CaptureSource::Gamescope(Node { name: "gamescope-ritz".into(), serial: Some(1) });
+            let source = CaptureSource::Gamescope(Node { kind: Kind::Gamescope, name: "gamescope-ritz".into(), serial: Some(1), camera: None });
             assert_eq!(source.restore_token().as_deref(), Some("node:gamescope-ritz"));
             let fragment = source.launch_fragment(60);
             assert!(fragment.starts_with("pipewiresrc target-object=\"gamescope-ritz\" ") && !fragment.contains("fd="), "{fragment}");
             assert_eq!(source.wire_label(), LABEL);
             assert!(source.silence_means_lost());
+            assert_eq!(Kind::from_token("node:gamescope-ritz"), Some((Kind::Gamescope, "gamescope-ritz")));
+        }
+
+        #[test]
+        fn an_obs_camera_is_found_among_the_cameras_by_name_in_its_biggest_mode() {
+            let mode = |w, h| webcam::Mode { format: "YUY2".into(), width: w, height: h, fps_num: 30, fps_den: 1 };
+            let cam = |name: &str, device: &str, modes| webcam::Camera { name: name.into(), device: device.into(), modes };
+            let cams = [
+                cam("HD Pro Webcam C920", "/dev/video0", vec![mode(1280, 720)]),
+                cam("obs virtual camera", "/dev/video2", vec![mode(1920, 1080), mode(5760, 1080)]),
+            ];
+            let found = obs_cameras_in(&cams);
+            assert_eq!(found.len(), 1);
+            let spec = found[0].camera.as_ref().unwrap();
+            assert_eq!((spec.device.as_str(), spec.mode.width), ("/dev/video2", 5760));
+            assert!(obs_cameras_in(&[]).is_empty());
+        }
+
+        #[test]
+        fn an_obs_camera_capture_restarts_by_card_name_with_its_own_label() {
+            let mode = webcam::Mode { format: "YUY2".into(), width: 1280, height: 720, fps_num: 30, fps_den: 1 };
+            let camera = Some(webcam::Spec { device: "/dev/video2".into(), mode });
+            let source = CaptureSource::Gamescope(Node { kind: Kind::ObsCamera, name: OBS_CARD.into(), serial: None, camera });
+            let token = source.restore_token().unwrap();
+            assert_eq!(token, "obs:OBS Virtual Camera");
+            assert_eq!(Kind::from_token(&token), Some((Kind::ObsCamera, OBS_CARD)));
+            assert!(source.launch_fragment(30).starts_with("v4l2src device=\"/dev/video2\""));
+            assert_eq!(source.wire_label(), OBS_LABEL);
+            assert_eq!(Kind::from_label(OBS_LABEL), Some(Kind::ObsCamera));
+            assert!(!webcam::is_webcam_label(OBS_LABEL));
         }
     }
 }
@@ -10978,7 +11090,7 @@ pub mod webcam {
             (self.fps().round() as u32).max(1)
         }
 
-        fn pixels(&self) -> u32 {
+        pub fn pixels(&self) -> u32 {
             self.width * self.height
         }
 
@@ -11136,7 +11248,9 @@ pub mod webcam {
         let mode = |format: &str, width, height, fps| Mode { format: format.into(), width, height, fps_num: fps, fps_den: 1 };
         let mut modes = vec![mode(MJPEG, 1280, 720, 30), mode(MJPEG, 640, 360, 30), mode("YUY2", 640, 480, 15)];
         sort_modes(&mut modes);
-        Camera { name: "Test camera".into(), device: FAKE_DEVICE.into(), modes }
+        // `SSS_FAKE_CAMERA_NAME` (underscores read as spaces: the rig splits env on spaces): lets the rig list the fake as "OBS Virtual Camera" (row 173).
+        let name = std::env::var("SSS_FAKE_CAMERA_NAME").map(|n| n.replace('_', " ")).unwrap_or_else(|_| "Test camera".into());
+        Camera { name, device: FAKE_DEVICE.into(), modes }
     }
 
     /// Every camera this machine has, with the modes it offers. **Blocking** (the device monitor opens each

@@ -175,10 +175,10 @@ pub enum Modal {
     /// "Leave X?" — raised by [`UiAction::Leave`] when the room has active
     /// shares or watches; confirm with [`UiAction::LeaveConfirmed`].
     LeaveConfirm { room: RoomHandle },
-    /// "What do you want to share?": raised by the Share button or menu entry when a gamescope node exists
-    /// (`capture::gamescope`, row 142). Screen or gamescope push [`UiAction::SharePicked`]. `auto` as for
-    /// [`UiAction::ShareNow`]; `node` is the gamescope node found. Rendered by `modals`.
-    SharePick { room: RoomHandle, auto: bool, node: String },
+    /// "What do you want to share?": raised by the Share button or menu entry when a gamescope node or OBS virtual
+    /// camera exists (`capture::gamescope`, rows 142, 173). Screen or one of the `nodes` push [`UiAction::SharePicked`].
+    /// `auto` as for [`UiAction::ShareNow`]. Rendered by `modals`.
+    SharePick { room: RoomHandle, auto: bool, nodes: Vec<simple_screensharing_client::capture::gamescope::Node> },
     /// "Forget X?" — confirm with [`UiAction::Forget`].
     ForgetConfirm { room: RoomKey },
     /// "Rename room" — confirm with [`UiAction::Rename`].
@@ -353,8 +353,8 @@ pub enum UiAction {
     /// remembered settings once the picker resolves (no modal).
     ShareNow(RoomHandle),
     /// The answer of [`Modal::SharePick`]: stage the capture of the screen (`node` `None`: the portal's picker) or of
-    /// that gamescope node (no picker). `auto` as for [`Self::ShareNow`].
-    SharePicked { room: RoomHandle, auto: bool, node: Option<String> },
+    /// that gamescope / OBS camera node (no picker). `auto` as for [`Self::ShareNow`].
+    SharePicked { room: RoomHandle, auto: bool, node: Option<simple_screensharing_client::capture::gamescope::Node> },
     /// Go live with a staged capture in `room` (saves the settings as
     /// defaults, closes its settings modal).
     GoLive { capture: CaptureSourceId, room: RoomHandle },
@@ -483,11 +483,8 @@ pub enum ProbeOutcome {
 
 /// The flow decision of a Share click (the bar's main button `auto`, or the menu entry): a gamescope node found asks
 /// first, none goes straight to the portal.
-pub fn share_after_probe(room: RoomHandle, auto: bool, found: Option<String>) -> ProbeOutcome {
-    match found {
-        Some(node) => ProbeOutcome::Ask(Modal::SharePick { room, auto, node }),
-        None => ProbeOutcome::Stage(room, auto),
-    }
+pub fn share_after_probe(room: RoomHandle, auto: bool, found: Vec<simple_screensharing_client::capture::gamescope::Node>) -> ProbeOutcome {
+    if found.is_empty() { ProbeOutcome::Stage(room, auto) } else { ProbeOutcome::Ask(Modal::SharePick { room, auto, nodes: found }) }
 }
 
 impl StagedShare {
@@ -524,7 +521,7 @@ pub struct Shell {
     pub staged: indexmap::IndexMap<RoomHandle, StagedShare>,
     /// The gamescope look-up a Share click started (`pw-dump`, off the UI thread): room, `auto`, answer. Polled by
     /// [`App::poll_staged`]; a node found asks [`Modal::SharePick`], none stages the portal share as before.
-    pub gamescope_probe: Option<(RoomHandle, bool, oneshot::Receiver<Option<String>>)>,
+    pub gamescope_probe: Option<(RoomHandle, bool, oneshot::Receiver<Vec<simple_screensharing_client::capture::gamescope::Node>>)>,
     pub toasts: Vec<Toast>,
     /// Rooms whose "Live in <room>" toast was already shown for the current
     /// on-air spell ([`newly_on_air`]).

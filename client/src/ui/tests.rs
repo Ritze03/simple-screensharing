@@ -1376,10 +1376,9 @@ fn an_automatic_staged_share_goes_live_by_itself_only_in_a_joined_room() {
 fn a_gamescope_node_asks_first_and_none_goes_to_the_portal() {
     let room = RoomHandle(3);
     for auto in [true, false] {
-        assert_eq!(share_after_probe(room, auto, None), ProbeOutcome::Stage(room, auto));
-        assert_eq!(
-            share_after_probe(room, auto, Some("gamescope-ritz".into())),
-            ProbeOutcome::Ask(Modal::SharePick { room, auto, node: "gamescope-ritz".into() })
-        );
+        use simple_screensharing_client::capture::gamescope::{Kind, Node};
+        assert_eq!(share_after_probe(room, auto, vec![]), ProbeOutcome::Stage(room, auto));
+        let nodes = vec![Node { kind: Kind::Gamescope, name: "gamescope-ritz".into(), serial: None, camera: None }, Node { kind: Kind::ObsCamera, name: "OBS Virtual Camera".into(), serial: None, camera: None }];
+        assert_eq!(share_after_probe(room, auto, nodes.clone()), ProbeOutcome::Ask(Modal::SharePick { room, auto, nodes }));
     }
 }

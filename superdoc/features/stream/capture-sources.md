@@ -16,7 +16,7 @@ no cached list:* a cached "no gamescope" would hide a game started a minute ago,
 then "none"), so without gamescope the click reaches the portal as before.
 
 **Flow.** Share main button (`ShareNow`) and menu entry (`StageShare`) both go through `App::stage_share`, which starts the look-up; `poll_staged`
-finishes it: none = today's flow, found = `Modal::SharePick` ("Screen" / "Gamescope"). Screen = `SharePicked { node: None }` = the portal picker;
+finishes it: none = today's flow, found = `Modal::SharePick` ("Screen" / "Gamescope", plus "OBS Virtual Camera" since row 173, see below). Screen = `SharePicked { node: None }` = the portal picker;
 Gamescope = `stage_gamescope_share_with_saved_defaults(node)`: no portal, the main button goes live at once, the menu path opens the Stream
 settings modal. The decision is `ui::share_after_probe` (tested).
 
@@ -43,6 +43,33 @@ headless gamescope cannot be resized and the fake node did not renegotiate); tha
 
 **Why** (the user's wording above): ask first rather than guess, because a gamescope node exists whenever a game session runs, even while the user
 means to share the desktop.
+
+
+## The OBS virtual camera as a share source (2026-11-10, row 173)
+
+**Brief.** The user: "When sharing a screen, like gamescope, it should be able to detect the OBS virtual camera." Native client, Linux only.
+
+**Detection** (`capture::gamescope::obs_cameras_in`, pure; `find_all` feeds it `webcam::list_cameras()`): a camera whose name contains
+"OBS Virtual Camera", ignoring case, in its biggest mode. The Share click's probe (`gamescope_probe`) now returns every gamescope node and OBS
+camera; any hit raises `Modal::SharePick`, which shows "Screen" plus one button per hit (`share_pick.node<i>` in the dump). `gamescope::Node` has a
+`Kind` (`Gamescope`, `ObsCamera`) and, for the camera, the webcam `Spec`. Listing the cameras opens each device, so it runs off the UI thread with a 3 s timeout
+beside the `pw-dump` look-up.
+
+**Capture.** `CaptureSource::Gamescope(Node)` with `Kind::ObsCamera` launches `webcam::source_fragment(spec)` (`v4l2src`, pinned to the mode)
+into the ordinary System-domain pipeline (`videoconvert` takes any raw format). The share is **not** a webcam: label `OBS Virtual Camera`
+(`gamescope::OBS_LABEL`, no `Webcam` prefix), so every viewer shows it as a screen. Restart token `obs:OBS Virtual Camera` (`Kind::from_token`):
+the card name, not the `/dev/videoN` number, which can change; `start_gamescope_capture(kind, name)` looks the camera up again. Always the CPU
+domain (GPU is for real gamescope only).
+
+**Why not PipeWire like gamescope.** First tried as a `Video/Source` node, then checked on the user's machine: WirePlumber enumerates a v4l2loopback
+device while it is still output-only (before OBS writes), so PipeWire has only a `Video/Device` for it and never creates the source node. The
+device only reports Video Capture once OBS writes, which is what `list_cameras` needs (so: "OBS camera started" is the detection condition). Its mode
+is OBS's canvas (e.g. YUYV 5760x1080), arbitrary.
+
+**Verified** (rig, release): `SSS_FAKE_CAMERA=1 SSS_FAKE_CAMERA_NAME=OBS_Virtual_Camera` (a rig seam; underscores read as spaces) lists the fake
+ball camera under that name; the modal offered Screen + "OBS Virtual Camera", the pick staged "OBS Virtual Camera 1280x720", the viewer showed
+"client-1 - OBS Virtual Camera" at 30 fps with the ball. **Not verified:** a real v4l2loopback device (needs root to load the module); the real `v4l2src`
+negotiation of a wide YUYV canvas.
 
 ---
 

@@ -26,7 +26,7 @@ impl App {
         {
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                let _ = tx.send(simple_screensharing_client::capture::gamescope::find(None).await.map(|n| n.name));
+                let _ = tx.send(simple_screensharing_client::capture::gamescope::find_all().await);
             });
             self.shell.gamescope_probe = Some((room, auto, rx));
             self.nav.popover = None;
@@ -36,7 +36,7 @@ impl App {
     }
 
     /// Stage the capture: the portal's picker, or the gamescope node `node` (no picker).
-    pub(super) fn stage_share_now(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool, node: Option<String>) {
+    pub(super) fn stage_share_now(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool, node: Option<simple_screensharing_client::capture::gamescope::Node>) {
         if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) {
             return;
         }
