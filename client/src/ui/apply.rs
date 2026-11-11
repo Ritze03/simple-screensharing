@@ -178,13 +178,20 @@ impl App {
                 }
                 self.state.set_room_auto_connect(&room, on);
             }
-            UiAction::CopyInviteLink(handle) => {
+            UiAction::CopyInviteLink(handle) | UiAction::CopyDirectLink(handle) => {
+                let direct = matches!(action, UiAction::CopyDirectLink(_));
                 let Some(room) = self.state.rooms.get(&handle) else { return };
                 match parse_join_string(&room.join_string) {
                     Ok(parsed) => {
                         let name = self.state.room_store.name_for(&room.join_string);
-                        ctx.copy_text(room.client.invite_link(&parsed.server, name));
-                        self.toast(tr("ui.toast.invite_copied", "Invite link copied").to_string(), "content_copy");
+                        let link = room.client.invite_link(&parsed.server, name);
+                        if direct {
+                            ctx.copy_text(super::direct_link::direct_link(&link));
+                            self.toast(tr("ui.toast.direct_link_copied", "Browser direct link copied").to_string(), "content_copy");
+                        } else {
+                            ctx.copy_text(link);
+                            self.toast(tr("ui.toast.invite_copied", "Invite link copied").to_string(), "content_copy");
+                        }
                     }
                     Err(e) => self.toast(tr_with("ui.toast.copy_failed", "Couldn't copy the invite link: %{error}", &[("error", &format!("{e:#}"))]), "error"),
                 }

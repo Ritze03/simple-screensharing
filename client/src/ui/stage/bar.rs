@@ -27,7 +27,7 @@ use simple_screensharing_client::session::RoomHandle;
 use super::{Host, StageLayout, StageState, StageView};
 use crate::theme::{self, Weight, font};
 use crate::ui::share::{self, live_elsewhere};
-use crate::ui::{ConnState, Cx, PopoverKind, RoomEntry, ShareState, UiAction, drive_dump, tr, tr_with};
+use crate::ui::{ConnState, Cx, Popover, PopoverKind, RoomEntry, ShareState, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, DISABLED_OPACITY, paint_icon, paint_text, text_width};
 
 /// A dropdown of the bar (`PopoverKind::Bar`).
@@ -38,6 +38,8 @@ pub enum BarMenu {
     Webcam,
     Layout,
     Room,
+    /// Right click on Copy invite link: Copy join link, Copy browser direct link.
+    Invite,
 }
 
 /// Button heights and widths (replica `.cb`, `.splitb`, `.cgroup`).
@@ -193,8 +195,14 @@ impl Bar {
             let w = if label { 8.0 + 22.0 + 6.0 + self.invite_label_w(ui) + 8.0 } else { DIM_W };
             let r = Rect::from_min_size(pos2(x, y), vec2(w, BTN_H));
             let tip = if self.joined.is_none() { tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate") } else { text.clone() };
-            if dim_btn(ui, r, "invite", "person_add", label.then_some(text.as_str()), &tip) && let Some(h) = self.joined {
-                cx.act(UiAction::CopyInviteLink(h));
+            let resp = dim_btn_resp(ui, r, "invite", "person_add", label.then_some(text.as_str()), &tip);
+            if let Some(h) = self.joined {
+                if resp.clicked() {
+                    cx.act(UiAction::CopyInviteLink(h));
+                } else if resp.secondary_clicked() {
+                    let p = resp.interact_pointer_pos().unwrap_or(r.left_bottom());
+                    cx.act(UiAction::OpenPopover(Popover { kind: PopoverKind::Bar(BarMenu::Invite), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
+                }
             }
         }
     }
@@ -478,6 +486,11 @@ fn fade(c: Color32, alpha: f32) -> Color32 {
 /// A freestanding bar button (no backdrop, dim icon): hide sidebar, Copy invite link, pop out, fullscreen.
 /// With `label` it is `[icon][label]`, 8 px padding and 6 between.
 fn dim_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, label: Option<&str>, tip: &str) -> bool {
+    dim_btn_resp(ui, rect, id, icon, label, tip).clicked()
+}
+
+/// [], returning the response (for a right click as well).
+fn dim_btn_resp(ui: &mut Ui, rect: Rect, id: &str, icon: &str, label: Option<&str>, tip: &str) -> egui::Response {
     drive_dump::rect(|| format!("ctl.{id}"), rect);
     let resp = ui.interact(rect, Id::new(("bar_dim", id)), Sense::click());
     let hov = resp.hovered();
@@ -492,7 +505,7 @@ fn dim_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, label: Option<&str>, t
             paint_text(ui, Rect::from_x_y_ranges(rect.left() + 8.0 + 22.0 + 6.0..=rect.right() - 8.0, rect.y_range()), text, font(Weight::Bold, theme::FS_SMALL), col, Align::Min);
         }
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip.to_owned()).clicked()
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip.to_owned())
 }
 
 /// A single button in a group (the people button): backdrop, accent when `on`.

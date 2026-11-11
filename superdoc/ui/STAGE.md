@@ -147,7 +147,7 @@ The room view of the desktop client: the black stage with its tiles, layouts, pe
   username"); "profile picture" is the app's existing avatar. Browser twin: `docs/js/ui/stage.js`
   `viewersChip`, `features/website/viewer-features.md` "Who watches my share".
 
-**The control bar** (task I3, `stage/bar.rs`; the replica's `.ctlrow`): `[hide sidebar][Copy invite link]` left, two button
+**The control bar** (task I3, `stage/bar.rs`; the replica's `.ctlrow`): `[hide sidebar][Copy invite link]` left (a right click opens a small menu: Copy join link, Copy browser direct link; `BarMenu::Invite`), two button
 groups and Leave in the middle, `[pop out][fullscreen]` right (Watched has no Invite, Room settings or Leave and shows
 Share and audio only while you have a share to act on, in the room you share in). **Share screen, Share audio, Webcam,
 Layout and Room settings are split buttons that always show their dropdown arrow**, cut off from the button by a separator
@@ -175,7 +175,7 @@ mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It
 when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
 running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view, on by default),
 Always show names, **Show stats** (numbers on every stream's name tag while hovered), Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
-others still see them), **Hide when unfocused** (on by default: your own screen's live preview stops while the window is unfocused; off keeps it running; your webcam never stops; `features/self-preview.md`, user request 2026-11-11), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
+others still see them), **Hide when unfocused** (on by default: your own screen's live preview stops while the window is unfocused; off keeps it running; your webcam never stops; `features/self-preview.md`, user request 2026-11-11), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Copy browser direct link (the web client's address with the invite link in its `#join=` fragment, `ui/direct_link.rs`; `architecture/protocol-spec.md` §11.4; browser twin: `features/website/direct-link.md`), Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows" in `APP-SHELL.md`.
 
 **Right click on a sidebar room row** (2026-11-05) opens this same Room settings menu at the pointer, for the clicked room (open or not, connected or not: Connect instead of Leave); a left click still selects, a right click never changes the open room. Native: `PopoverKind::RoomMenu(RoomKey)`, set by `sidebar.rs` `paint_lines` (`secondary_clicked`), drawn by `stage/menus.rs` `room_key_popover` at the top of `sidebar::show_body` (before the rows, so a right click on another row queues its open after the old menu's click-outside close); body is the shared `room_menu`. *Why:* user, "on desktop, make sure that right clicking a room in the left view opens the same context menu, as the bottom button bar has".

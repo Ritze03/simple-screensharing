@@ -1070,6 +1070,12 @@ byte-identical links; `docs/dev/tests.js` checks the native vectors (`a|b`, `100
 emoji, `a|b|c|d`, bad `%4`/`%zz`/`%FF%FE`/`%0A`). Before task #69 the browser split at the first three
 `|` and rejected `hash|name` as an invalid cert hash.
 
+**Browser direct link** (user request 2026-11-11): `https://ritze03.github.io/simple-screensharing/#join=<join link>`,
+the join link above percent-encoded like `encodeURIComponent` (`|`, `%`, `#`, `&`, space and non-ASCII always `%XX`),
+so the browser client opens and joins the room on its own. Native: `ui/direct_link.rs` (`direct_link`, `WEB_CLIENT_URL`),
+`UiAction::CopyDirectLink`; browser side `features/website/direct-link.md`. *Why a fragment:* it is never sent to the web server, so the room key stays out of
+its logs. Same availability as the invite link (needs the connected relay's cert hash).
+
 `Why links go stale:` a pinned hash is only valid while the relay presents that exact
 certificate, i.e. until its next rotation (a link made right after a rotation is good for ~11
 days; one made just before is good for days less). A browser whose pinned hash no longer
