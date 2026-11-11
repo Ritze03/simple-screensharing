@@ -45,6 +45,7 @@ A page that was split keeps its old name as a hub: the hub lists its pages, and 
   - [The stage](features/website/stage.md): tiles, control bar, layouts, chrome, tile fullscreen, stage tests.
   - [Website on a phone](features/website/phone.md): dropouts, decoder failures, supported phones, wake lock.
   - [Webcam, audio-only and picture-in-picture](features/website/webcam-and-audio.md): the browser's webcam and audio-only shares.
+  - [Automatically watch new streams](features/website/auto-watch.md): the Playback option (on by default), the rule, why the join snapshot stays unwatched.
   - [Viewer features](features/website/viewer-features.md): sounds, emoji avatars, fullscreen, own-tile preview, who watches, above 60 fps.
   - [Join links](features/website/join-links.md): display name and room name in join links.
   - [NACK and big keyframes](features/website/nack-and-big-keyframes.md): selective retransmission and large keyframes in the browser.

@@ -116,6 +116,7 @@ The long sections moved to `superdoc/features/website/` on 2026-11-07 (row 164);
 - `superdoc/features/website/stage.md`: The browser stage (tiles, control bar, layouts, chrome), its fullscreen rule and what its tests cover.
 - `superdoc/features/website/phone.md`: Phone dropouts, decoder failures, which phones can watch, and the Screen Wake Lock.
 - `superdoc/features/website/webcam-and-audio.md`: Webcam and audio-only sharing and the PIP pairing in the browser.
+- `superdoc/features/website/auto-watch.md`: Settings > Playback "Automatically watch new streams" (default on) and its rule.
 - `superdoc/features/website/viewer-features.md`: Sounds, emoji avatars, decode-error clearing, double-click fullscreen, own-tile preview, who watches a share, rendering above 60 fps.
 - `superdoc/features/website/join-links.md`: Display name and room name in join links.
 - `superdoc/features/website/nack-and-big-keyframes.md`: Selective retransmission and big keyframes in the browser sharer.

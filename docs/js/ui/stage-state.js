@@ -243,6 +243,12 @@ export function itemNumbers(it) {
   return [watchRes(it.w, it.s), fps ? `${fps} fps` : "", codecName((st && st.codec) || it.w.codec), watchKbps(it.w)].filter(Boolean).join(" · ");
 }
 
+/** Which streams to watch automatically when a room's stream list changes (Settings > Playback > "Automatically watch new streams", row 176).
+ *  Only a video stream of someone else that was not in the room's previous list (`known`, a Set of keys) and is not watched yet; an empty result while the
+ *  room is not joined yet (the snapshot a (re)connect delivers is the baseline: a reconnect is restored by the stableKey resume, not by this) or the option is off. */
+export const autoWatchKeys = ({ enabled, joined, streams, known, watching }) =>
+  enabled && joined ? streams.filter((s) => s.kind === "video" && !s.self && !known.has(s.key) && !watching.has(s.key)).map((s) => s.key) : [];
+
 /** Whether the own live preview may run (native `ui::live_preview_allowed`). A hidden tab always detaches (the browser throttles it, nobody sees it);
  *  focus loss detaches only a screen preview and only while "Hide when unfocused" is on: the own webcam never hides on blur. */
 export const previewAllowed = ({ visible, focused, hideUnfocused, webcam }) => visible && (focused || webcam || !hideUnfocused);

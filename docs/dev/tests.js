@@ -16,7 +16,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { previewAllowed, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
+import { previewAllowed, autoWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";

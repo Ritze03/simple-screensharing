@@ -8,6 +8,7 @@ import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent, mediaLogLine } from "./media-event.js";
 import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
+import { autoWatchKeys } from "./stage-state.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
 // volume row, the card's "Audio"), so the audio UI can be tested without creating an audio stream on the host.
@@ -37,6 +38,7 @@ export class RoomEntry {
     this.streams = [];
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
+    this.knownStreams = new Set(); // stream keys of the last list, so a new one can be told from one already there (auto-watch)
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
     this.sounds = new RoomSounds(); // notification-sound edges of this room (sounds.js)
   }
@@ -184,6 +186,9 @@ function wire(r, client) {
       }
     }
     resumeWatches(r);
+    // Settings > Playback > "Automatically watch new streams": a stream that was not in the previous list (after the resume above took its own).
+    for (const key of autoWatchKeys({ enabled: S.settings.autoWatch, joined: r.state === "joined", streams: d.streams, known: r.knownStreams, watching: r.watches })) watchStream(r, key);
+    r.knownStreams = new Set(d.streams.map((s) => s.key));
     invalidate();
   });
   on("stream-gone", (d) => {

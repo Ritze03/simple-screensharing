@@ -681,7 +681,8 @@ function renderSettings(close, lgBtn, spacer) {
     tab === "interface" && card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
     tab === "playback" && card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
-      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit)),
+      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit),
+      ctrlRow(null, cbx(t("ui.settings.auto_watch"), st.autoWatch, () => { st.autoWatch = !st.autoWatch; persistSettings(); render(); }, { title: t("ui.settings.auto_watch_tip"), id: "set-autowatch" }))),
     tab === "connection" && card(t("ui.settings.tab_connection"), null, h("span", { class: "hint", text: t("ui.settings.conn_note") }), connLog()),
     // Notification sounds (I9): one volume, separate from every stream's, applied live while dragged; a Test button per sound.
     tab === "interface" && card(t("ui.settings.sounds_card"), null,
