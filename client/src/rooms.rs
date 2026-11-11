@@ -389,6 +389,10 @@ pub struct AppSettings {
     /// this just caps how far it's allowed to grow.
     #[serde(default = "AppSettings::default_max_jitter_buffer_ms")]
     pub max_jitter_buffer_ms: u32,
+    /// Settings > Playback > "Automatically watch new streams": a stream that appears in a joined room after
+    /// you are there is watched at once. On by default (user request 2026-11-11).
+    #[serde(default = "AppSettings::default_auto_watch")]
+    pub auto_watch: bool,
     /// Ceiling, as a percent of wall-clock time, on how much faster than
     /// live the View tab's jitter buffer is allowed to play back queued
     /// video while shrinking back down after a jitter spike
@@ -622,6 +626,7 @@ impl Default for AppSettings {
             absolute_total_kbps: Self::default_absolute_total_kbps(),
             destination_floor_kbps: Self::default_destination_floor_kbps(),
             max_jitter_buffer_ms: Self::default_max_jitter_buffer_ms(),
+            auto_watch: true,
             catch_up_speed_percent: Self::default_catch_up_speed_percent(),
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: String::new(),
@@ -638,6 +643,10 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    fn default_auto_watch() -> bool {
+        true
+    }
+
     fn default_level_loudness() -> bool {
         true
     }
@@ -1013,6 +1022,7 @@ mod tests {
             absolute_total_kbps: 12_345,
             destination_floor_kbps: 750,
             max_jitter_buffer_ms: 3_500,
+            auto_watch: false,
             catch_up_speed_percent: 8,
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: "mo".to_string(),
@@ -1035,6 +1045,7 @@ mod tests {
         assert_eq!(parsed.absolute_total_kbps, 12_345);
         assert_eq!(parsed.destination_floor_kbps, 750);
         assert_eq!(parsed.max_jitter_buffer_ms, 3_500);
+        assert!(!parsed.auto_watch);
         assert_eq!(parsed.catch_up_speed_percent, 8);
         assert_eq!(parsed.display_name, "mo");
         assert!(parsed.send_diagnostics);
@@ -1094,6 +1105,15 @@ mod tests {
     }
 
     /// #119: levelling is on unless the user switched it off; a file from before the setting has it on.
+    #[test]
+    fn auto_watch_defaults_to_on() {
+        assert!(AppSettings::default().auto_watch);
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert!(old.auto_watch, "a file from before the option keeps the default, on");
+        let off: AppSettings = toml::from_str("auto_watch = false\n").unwrap();
+        assert!(!off.auto_watch);
+    }
+
     #[test]
     fn level_loudness_defaults_to_on() {
         assert!(AppSettings::default().level_loudness);

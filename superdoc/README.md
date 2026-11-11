@@ -61,7 +61,7 @@ A page that was split keeps its old name as a hub: the hub lists its pages, and 
 - [App shell](ui/APP-SHELL.md): window layout, sidebar, screen contract, behavioural rules.
 - [Stage](ui/STAGE.md): the room view: tiles, layouts, people strip, control bar, menus, pop-outs, fullscreen, saved layout settings.
 - [Share flow](ui/SHARE-FLOW.md): starting, stopping and recovering a share, the stream-settings modal, the screen-or-gamescope question.
-- [Settings](ui/SETTINGS.md): the Settings modal, Boost, Level loudness, Playback sliders.
+- [Settings](ui/SETTINGS.md): the Settings modal, Boost, Level loudness, Playback sliders and auto-watch.
 - [Module map](ui/MODULE-MAP.md): which file of `client/src/ui/` owns what.
 - [Styling guide](ui/STYLING-GUIDE.md): tokens, widget helpers, the slot layout model, avatar colour, i18n.
 - [HTML replica](ui/REPLICA.md): the design sandbox `ui/replica/index.html` and the notes taken from it.

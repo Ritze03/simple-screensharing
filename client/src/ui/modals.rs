@@ -653,6 +653,22 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                         1,
                         " s",
                     );
+                    let mut auto_watch = cx.shell.auto_watch;
+                    let auto_label = tr("ui.settings.auto_watch_check", "Automatically watch new streams");
+                    let r = widgets::ctrl_row(
+                        ui,
+                        &tr("ui.settings.auto_watch", "New streams"),
+                        Some(&tr(
+                            "ui.settings.auto_watch_tip",
+                            "On: a stream someone starts while you are in the room is watched at once. Streams already running when you join, and your own, are not. Off: new streams are listed until you click them.",
+                        )),
+                        |ui| widgets::checkbox(ui, &mut auto_watch, &auto_label),
+                    );
+                    drive_dump::rect(|| "settings.auto_watch".into(), r.rect);
+                    drive_dump::line(|| format!("auto_watch {}", if auto_watch { "on" } else { "off" }));
+                    if r.changed() {
+                        cx.act(UiAction::SetAutoWatch(auto_watch));
+                    }
                     let lo = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(0);
                     let hi = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(u32::MAX);
                     widgets::slider_row(

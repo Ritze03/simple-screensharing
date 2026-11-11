@@ -65,3 +65,5 @@ completed (261/521 fragments)`), viewer recovery L1 asks for a new one (recovere
 with and without the buffer. A *still screen* (the pattern frozen with SIGSTOP; the sharer kept sending keyframes at about
 30 fps) left the delay at 73-87 ms, no growth. Under loss the buffer grows to cover NACK repair (a repaired keyframe
 arrives about 250 ms late): the stutter is gone, the price is that delay; the user can cap it with the slider.
+
+Settings > Playback also holds "Automatically watch new streams" (2026-11-11, row 175; `ui/SETTINGS.md`): not part of the buffer, it decides whether a new stream is watched at all.

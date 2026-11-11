@@ -1385,3 +1385,14 @@ fn a_gamescope_node_asks_first_and_none_goes_to_the_portal() {
         assert_eq!(share_after_probe(room, auto, nodes.clone()), ProbeOutcome::Ask(Modal::SharePick { room, auto, nodes }));
     }
 }
+
+#[tokio::test]
+async fn auto_watch_setting_is_on_by_default_and_persists() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    assert!(app.shell.auto_watch, "on by default");
+    app.apply(&ctx, UiAction::SetAutoWatch(false));
+    assert!(!app.shell.auto_watch);
+    assert!(!simple_screensharing_client::rooms::AppSettings::load().auto_watch, "saved to settings.toml");
+}
