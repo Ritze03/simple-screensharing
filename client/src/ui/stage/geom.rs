@@ -10,7 +10,7 @@
 //! - **Floating** windows ([`FRect`], fractions of the arena) always keep their stream's aspect ratio
 //!   ([`fit_float`]); [`resize_float`] moves the corner to the nearest point of the window's diagonal.
 
-use egui::{Rect, pos2, vec2};
+use egui::{Rect, Vec2, pos2, vec2};
 
 /// Gap between tiles (`--tile-gap`); also the resize bars' resting width.
 pub const GAP: f32 = crate::theme::TILE_GAP;
@@ -282,6 +282,25 @@ pub fn pip_at(origin: f32, len: f32, size: f32, i: u8) -> f32 {
     }
 }
 
+/// Crop pan: how far a picture of aspect `ar` filling a `tw` x `th` cell is shifted from the centre, in points, for the
+/// normalised offset `pan` (-1..1 per axis, 0 = centred, 1 = the picture's edge flush with the cell's). It is a
+/// fraction of the **overflow**, so it survives a cell resize. Clamped so the picture always covers the cell; an axis
+/// with no overflow stays 0. Positive `pan.x` moves the picture right (shows more of its left side).
+pub fn pan_shift(tw: f32, th: f32, ar: f32, pan: Vec2) -> Vec2 {
+    let pw = tw.max(th * ar);
+    let ph = pw / ar;
+    vec2(pan.x.clamp(-1.0, 1.0) * ((pw - tw) / 2.0).max(0.0), pan.y.clamp(-1.0, 1.0) * ((ph - th) / 2.0).max(0.0))
+}
+
+/// The pan after the pointer moved `delta` points from where the drag began at `start`: the picture follows the
+/// pointer 1:1 (grab the image), clamped to -1..1; an axis without overflow stays 0.
+pub fn pan_drag(start: Vec2, delta: Vec2, tw: f32, th: f32, ar: f32) -> Vec2 {
+    let pw = tw.max(th * ar);
+    let ph = pw / ar;
+    let axis = |s: f32, d: f32, over: f32| if over > 0.5 { (s + d / (over / 2.0)).clamp(-1.0, 1.0) } else { 0.0 };
+    vec2(axis(start.x, delta.x, pw - tw), axis(start.y, delta.y, ph - th))
+}
+
 /// The picture of a stream of aspect `ar` in a `tw` x `th` tile, and what shows of it: all of it when contained
 /// (Split, Floating), the centre when it fills the tile (Crop, `Fit::Cover`).
 pub fn picture(tw: f32, th: f32, ar: f32, crop: bool) -> (Rect, Rect) {
@@ -461,6 +480,22 @@ fn same_rect(a: Rect, b: Rect) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pan_follows_the_pointer_and_never_uncovers_the_cell() {
+        let (tw, th, ar) = (500.0, 700.0, 16.0 / 9.0);
+        let over = th * ar - tw;
+        let p = pan_drag(vec2(0.0, 0.0), vec2(100.0, 50.0), tw, th, ar);
+        assert_eq!(p.y, 0.0, "no overflow on y, no move");
+        assert!((pan_shift(tw, th, ar, p).x - 100.0).abs() < 0.01, "1:1");
+        let far = pan_drag(p, vec2(1e6, 0.0), tw, th, ar);
+        assert_eq!(far.x, 1.0);
+        assert!((pan_shift(tw, th, ar, far).x - over / 2.0).abs() < 0.01, "stops at the edge");
+        assert_eq!(pan_shift(1000.0, 1000.0, 1.0, vec2(1.0, 1.0)), vec2(0.0, 0.0), "a fitting picture does not move");
+        let a = pan_shift(400.0, 700.0, ar, vec2(0.5, 0.0)).x / ((700.0 * ar - 400.0) / 2.0);
+        let b = pan_shift(600.0, 700.0, ar, vec2(0.5, 0.0)).x / ((700.0 * ar - 600.0) / 2.0);
+        assert!((a - b).abs() < 1e-4, "the same fraction of its own overflow");
+    }
+
     use super::*;
 
     const AR: f32 = 16.0 / 9.0;

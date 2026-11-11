@@ -31,6 +31,8 @@ pub(super) struct Spot {
     pub rect: Rect,
     /// Fill the rect (Crop) instead of fitting the picture whole.
     pub crop: bool,
+    /// Crop pan: how far the picture is shifted from the centre, in points ([`super::geom::pan_shift`]).
+    pub pan: egui::Vec2,
     /// Corner radius; 0 in Floating, where windows overlap (the corner masks would paint over the one underneath).
     pub round: u8,
     /// The pointer is over this tile (and no tile above it).
@@ -159,7 +161,7 @@ pub(super) fn name_tag(ui: &Ui, rect: Rect, max_w: f32, icon: &str, icon_col: Co
 /// A watched stream: its video (Contain, or Cover in Crop), the green ring while its shared audio is audible,
 /// the health chip, the name tag and the hover buttons.
 pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, between: &mut Between, acts: &mut Vec<UiAction>) {
-    cx.videos.paint(key, ui, s.rect, if s.crop { Fit::Cover } else { Fit::Contain });
+    cx.videos.paint_panned(key, ui, s.rect, if s.crop { Fit::Cover } else { Fit::Contain }, s.pan);
     corner_masks(ui, s.rect, s.round);
     let has_audio = cx.stream_has_audio(key);
     let audible = has_audio && cx.session(key.0).is_some_and(|x| !x.volume(key.1, key.2).muted);

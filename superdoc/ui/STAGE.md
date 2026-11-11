@@ -66,6 +66,18 @@ The room view of the desktop client: the black stage with its tiles, layouts, pe
     window's diagonal (`geom::resize_float`), so width and height both count, growing and shrinking; moving only
     left or only up shrinks it too. Press raises a window; windows stop at the stage edge.
   - **Drag to reorder** (Split, Crop): drag a tile onto another, they swap on release (accent ring on the target).
+  - **Pan in Crop (2026-11-11, row 177):** hold **Shift** and drag a watched stream's picture with the left button to
+    move it inside its cell (cursor: grab, grabbing while dragging); the picture follows the pointer 1:1, like
+    grabbing the image. The offset is stored per stream (`ViewGeom::pan`, keyed by `ItemId` like the PIP spots, per
+    session, **not persisted**, as grid sizes and window rects are not) and **normalised**: -1..1 per axis as a
+    fraction of the overflow (0 = centred), so it survives cell and window resizes (`geom::pan_shift`, `pan_drag`,
+    tested). It is clamped so the picture always covers the cell, and an axis with no overflow does not move.
+    "Reset sizes and positions" clears it. A plain drag still reorders; a webcam in picture under the pointer keeps
+    priority (its drag starts first). Only Crop: Split and Floating show the whole picture, and fullscreen / pop-out
+    are not Crop stages, so no pan there (the offset is kept for when you come back). The webcam in picture keeps
+    its spot relative to the centred picture, it does not follow the pan. Painted by `VideoView::paint_panned` (the
+    quad shifted, the clip stays the cell). The Crop item's menu subtitle says "Shift+drag to pan".
+    *Why:* user request 2026-11-11 ("hold Shift+LeftMouseButton, to move around the image in the cropped area").
   - **Paint order:** egui paints a wgpu callback in the order shapes are added, so a floating window above
     another covers its video correctly; the rounded-corner masks (the video cannot be clipped to a rounded rect)
     are only used outside Floating, where windows overlap and a mask would paint over the one underneath.
