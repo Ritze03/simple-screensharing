@@ -16,7 +16,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
+import { previewAllowed, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
@@ -2593,4 +2593,14 @@ test("emoji: balancePoint is the midpoint of the mass centre and the enclosing c
   near(cx - bx, 3, 0.01, "shifted by 3 in x");
   near(cy - by, 3, 0.01, "shifted by 3 in y");
   eq(balancePoint(new Uint8Array(16).fill(127), 4, 4), null, "nothing solid: no point");
+});
+
+test("previewAllowed: focus gates a screen preview only while Hide when unfocused is on; a webcam and a visible page stay", () => {
+  const p = (o) => previewAllowed({ visible: true, focused: true, hideUnfocused: true, webcam: false, ...o });
+  ok(p({}));
+  ok(!p({ focused: false }));
+  ok(p({ focused: false, hideUnfocused: false }));
+  ok(p({ focused: false, webcam: true }));
+  ok(!p({ visible: false, focused: false, hideUnfocused: false, webcam: true }));
+  ok(!p({ visible: false }));
 });

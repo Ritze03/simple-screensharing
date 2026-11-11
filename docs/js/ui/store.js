@@ -92,7 +92,7 @@ function normalizeStage(st) {
     const pip = !(v && v.pip === false);
     if (layout !== "split" || !pip) views[k] = { layout, pip };
   }
-  return { hideOwn: st.hideOwn === true, alwaysNames: st.alwaysNames === true, showStats: st.showStats === true, views };
+  return { hideOwn: st.hideOwn === true, alwaysNames: st.alwaysNames === true, showStats: st.showStats === true, hideUnfocused: st.hideUnfocused !== false, views };
 }
 
 export function loadSettings() {
@@ -163,6 +163,7 @@ export const S = {
     hideOwn: initialSettings.stage.hideOwn,
     pipOff: stagePipOff(), // view keys with "Webcam in picture" switched off (on until then: native `StageSettings::pip`)
     alwaysNames: initialSettings.stage.alwaysNames,
+    hideUnfocused: initialSettings.stage.hideUnfocused, // Layout menu "Hide when unfocused" (on by default): the own screen preview stops while the page is unfocused; a webcam never does
     stripHidden: false, // the people button hid the strip
     sidebarHidden: false,
     showStats: initialSettings.stage.showStats, // Layout menu "Show stats": the numbers on every watched stream's name tag (native `StageSettings::show_stats`)
@@ -214,7 +215,7 @@ export const persistSettings = () => saveSettings(S.settings);
 export function persistStage() {
   const st = S.stage;
   const keys = new Set([...Object.keys(st.layouts), ...st.pipOff]);
-  S.settings.stage = normalizeStage({ hideOwn: st.hideOwn, alwaysNames: st.alwaysNames, showStats: st.showStats, views: Object.fromEntries([...keys].map((k) => [k, { layout: st.layouts[k] || "split", pip: !st.pipOff.has(k) }])) });
+  S.settings.stage = normalizeStage({ hideOwn: st.hideOwn, alwaysNames: st.alwaysNames, showStats: st.showStats, hideUnfocused: st.hideUnfocused, views: Object.fromEntries([...keys].map((k) => [k, { layout: st.layouts[k] || "split", pip: !st.pipOff.has(k) }])) });
   persistSettings();
 }
 export const persistRooms = () => saveRoomList(S.rooms);

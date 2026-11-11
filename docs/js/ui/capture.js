@@ -9,6 +9,7 @@
 // the stream end and a new one start in its place.
 
 import { WEBCAM_LABEL } from "../core/index.js";
+import { previewAllowed } from "./stage-state.js";
 import { S, invalidate, toast, persistSettings, encoderOf } from "./store.js";
 import { t } from "./i18n.js";
 
@@ -18,14 +19,15 @@ let seq = 1;
  * The sharer already holds the captured MediaStream, so the own tile shows it in a muted <video>. `Why`
  * only while the page is visible AND focused: user request 2026-10-15 ("show a preview while tabbed into the
  * program, otherwise hide it"). Otherwise srcObject is detached so nothing renders or composites at all (the
- * track itself keeps feeding the encoder). `Why a persistent element per capture:` render() rebuilds the
+ * track itself keeps feeding the encoder). Row 174 (user request 2026-11-11, native row 173): the Layout menu's "Hide when
+ * unfocused" (on by default) can be off, and the own webcam is never hidden by focus loss; a hidden tab always detaches.  `Why a persistent element per capture:` render() rebuilds the
  * whole tree on every state change; myCard() re-attaches the same element, so playback never restarts. */
-export const previewActive = () => document.visibilityState === "visible" && (typeof document.hasFocus !== "function" || document.hasFocus());
+export const previewActive = (c) => previewAllowed({ visible: document.visibilityState === "visible", focused: typeof document.hasFocus !== "function" || document.hasFocus(), hideUnfocused: S.stage.hideUnfocused, webcam: c.kind === "webcam" });
 
 function syncPreview(c) {
   const el = c.previewEl;
   if (!el) return;
-  const on = previewActive() && c.video && c.video.readyState === "live";
+  const on = previewActive(c) && c.video && c.video.readyState === "live";
   if (on) {
     if (!el.srcObject) el.srcObject = new MediaStream([c.video]); // video only: a preview never plays audio
     el.hidden = false;

@@ -202,6 +202,7 @@ function layoutMenu() {
     checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => { S.stage.alwaysNames = !S.stage.alwaysNames; persistStage(); }), t("ui.stage.always_names_tip")),
     checkRow(t("ui.stage.show_stats"), S.stage.showStats, stay(() => { S.stage.showStats = !S.stage.showStats; persistStage(); }), t("ui.stage.show_stats_tip")),
     checkRow(t("ui.stage.hide_own"), S.stage.hideOwn, stay(() => { S.stage.hideOwn = !S.stage.hideOwn; persistStage(); }), t("ui.stage.hide_own_tip")),
+    checkRow(t("ui.stage.hide_unfocused"), S.stage.hideUnfocused, stay(() => { S.stage.hideUnfocused = !S.stage.hideUnfocused; persistStage(); }), t("ui.stage.hide_unfocused_tip")),
     sep(),
     menuItem({ icon: "restart_alt", label: t("ui.stage.reset_layout"), onclick: done(() => resetView(key)) }),
   ];

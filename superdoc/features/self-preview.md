@@ -16,7 +16,13 @@
 > *Why (user request 2026-11-11):* "make sure to add a checkbox for 'Hide when unfocused' (on by default, which
 > is the same behavior as right now). Also, never hide the user's own webcam when he tabs out." Stored inverted
 > (`StagePrefs::preview_unfocused`, default false) so old files keep hiding; the rule is the pure
-> `ui::live_preview_allowed`, used by `poll_live_previews` and `tile::ask_live_preview`. Browser client: not changed.
+> `ui::live_preview_allowed`, used by `poll_live_previews` and `tile::ask_live_preview`. 
+> **Browser (row 174, user request 2026-11-11, parity with native row 173):** the same Layout checkbox, on by default,
+> saved as `settings.stage.hideUnfocused` (a missing value reads as on). Off: a blur keeps the own screen preview
+> running. The own webcam preview (tile or picture-in-picture) never detaches on blur. A *hidden* tab (visibilitychange)
+> always detaches, whatever the box says: the browser throttles it and nobody sees it, so it costs nothing to stop.
+> The rule is the pure `previewAllowed` (`docs/js/ui/stage-state.js`, unit-tested), used by `capture.js` `previewActive`;
+> `docs/dev/e2e/live-preview.mjs` checks it through the real UI.
 >
 > *Why (user request 2026-10-15):* "For the sharer, it should show a stream preview, while he is tabbed
 > into the program. Otherwise, its fine to hide it."

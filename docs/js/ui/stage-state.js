@@ -242,3 +242,7 @@ export function itemNumbers(it) {
   const fps = watchFps(it.w);
   return [watchRes(it.w, it.s), fps ? `${fps} fps` : "", codecName((st && st.codec) || it.w.codec), watchKbps(it.w)].filter(Boolean).join(" · ");
 }
+
+/** Whether the own live preview may run (native `ui::live_preview_allowed`). A hidden tab always detaches (the browser throttles it, nobody sees it);
+ *  focus loss detaches only a screen preview and only while "Hide when unfocused" is on: the own webcam never hides on blur. */
+export const previewAllowed = ({ visible, focused, hideUnfocused, webcam }) => visible && (focused || webcam || !hideUnfocused);

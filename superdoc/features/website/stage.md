@@ -49,6 +49,9 @@ A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a f
 - *Tile overlays:* buttons and stats only while hovered; the name tag too unless "Always show names". The stats pill reserves `9999x9999`, `999 fps` and
   `99.9 Mbps` slots (`.tag .v`), so it is as wide as its content and never jitters; a narrow tile drops the resolution, then the rate (`fitTags`, native `stats_fields`).
   "Hide my own streams" removes your screen from your stage only.
+"Hide when unfocused" (on by default, row 174) controls whether your own screen's live preview stops on focus loss;
+your webcam preview never does. *Why (user request 2026-11-11, parity with native row 173):* tabbing out should not
+blank a preview you want to keep watching, and a webcam should never vanish. Details: `features/self-preview.md`.
 - *People strip and hover card:* ring, avatar, LIVE badge and name share one centre line (the badge is positioned from the avatar's size, no transform); the ring is one
   2 px circle border 4 px outside the avatar (`::before { inset: -4px }`), even all round. Everyone who shares gets the same card, one row per stream with Audio / No
   audio, numbers and state. **The card is kept open by pointer geometry** (`cardKeeps`: the card, the avatar and the gap straight above it, 3 px grown), not by the

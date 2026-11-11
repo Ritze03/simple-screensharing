@@ -22,7 +22,8 @@ const check = (cond, what, extra = "") => {
 };
 
 const site = await L.serveSite(0);
-const A = await L.openApp(site.url, { name: "client-1" });
+const A = await L.openApp(site.url, { name: "client-1", flags: ["--use-fake-device-for-media-stream"] }); // the fake camera is video only (audio: false)
+await A.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
 const probe = () =>
   A.page.eval(`(() => {
     const v = document.querySelector(".st-tile.mine .vid > video.live-preview");
@@ -93,6 +94,47 @@ try {
   await L.sleep(800);
   p = await probe();
   check(p && p.vis === "visible" && !p.hidden && p.attached, "tab visible again: preview resumes", JSON.stringify(p));
+
+
+  // Row 174: Layout menu "Hide when unfocused" (on by default). Off: a blur keeps the screen preview running. The own webcam
+  // (tile and webcam in picture) never hides on blur, whatever the box says. A hidden tab always detaches.
+  check(await A.page.eval(`__sss.S.stage.hideUnfocused === true`), "Hide when unfocused is on by default");
+  await A.page.click("#btn-layout");
+  await A.page.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
+  const box = `[...document.querySelectorAll('.menu .cbx')].find((e) => /Hide when unfocused/.test(e.innerText))`;
+  check(await A.page.eval(`!!(${box})`), "the Layout menu lists the Hide when unfocused checkbox");
+  await A.page.screenshot(OUT + PFX + "layout_menu.png");
+  await A.page.click({ js: box });
+  await A.page.eval(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  check(await A.page.eval(`__sss.S.stage.hideUnfocused === false && JSON.parse(localStorage.getItem(Object.keys(localStorage).find((k) => /settings/i.test(k)))).stage.hideUnfocused === false`), "unchecking it flips the state and persists it (localStorage)");
+  await A.page.eval(`Object.defineProperty(document, "hasFocus", { value: () => false, configurable: true }); window.dispatchEvent(new Event("blur"))`);
+  await L.sleep(600);
+  p = await probe();
+  const t2 = p && p.t;
+  await L.sleep(1000);
+  p = await probe();
+  check(p && !p.hidden && p.attached && p.t > t2 + 0.5, "box off + blur: the own screen preview keeps playing", JSON.stringify(p));
+  await A.page.screenshot(OUT + PFX + "unfocused_box_off.png");
+  // box back on while still blurred -> detaches at once
+  await A.page.eval(`__sss.S.stage.hideUnfocused = true; __sss.render()`);
+  await L.sleep(400);
+  p = await probe();
+  check(p && p.hidden && !p.attached, "box on again while blurred: preview detaches");
+  // webcam, box on, blurred: its preview (own tile) keeps running
+  await A.page.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "webcam button" });
+  await A.page.click("#btn-webcam");
+  await A.page.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live')", { timeout: 20000, what: "webcam live" });
+  await A.page.eval(`__sss.render()`);
+  await L.sleep(1200);
+  const cam = () => A.page.eval(`(() => { const v = document.querySelector(".st-tile.mine.cam video.live-preview, .pip video.live-preview"); return v ? { hidden: v.hidden, attached: !!v.srcObject, t: v.currentTime, kinds: v.srcObject ? v.srcObject.getTracks().map((x) => x.kind).join() : "" } : null; })()`);
+  let c1 = await cam();
+  await L.sleep(1000);
+  let c2 = await cam();
+  check(c1 && c2 && !c2.hidden && c2.attached && c2.t > c1.t + 0.5 && c2.kinds === "video", "box on + blur: the own webcam preview keeps playing (video only)", JSON.stringify([c1, c2]));
+  check(await A.page.eval(`!!document.querySelector(".st-tile.mine.cam video.live-preview, .pip video.live-preview")`) && p.hidden, "...while the screen preview of the same page is detached");
+  await A.page.screenshot(OUT + PFX + "webcam_blur.png");
+  await A.page.eval(`delete document.hasFocus; window.dispatchEvent(new Event("focus"))`);
+  await L.sleep(500);
 
   // the share itself is unaffected: still live
   check(await A.page.eval(`__sss.S.captures.some((c) => c.state === "live" && [...c.dests.values()].every((d) => d.state === "live"))`), "the share stayed live throughout");
