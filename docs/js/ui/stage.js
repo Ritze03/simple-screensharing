@@ -19,7 +19,7 @@ import { previewFor } from "./capture.js";
 import { pipEl, placePip, pipPointerMove, pipPointerUp, pipDragging } from "./pip.js";
 import * as G from "./stage-geom.js";
 import { chromeStart, chromeStep, chromeRemaining } from "./chrome.js";
-import { vg, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, peopleOf, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
+import { vg, panPos, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, peopleOf, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
 import { renderBar } from "./bar.js";
 import { openTileMenu, renderMenu, positionMenu, closeMenu } from "./menus.js";
 import { watchStream, unwatchStream } from "./rooms.js";
@@ -368,6 +368,9 @@ export function layoutArena(ar) {
     el.style.top = q.y + "px";
     el.style.width = q.w + "px";
     el.style.height = q.h + "px";
+    const pan = g.pan[id]; // Crop pan (CSS reads --px/--py only inside .arena.crop)
+    el.style.setProperty("--px", String(pan ? pan.x : 0.5));
+    el.style.setProperty("--py", String(pan ? pan.y : 0.5));
     const pip = el.querySelector(":scope > .pip");
     if (pip) placePip(pip);
   });
@@ -479,6 +482,17 @@ function tilePointerDown(e, tile, ar) {
   const g = vg(key);
   const id = tile.dataset.id;
   const float = layoutOf(key) === "float";
+  const vidEl = tile.querySelector(":scope > .vid");
+  if (e.shiftKey && layoutOf(key) === "crop" && vidEl && !tile.classList.contains("idle")) {
+    // Shift + drag in Crop pans the picture inside its cell (row 178); it starts no tile drag (PIP and buttons returned above)
+    const p = g.pan[id] || { x: 0.5, y: 0.5 };
+    drag = { kind: "pan", id, tile, arena: ar, vid: vidEl, sx: e.clientX, sy: e.clientY, p0: { ...p } };
+    ar.classList.add("panning");
+    try { tile.setPointerCapture(e.pointerId); } catch { /* synthetic or ended pointer */ }
+    chromeSync();
+    e.preventDefault();
+    return;
+  }
   if (float) {
     raise(g, id);
     ar.classList.add("dragging"); // the windows follow the pointer: no glide (the replica's .nofx)
@@ -504,6 +518,13 @@ function dragMove(e) {
     // The bar sits midway between the pictures, which move slower than the cell edge; search the split that puts it under the pointer.
     const want = drag.startCenter + (drag.bar.t === "v" ? dx : dy);
     g.grid = G.dragBar(drag.start, drag.bar, want, ar._ars, W, H, crop);
+    layoutArena(ar);
+    return;
+  }
+  if (drag.kind === "pan") {
+    // offsetWidth/Height ignore the centring transform: picture size minus cell size = what is cropped on that axis
+    const v = drag.vid;
+    g.pan[drag.id] = { x: panPos(drag.p0.x, dx, v.offsetWidth - drag.tile.clientWidth), y: panPos(drag.p0.y, dy, v.offsetHeight - drag.tile.clientHeight) };
     layoutArena(ar);
     return;
   }
@@ -536,7 +557,7 @@ function endDrag() {
   drag = null;
   const ar = d.arena;
   if (ar.isConnected) {
-    ar.classList.remove("dragging");
+    ar.classList.remove("dragging", "panning");
     if (d.kind === "tile" && d.tile) {
       d.tile.classList.remove("dragging");
       d.tile.style.transform = "";
@@ -669,6 +690,11 @@ export function bindWindow(win, hostId) {
     S.menu = null;
     setTimeout(() => A.render(), 0);
   }, true);
+  // Shift held: Crop tiles show the grab cursor (they pan on Shift + drag)
+  const shiftCls = (e) => win.document.documentElement.classList.toggle("shift-held", e.shiftKey);
+  win.document.addEventListener("keydown", shiftCls, true);
+  win.document.addEventListener("keyup", shiftCls, true);
+  win.addEventListener("blur", () => win.document.documentElement.classList.remove("shift-held"));
   win.document.addEventListener("keydown", (e) => {
     if (S.stage.fullscreen && hostId === "main") chromeSync(true);
     if (e.key !== "Escape") return;

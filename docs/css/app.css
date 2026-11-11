@@ -333,7 +333,11 @@ select.field { cursor: pointer; padding-right: 6px; }
 .st-tile.audible::after { content: ""; position: absolute; inset: 0; z-index: 8; border: 2px solid var(--success); border-radius: 8px; pointer-events: none; }
 .st-tile.flash { box-shadow: 0 0 0 2px var(--accent), var(--accent-glow); }
 .st-tile .vid { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); aspect-ratio: var(--ar); width: min(100cqw, calc(100cqh * var(--ar))); }
-.arena.crop .st-tile .vid { width: max(100cqw, calc(100cqh * var(--ar))); }
+.arena.crop .st-tile .vid { width: max(100cqw, calc(100cqh * var(--ar)));
+  /* Crop pan (Shift + drag): --px/--py 0..1 act like object-position (.5 = centred); the tile sets them from the view's pan state */
+  left: calc(var(--px, .5) * 100%); top: calc(var(--py, .5) * 100%); transform: translate(calc(var(--px, .5) * -100%), calc(var(--py, .5) * -100%)); }
+.shift-held .arena.crop .st-tile:not(.idle) { cursor: grab; }
+.arena.panning, .arena.panning .st-tile { cursor: grabbing !important; }
 .st-tile .vid > canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; background: #000; }
 .arena.float .st-tile { border-radius: 10px; box-shadow: 0 0 0 1px var(--border), var(--popup-shadow); }
 .st-tile.idle { cursor: default; }

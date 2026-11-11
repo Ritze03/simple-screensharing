@@ -16,7 +16,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { previewAllowed, autoWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
+import { panPos, previewAllowed, autoWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
@@ -2603,4 +2603,15 @@ test("previewAllowed: focus gates a screen preview only while Hide when unfocuse
   ok(p({ focused: false, webcam: true }));
   ok(!p({ visible: false, focused: false, hideUnfocused: false, webcam: true }));
   ok(!p({ visible: false }));
+});
+
+test("panPos: Crop pan follows the pointer 1:1, clamps so the picture covers the cell, an axis without overflow stays centred", () => {
+  near(panPos(0.5, 0, 200), 0.5, 1e-9, "no movement keeps the position");
+  near(panPos(0.5, 50, 200), 0.25, 1e-9, "dragging right 50 px of 200 px overflow shows more of the left: 0.25");
+  near(panPos(0.5, -50, 200), 0.75, 1e-9, "dragging left shows more of the right");
+  eq(panPos(0.5, 1000, 200), 0, "clamped at the start edge");
+  eq(panPos(0.5, -1000, 200), 1, "clamped at the end edge");
+  near(panPos(0.2, 20, 200), 0.1, 1e-9, "starts from the stored position");
+  eq(panPos(0.3, 80, 0), 0.5, "no overflow: centred, does not move");
+  eq(panPos(0.3, 80, 0.4), 0.5, "sub-pixel overflow counts as none");
 });

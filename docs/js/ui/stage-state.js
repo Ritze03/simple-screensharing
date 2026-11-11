@@ -30,7 +30,12 @@ export function viewOf(key) {
 
 /* ---------- per-view layout state ---------- */
 const VG = {}; // view key -> { order: [ids], z: [ids] back to front, float: { id: {x,y,w,h} fractions }, grid, pip: { webcam id: {w, spot, x, y} } }
-export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: null, pip: {} });
+export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: null, pip: {}, pan: {} });
+/** Crop pan (Shift + drag, row 178): where the cropped picture sits in its cell on one axis, 0..1 like CSS `object-position` (0.5 = centred, 0 = the
+ *  picture's start edge on the cell's, 1 = its end edge). A drag of `delta` px moves the picture 1:1 (the picture follows the pointer, so the
+ *  position falls by delta / overflow); `overflow` is the picture size minus the cell size on that axis, px. Clamped to 0..1, so the picture
+ *  always covers the cell; an axis with nothing to crop (overflow < 1 px) stays centred. Native twin: row 177. */
+export const panPos = (start, delta, overflow) => (overflow < 1 ? 0.5 : Math.min(1, Math.max(0, start - delta / overflow)));
 /** The size and spot of the webcam `camId` in its parent's picture in view `key` (a new one starts bottom right, .24 wide). */
 export const pipPos = (key, camId) => (vg(key).pip[camId] ??= defaultPip());
 /** "Webcam in picture" is on for this view (per view, on until switched off: native `StageSettings::pip`). */
@@ -48,13 +53,14 @@ export function setLayout(key, layout) {
   S.stage.layouts[key] = layout;
   persistStage();
 }
-/** "Reset sizes and positions": forget the view's grid, floating windows and their order. */
+/** "Reset sizes and positions": forget the view's grid, floating windows, Crop pans and their order. */
 export function resetView(key) {
   const g = vg(key);
   g.grid = null;
   g.float = {};
   g.z = [];
   g.pip = {}; // also forgets the webcams' spots and sizes
+  g.pan = {}; // and the Crop pan offsets: every picture centred again
 }
 
 /* ---------- formatters (the sidebar uses them too) ---------- */

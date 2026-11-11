@@ -39,6 +39,17 @@ one window per stream. A drag on a resize bar, a floating window or a reorder up
 Positions are applied after the new tree is inserted (`afterRender` -> `layoutArena`), the video `<canvas>` of a watch is re-adopted by the new tree as before.
 A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a floating window keeps its stream's aspect ratio without black bars.
 
+**Crop pan (row 178, 2026-11-11).** In Crop, **Shift + left-drag** on a watched tile's picture pans it inside its cell (the picture follows the pointer 1:1; the cursor is `grab` while Shift is held over a
+cropped tile, `grabbing` during the drag). The offset is per stream, `vg(view).pan[itemId] = { x, y }` (0..1 like CSS `object-position`, 0.5 centred; item ids are `stableKey`-based, so it survives a
+reconnect; UI-private and not persisted, like grid sizes and floating rects). `stage-state.js` `panPos(start, delta, overflow)` is the pure maths (position falls by `delta / overflow`, clamped to 0..1 so the
+picture always covers the cell; an axis with overflow < 1 px stays centred, so a 16:9 picture in a tall cell only pans sideways). `layoutArena` writes `--px`/`--py` on the tile and `.arena.crop .st-tile .vid`
+places the picture with `left/top: p*100%` + `translate(-p*100%)` (CSS only inside Crop; Split and Floating ignore the stored offset and show it again when Crop returns); percentages mean a resize keeps the
+framing and stays clamped. `tilePointerDown` starts a `drag.kind = "pan"` (pointer capture on the tile) only when Shift is down, the layout is Crop and the tile is a live picture; buttons and the webcam in
+picture return earlier, so PIP keeps priority under the pointer, and Shift-drag starts no tile reorder. A plain drag, click and double-click (fullscreen) are unchanged. "Reset sizes and positions" clears
+`pan` too. Fullscreen: the stage's fullscreen is the same tiles, so pan works there; a tile's own fullscreen / pop-out shows the whole picture (`object-fit: contain`), nothing to pan. The Crop menu's
+sub-line says "Shift+drag to pan". *Why (user request 2026-11-11, parity with native row 177):* "For the cropping option, it would be really nice, if i could hold Shift+LeftMouseButton, to move around the
+image in the cropped area (Essentially an offset)." Tests: `dev/tests.js` `panPos`, `dev/e2e/crop-pan.mjs` (real Shift+drag over CDP: 1:1, clamp, y axis fixed, plain drag, resize, Split, Reset).
+
 **Behaviour that follows native, not the replica** (the native code carries the fixes found in testing; D1 in the plan):
 - *Resize bars:* with the pointer between streams, including the black space around a picture, every bar shows dark grey (CSS
   `.arena:hover:not(:has(.st-tile:hover))`); over a stream they hide; the bar under the pointer is blue and stays blue for the whole drag while the others hide
