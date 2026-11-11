@@ -421,6 +421,14 @@ impl App {
             UiAction::SetCatchUpSpeed(p) => {
                 self.state.set_catch_up_speed_percent(p);
             }
+            UiAction::SetAutoWatch(on) => {
+                self.shell.auto_watch = on;
+                let mut settings = simple_screensharing_client::rooms::AppSettings::load();
+                settings.auto_watch = on;
+                if let Err(e) = settings.save() {
+                    tracing::warn!("failed to save the auto-watch preference: {e:#}");
+                }
+            }
             UiAction::SetSendDiagnostics(on) => self.state.set_send_diagnostics(on),
             UiAction::SetAudioGain(g) => {
                 self.state.set_audio_gain(g);

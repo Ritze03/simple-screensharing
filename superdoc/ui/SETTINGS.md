@@ -103,3 +103,28 @@ the browser). Both setters also call `decode::playout::set_limits`, which every 
 (the sliders push on release, as before). An old `settings.toml` with the keys keeps them; one without gets the
 defaults. The tab holds only these two sliders, so `SETTINGS_BODY_H` (set by the Interface tab) is unchanged. Level
 loudness stays on the control bar (above).
+
+## Native Playback: "Automatically watch new streams" (2026-11-11, row 175)
+
+Settings > **Playback** > card "Playback", row "New streams" (checkbox "Automatically watch new streams", rig rect `settings.auto_watch`), between the
+Jitter buffer and Catch-up speed sliders. **On by default.** `UiAction::SetAutoWatch` -> `Shell::auto_watch`, saved as `AppSettings::auto_watch`
+(`#[serde(default = true)]`, so an older `settings.toml` is on). Locale keys `ui.settings.auto_watch*` (en, de).
+
+**Behaviour.** Before this nothing watched on its own: a stream was listed and the viewer clicked it (only a sender's audio
+follows their video watch, `sync_audio_watches`). Now `App::auto_watch_new_streams` (`ui/mod.rs`, right after
+`drain_events`) compares each joined room's roster with `AutoWatchSeen` and calls `RoomSession::toggle_watch` for each
+stream that is new: **video streams only** (screen or webcam); audio-only streams are never auto-listened (same as the
+browser, `features/website/auto-watch.md`; a sender's audio still rides along with the video watch). Rules:
+- **Streams already running when you join are listed, not watched** (the room's first pass only records them); your own
+  streams are never watched; a stream already watched is left alone (`toggle_watch` would otherwise stop it).
+- The roster is recorded **also while the option is off**, so switching it on does not pull in what was already there.
+- "Seen" is the roster of the last pass by `(owner, stream id)`: a stream that keeps running is never started twice, so a
+  watch you stopped stays stopped; a stream that stops and starts again is new. A **reconnect** (own `ConnId` changes) is a
+  new baseline: re-announced streams are listed, not watched. Reconnect restoration of what you watched (`Wanted stream`,
+  `RoomSession::apply_rewatch`) is separate and works whatever this says.
+- Off: new streams are listed until clicked, as before.
+
+**Why:** user request 2026-11-11 ("automatically watch new streams ... on by default"). **Why in the UI layer:** the gate
+needs a setting and `session.rs` was held by another row; `toggle_watch` is the public entry the click uses, so a
+auto-watched stream is indistinguishable from a clicked one. Pure rule and tests: `ui::auto_watch_seen_tests`,
+`rooms::tests::auto_watch_defaults_to_on`. The browser client has its own option (row 176).

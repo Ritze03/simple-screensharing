@@ -419,6 +419,8 @@ pub enum UiAction {
     SetCatchUpSpeed(u32),
     /// Settings > Diagnostics: the "Send diagnostics to the relay" checkbox (task #110).
     SetSendDiagnostics(bool),
+    /// Settings > Playback: "Automatically watch new streams" (row 175).
+    SetAutoWatch(bool),
     /// Settings > Audio boost: the sender-side multiplier (slider; persisted, pushed to running
     /// audio shares). Task #114.
     SetAudioGain(f64),
@@ -551,6 +553,69 @@ pub struct Shell {
     /// was last painted and the texture of the newest frame. See
     /// [`App::poll_live_previews`].
     pub live_previews: HashMap<simple_screensharing_client::session::CaptureSourceId, LiveTile>,
+    /// Settings > Playback > "Automatically watch new streams" (`AppSettings::auto_watch`).
+    pub auto_watch: bool,
+    /// Per room, the streams already seen ([`AutoWatchSeen`]); what makes a stream "new" for auto-watch.
+    auto_seen: HashMap<RoomHandle, AutoWatchSeen>,
+}
+
+/// What auto-watch has already seen in one room: the `(owner, stream id)` of every stream on the roster at the last
+/// pass, and the own `ConnId` they were seen under (a reconnect gives a new one and starts a new baseline).
+#[derive(Default)]
+pub struct AutoWatchSeen {
+    ids: std::collections::HashSet<(u64, u8)>,
+    me: Option<u64>,
+}
+
+impl AutoWatchSeen {
+    /// Return the video streams that appeared since the last call (not mine), then remember the roster. The first
+    /// call for a room, and the first after a reconnect (`me` changed), is only the baseline: streams already running
+    /// are listed, not watched. A stream that stops leaves the set, so a restart is new; one that keeps running
+    /// stays seen, so a watch the user stopped is not started again. Audio-only streams are never returned.
+    pub fn take_new(&mut self, me: u64, streams: &[StreamInfo]) -> Vec<StreamInfo> {
+        let baseline = self.me != Some(me);
+        self.me = Some(me);
+        let now: std::collections::HashSet<(u64, u8)> = streams.iter().map(|s| (s.owner, s.stream_id)).collect();
+        let fresh = streams
+            .iter()
+            .filter(|s| !baseline && s.owner != me && s.kind == StreamKind::Video && !self.ids.contains(&(s.owner, s.stream_id)))
+            .cloned()
+            .collect();
+        self.ids = now;
+        fresh
+    }
+}
+
+#[cfg(test)]
+mod auto_watch_seen_tests {
+    use super::*;
+
+    fn info(owner: u64, id: u8, kind: StreamKind) -> StreamInfo {
+        StreamInfo { owner, stream_id: id, kind, label: String::new(), width: 0, height: 0 }
+    }
+
+    #[test]
+    fn baseline_own_audio_and_known_are_not_news() {
+        let mut seen = AutoWatchSeen::default();
+        let early = info(101, 1, StreamKind::Video);
+        assert!(seen.take_new(1, &[early.clone()]).is_empty(), "already running at join: listed, not watched");
+        let late = info(102, 1, StreamKind::Video);
+        let mine = info(1, 2, StreamKind::Video);
+        let audio = info(103, 3, StreamKind::Audio);
+        let all = [early.clone(), late.clone(), mine, audio];
+        assert_eq!(seen.take_new(1, &all), vec![late.clone()], "only the new foreign video stream");
+        assert!(seen.take_new(1, &all).is_empty(), "never twice (a stopped watch is not restarted)");
+    }
+
+    #[test]
+    fn a_restart_is_new_and_a_reconnect_is_a_new_baseline() {
+        let mut seen = AutoWatchSeen::default();
+        let s = info(101, 1, StreamKind::Video);
+        seen.take_new(1, &[s.clone()]);
+        assert!(seen.take_new(1, &[]).is_empty());
+        assert_eq!(seen.take_new(1, &[s.clone()]), vec![s.clone()], "stopped and started again: new");
+        assert!(seen.take_new(9, &[info(201, 1, StreamKind::Video)]).is_empty(), "after a reconnect (own id changed): baseline");
+    }
 }
 
 /// One capture's own-tile live preview state ([`Shell::live_previews`]).
@@ -1220,7 +1285,10 @@ impl App {
         Self {
             state,
             nav: Nav { view, ..Default::default() },
-            shell: Shell { stage: StageSettings::from_saved(simple_screensharing_client::rooms::AppSettings::load().stage), ..Shell::default() },
+            shell: {
+                let saved = simple_screensharing_client::rooms::AppSettings::load();
+                Shell { stage: StageSettings::from_saved(saved.stage), auto_watch: saved.auto_watch, ..Shell::default() }
+            },
             videos: VideoViews::default(),
             sidebar: Default::default(),
             room: Default::default(),
@@ -1230,6 +1298,28 @@ impl App {
             modals: Default::default(),
             popout: Default::default(),
             now: 0.0,
+        }
+    }
+
+    /// Settings > Playback > "Automatically watch new streams": watch what appeared in a joined room since the
+    /// last pass (see [`AutoWatchSeen`]). The room's streams are recorded even with the option off, so switching it
+    /// on later does not pull in what was already there. Reconnect restoration (`apply_rewatch`) is separate.
+    fn auto_watch_new_streams(&mut self) {
+        let on = self.shell.auto_watch;
+        let mut starts = Vec::new();
+        for (h, room) in self.state.rooms.iter() {
+            let seen = self.shell.auto_seen.entry(*h).or_default();
+            for s in seen.take_new(room.client.conn_id(), &room.streams) {
+                if on {
+                    starts.push((*h, s));
+                }
+            }
+        }
+        for (h, s) in starts {
+            let Some(room) = self.state.rooms.get_mut(&h) else { continue };
+            if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
+                room.toggle_watch(s.owner, s.stream_id);
+            }
         }
     }
 
@@ -1268,6 +1358,7 @@ impl App {
             }
         }
         self.state.drain_events(ctx);
+        self.auto_watch_new_streams();
         self.state.poll_capture_states();
         self.state.poll_capture_recovery();
         self.state.poll_pending_destinations();
