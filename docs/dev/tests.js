@@ -17,7 +17,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { panPos, previewAllowed, autoWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
+import { panPos, previewAllowed, autoWatchKeys, joinWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
@@ -2594,6 +2594,28 @@ test("emoji: balancePoint is the midpoint of the mass centre and the enclosing c
   near(cx - bx, 3, 0.01, "shifted by 3 in x");
   near(cy - by, 3, 0.01, "shifted by 3 in y");
   eq(balancePoint(new Uint8Array(16).fill(127), 4, 4), null, "nothing solid: no point");
+});
+
+test("autoWatchKeys: only a new video stream of someone else, once joined (the first list is a baseline)", () => {
+  const screen = { key: "a|video|", kind: "video", self: false, label: "" };
+  const cam = { key: "a|video|Webcam", kind: "video", self: false, label: "Webcam" };
+  const base = { enabled: true, joined: true, streams: [screen, cam], known: new Set(), watching: new Map() };
+  eq(autoWatchKeys(base), [screen.key, cam.key]);
+  eq(autoWatchKeys({ ...base, joined: false }), [], "not joined yet: baseline");
+  eq(autoWatchKeys({ ...base, enabled: false }), [], "option off");
+  eq(autoWatchKeys({ ...base, known: new Set([screen.key]) }), [cam.key], "already in the last list");
+});
+
+test("joinWatchKeys: the first join watches the webcams already on, not screens, not your own; a reconnect or option off nothing", () => {
+  const screen = { key: "a|video|", kind: "video", self: false, label: "" };
+  const cam = { key: "a|video|Webcam", kind: "video", self: false, label: "Webcam" };
+  const mine = { key: "me|video|Webcam", kind: "video", self: true, label: "Webcam" };
+  const audio = { key: "a|audio|", kind: "audio", self: false, label: "" };
+  const base = { enabled: true, first: true, streams: [screen, cam, mine, audio], watching: new Map() };
+  eq(joinWatchKeys(base), [cam.key], "join list with a webcam and a screen: only the webcam");
+  eq(joinWatchKeys({ ...base, first: false }), [], "reconnect: nothing");
+  eq(joinWatchKeys({ ...base, enabled: false }), [], "option off");
+  eq(joinWatchKeys({ ...base, watching: new Map([[cam.key, {}]]) }), [], "already watched");
 });
 
 test("previewAllowed: focus gates a screen preview only while Hide when unfocused is on; a webcam and a visible page stay", () => {

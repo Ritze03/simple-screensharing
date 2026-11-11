@@ -255,6 +255,11 @@ export function itemNumbers(it) {
 export const autoWatchKeys = ({ enabled, joined, streams, known, watching }) =>
   enabled && joined ? streams.filter((s) => s.kind === "video" && !s.self && !known.has(s.key) && !watching.has(s.key)).map((s) => s.key) : [];
 
+/** Which streams to watch when you join a room (row 181, same option): the webcams of others already on, only on the FIRST join of the room in this page.
+ *  A screen share already running is listed, not watched; a reconnect gives nothing (the stableKey resume restores what you watched, and a webcam you stopped stays stopped). */
+export const joinWatchKeys = ({ enabled, first, streams, watching }) =>
+  enabled && first ? streams.filter((s) => s.kind === "video" && !s.self && isWebcamLabel(s.label) && !watching.has(s.key)).map((s) => s.key) : [];
+
 /** Whether the own live preview may run (native `ui::live_preview_allowed`). A hidden tab always detaches (the browser throttles it, nobody sees it);
  *  focus loss detaches only a screen preview and only while "Hide when unfocused" is on: the own webcam never hides on blur. */
 export const previewAllowed = ({ visible, focused, hideUnfocused, webcam }) => visible && (focused || webcam || !hideUnfocused);

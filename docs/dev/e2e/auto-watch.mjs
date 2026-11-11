@@ -3,6 +3,8 @@
 // Zoe has the option off (stored setting) and must only list the stream; Dora joins AFTER the stream runs and must not watch (snapshot is a baseline).
 // Then Zoe flips the option on through the Settings UI (persisted) and Alice restarts the share: Zoe now auto-watches. A stopped watch is not
 // re-watched (stableKey resume is covered by ui-reconnect.mjs).
+// Row 181: Alice also turns on her (fake, video only) webcam; Eve joins late with default settings and watches the webcam by herself but only lists
+// the running screen share; Fay joins late with the option off and watches nothing.
 //
 //   usage: node docs/dev/e2e/auto-watch.mjs <relay host:port> <certhash>   (relay: docs/dev/relay.sh start ...)
 //   env:   E2E_OUT = where the screenshots go (default ~/tmp/sss-e2e)
@@ -22,10 +24,14 @@ const watching = (p) => p.page.eval(`__sss.S.rooms[0].watches.size`);
 const listed = (p) => p.page.eval(`__sss.S.rooms[0].streams.filter((s) => !s.self && s.kind === "video").length`);
 
 const site = await L.serveSite(0);
-const A = await L.openApp(site.url, { name: "Alice" });
+const fakeCam = { flags: ["--use-fake-device-for-media-stream"] };
+const A = await L.openApp(site.url, { name: "Alice", ...fakeCam });
+await A.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
 const B = await L.openApp(site.url, { name: "Bob" });
 const Z = await L.openApp(site.url, { name: "Zoe", settings: { autoWatch: false } });
 let D = null;
+let E = null;
+let F = null;
 try {
   check((await B.page.eval(`__sss.S.settings.autoWatch`)) === true, "default: autoWatch on (no stored value)");
   check((await Z.page.eval(`__sss.S.settings.autoWatch`)) === false, "stored autoWatch:false loads as off");
@@ -77,6 +83,23 @@ try {
     await P.page.waitFor(`__sss.S.rooms[0].watches.size === 1`, { timeout: 25000, what: n + " auto-watches the restarted share" });
     check(true, n + " auto-watches the restarted share");
   }
+
+  // Row 181: late joiners with a screen share AND a webcam already running
+  await A.page.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "Alice's webcam button" });
+  await A.page.click("#btn-webcam");
+  await A.page.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "Alice's webcam live" });
+  await Z.page.waitFor(`__sss.S.rooms[0].streams.filter((s) => !s.self && s.kind === "video").length === 2`, { what: "both streams listed" });
+  E = await L.openApp(site.url, { name: "Eve" });
+  F = await L.openApp(site.url, { name: "Fay", settings: { autoWatch: false } });
+  for (const P of [E, F]) {
+    await L.addRoomByLink(P.page, link, "autowatch");
+    await L.waitJoined(P.page);
+  }
+  await E.page.waitFor(`__sss.S.rooms[0].watches.size === 1`, { timeout: 25000, what: "Eve auto-watches the webcam" });
+  await L.sleep(3000);
+  check((await E.page.eval(`[...__sss.S.rooms[0].watches.values()].map((w) => w.label).join()`)) === "Webcam" && (await listed(E)) === 2, "joining with a screen share and a webcam running: Eve watches the webcam, only lists the screen");
+  check((await watching(F)) === 0 && (await listed(F)) === 2, "option off: Fay joining late watches nothing");
+  await E.page.screenshot(OUT + "autowatch_join_webcam.png");
 } catch (e) {
   failed++;
   console.log("FAIL", e.message);
@@ -86,6 +109,8 @@ try {
   await B.close();
   await Z.close().catch(() => {});
   if (D) await D.close().catch(() => {});
+  if (E) await E.close().catch(() => {});
+  if (F) await F.close().catch(() => {});
   site.close();
 }
 console.log(failed ? `${failed} FAILED` : "ALL PASSED");

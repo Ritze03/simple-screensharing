@@ -8,7 +8,7 @@ import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent, mediaLogLine } from "./media-event.js";
 import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
-import { autoWatchKeys } from "./stage-state.js";
+import { autoWatchKeys, joinWatchKeys } from "./stage-state.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
 // volume row, the card's "Audio"), so the audio UI can be tested without creating an audio stream on the host.
@@ -39,6 +39,7 @@ export class RoomEntry {
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
     this.knownStreams = new Set(); // stream keys of the last list, so a new one can be told from one already there (auto-watch)
+    this.joinedOnce = false; // set at the first join in this page: only that one watches the webcams already on (auto-watch)
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
     this.sounds = new RoomSounds(); // notification-sound edges of this room (sounds.js)
   }
@@ -165,6 +166,10 @@ function wire(r, client) {
     if (d.state === "connected") {
       r.issue = null;
       resumeWatches(r);
+      // Settings > Playback > "Automatically watch new streams": the webcams already on at the first join of this room (row 181).
+      const first = !r.joinedOnce && !d.reconnected;
+      r.joinedOnce = true;
+      for (const key of joinWatchKeys({ enabled: S.settings.autoWatch, first, streams: r.streams, watching: r.watches })) watchStream(r, key);
     }
     if (d.state === "connected" && d.reconnected) r.sounds.quiet(Date.now() + RESUME_QUIET_MS); // the room replays what it had: no sounds for it
     if (d.state === "connected" && d.reconnected) toast(t("ui.toast.reconnected", { room: r.name }), "check_circle");
