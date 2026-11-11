@@ -109,6 +109,7 @@ pub mod stage;
 pub mod stream_settings;
 #[cfg(test)]
 mod tests;
+pub mod direct_link;
 mod video;
 pub mod webcam_settings;
 
@@ -323,6 +324,8 @@ pub enum UiAction {
     SetAutoConnect { room: RoomKey, on: bool },
     /// Copy the live connection's invite link (with cert hash) + toast.
     CopyInviteLink(RoomHandle),
+    /// Copy the browser direct link (web client URL + the invite link in its fragment) + toast.
+    CopyDirectLink(RoomHandle),
 
     // --- watching ---------------------------------------------------------
     /// Start watching (idempotent). Audio from the same sender follows.

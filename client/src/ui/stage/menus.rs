@@ -63,6 +63,11 @@ fn bar_menu(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, view: &StageV
                 room_menu(ui, cxr, r, &mut out, &mut close);
             }
         }
+        BarMenu::Invite => {
+            if let StageView::Room(h) = view {
+                invite_menu(ui, *h, &mut out, &mut close);
+            }
+        }
     });
     if reset {
         st.reset_view(view);
@@ -171,6 +176,20 @@ fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, 
     reset
 }
 
+/// The right-click menu of the bar's Copy invite link button: the join link, then the browser direct link.
+fn invite_menu(ui: &mut Ui, h: simple_screensharing_client::session::RoomHandle, out: &mut Vec<UiAction>, close: &mut bool) {
+    if widgets::pop_item(ui, &PopItem::new("link", &tr("ui.room.copy_join_link", "Copy join link"))).clicked() {
+        out.push(UiAction::CopyInviteLink(h));
+        *close = true;
+    }
+    share::pop_sep(ui);
+    let tip = tr("ui.room.copy_direct_link_tip", "Opens this room in the browser");
+    if widgets::pop_item(ui, &PopItem::new("public", &tr("ui.room.copy_direct_link", "Copy browser direct link")).sub(&tip)).clicked() {
+        out.push(UiAction::CopyDirectLink(h));
+        *close = true;
+    }
+}
+
 /// The Room settings menu: a header, Auto-connect, Rename, Copy invite link, Leave, Forget.
 fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAction>, close: &mut bool) {
     let joined = r.handle.filter(|_| r.conn == ConnState::Joined);
@@ -203,6 +222,13 @@ fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAct
         && let Some(h) = joined
     {
         out.push(UiAction::CopyInviteLink(h));
+        *close = true;
+    }
+    let tip = if joined.is_some() { tr("ui.room.copy_direct_link_tip", "Opens this room in the browser") } else { tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate") };
+    if widgets::pop_item(ui, &PopItem::new("public", &tr("ui.room.copy_direct_link", "Copy browser direct link")).sub(&tip).enabled(joined.is_some())).clicked()
+        && let Some(h) = joined
+    {
+        out.push(UiAction::CopyDirectLink(h));
         *close = true;
     }
     let leave = tr("ui.bar.leave_room_item", "Leave room");
