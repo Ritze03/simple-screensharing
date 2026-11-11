@@ -493,7 +493,7 @@ ui.stage.hide_own_tip: "Dein Bildschirm und deine Webcam verschwinden hier von d
 ui.stage.hide_unfocused: "Bei Fokusverlust ausblenden"
 ui.stage.hide_unfocused_tip: "Die Live-Vorschau deines eigenen Bildschirms stoppt, solange dieses Fenster nicht im Fokus ist. Deine Webcam bleibt immer sichtbar"
 ui.stage.layout_crop: "Zuschneiden"
-ui.stage.layout_crop_sub: "Füllt jede Zelle, Ränder werden abgeschnitten"
+ui.stage.layout_crop_sub: "Füllt jede Zelle, Ränder abgeschnitten; Umschalt+Ziehen verschiebt"
 ui.stage.layout_floating: "Frei"
 ui.stage.layout_floating_sub: "Jeden Stream selbst verschieben und skalieren"
 ui.stage.layout_heading: "Layout"

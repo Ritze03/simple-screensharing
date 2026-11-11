@@ -61,7 +61,7 @@ mod tile;
 
 use std::collections::{HashMap, HashSet};
 
-use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2};
 use simple_screensharing_client::capture::webcam;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
 use simple_screensharing_client::rooms::{AppSettings, StagePrefs, ViewPrefs, WATCHED_KEY, room_identity};
@@ -258,6 +258,7 @@ impl StageState {
             g.z.clear();
             g.pip.clear();
             g.pip_glide.clear();
+            g.pan.clear();
         }
     }
 }
@@ -287,6 +288,8 @@ struct ViewGeom {
     arena: Option<(f32, f32)>,
     /// Webcams gliding to their spot after a drag ([`pip`]).
     pip_glide: HashMap<ItemId, pip::PipGlide>,
+    /// Crop: how far each picture is panned off the centre, -1..1 per axis as a fraction of its overflow ([`geom::pan_shift`]).
+    pan: HashMap<ItemId, Vec2>,
 }
 
 /// A pointer drag in progress; `origin` is where the press started.
@@ -297,6 +300,8 @@ enum Drag {
     Reorder { id: ItemId, origin: Pos2 },
     /// A webcam in picture moved or resized ([`pip`]).
     Pip(pip::PipDragState),
+    /// Shift + drag in Crop: the picture moves inside its cell; `start` is the pan when the press began.
+    Pan { id: ItemId, origin: Pos2, start: Vec2 },
 }
 
 enum Kind {
@@ -525,6 +530,13 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     }
     let grid = geom.grid.clone().unwrap_or_else(|| Grid::even(Vec::new()));
     let placed = geom::place(&grid, &ars, w, h, crop);
+    // Shift + drag in Crop: the picture follows the pointer inside its cell (the maths is cell-relative).
+    if let (Some(Drag::Pan { id, origin, start }), Some(p), true) = (drag.as_ref(), pointer, down)
+        && let Some(i) = vis.iter().position(|it| &it.id == id)
+    {
+        let cell = placed.pics[i];
+        geom.pan.insert(id.clone(), geom::pan_drag(*start, p - *origin, cell.width(), cell.height(), ars[i]));
+    }
     let off = arena.min.to_vec2();
     let rects: Vec<Rect> = if float {
         let split = if crop { geom::place(&grid, &ars, w, h, false).pics } else { placed.pics.clone() };
@@ -618,6 +630,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
             n: i,
             rect,
             crop,
+            pan: if crop { geom::pan_shift(rect.width(), rect.height(), it.ar, geom.pan.get(&it.id).copied().unwrap_or_default()) } else { Vec2::ZERO },
             round: if float { 0 } else { 8 },
             hovered: hover == Some(i) && !dragging && hover_ok && menu_ok(cxr, &it.id),
             always_names,
@@ -702,13 +715,26 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         {
             acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(it.id.clone()), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
         }
+        let pannable = crop && matches!(it.kind, Kind::Video(_));
+        if pannable && !dragging && hover == Some(i) && hover_ok && ui.input(|x| x.modifiers.shift) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if let Some(Drag::Pan { id, .. }) = drag.as_ref()
+            && id == &it.id
+        {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
         if resp.drag_started()
             && started.is_none()
             && let Some(origin) = press
         {
-            started = Some(match geom.float.get(&it.id) {
-                Some(from) if float => Drag::Move { id: it.id.clone(), origin, from: *from },
-                _ => Drag::Reorder { id: it.id.clone(), origin },
+            started = Some(if pannable && ui.input(|x| x.modifiers.shift) {
+                Drag::Pan { id: it.id.clone(), origin, start: geom.pan.get(&it.id).copied().unwrap_or_default() }
+            } else {
+                match geom.float.get(&it.id) {
+                    Some(from) if float => Drag::Move { id: it.id.clone(), origin, from: *from },
+                    _ => Drag::Reorder { id: it.id.clone(), origin },
+                }
             });
         }
     }

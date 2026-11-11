@@ -194,6 +194,12 @@ impl VideoViews {
         Some(entry.view.lock().unwrap().paint(ui, rect, fit))
     }
 
+    /// [`paint`](Self::paint) with the picture shifted by `pan` points from the centre (Crop's pan).
+    pub fn paint_panned(&self, key: StreamKey, ui: &Ui, rect: egui::Rect, fit: Fit, pan: egui::Vec2) -> Option<egui::Rect> {
+        let entry = self.entries.get(&key)?;
+        Some(entry.view.lock().unwrap().paint_panned(ui, rect, fit, pan))
+    }
+
     /// Newest frame size in pixels (`None` before the first frame).
     pub fn frame_size(&self, key: StreamKey) -> Option<(u32, u32)> {
         self.entries.get(&key)?.view.lock().unwrap().frame_size()

@@ -542,6 +542,12 @@ impl VideoView {
     /// Draw into `rect` without allocating layout space. Returns the rect the
     /// picture occupies (empty before the first frame).
     pub fn paint(&mut self, ui: &Ui, rect: Rect, fit: Fit) -> Rect {
+        self.paint_panned(ui, rect, fit, Vec2::ZERO)
+    }
+
+    /// [`paint`](Self::paint) with the picture shifted by `pan` points from the centre (Crop's pan; the caller keeps
+    /// it within the overflow). The clip stays `rect`.
+    pub fn paint_panned(&mut self, ui: &Ui, rect: Rect, fit: Fit, pan: Vec2) -> Rect {
         if let Some(frame) = self.source.latest_if_newer(self.size_seq) {
             self.size_seq = frame.seq;
             self.frame_size = Some((frame.width, frame.height));
@@ -554,7 +560,9 @@ impl VideoView {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         let Some((w, h)) = self.frame_size else { return Rect::from_min_size(rect.min, Vec2::ZERO) };
-        let video = fit_rect(rect, egui::vec2(w as f32, h as f32), fit, ui.ctx().pixels_per_point());
+        let ppp = ui.ctx().pixels_per_point().max(0.0001);
+        let pan = egui::vec2((pan.x * ppp).round() / ppp, (pan.y * ppp).round() / ppp);
+        let video = fit_rect(rect, egui::vec2(w as f32, h as f32), fit, ui.ctx().pixels_per_point()).translate(pan);
         if video.width() > 0.0 && video.height() > 0.0 {
             painter.add(egui_wgpu::Callback::new_paint_callback(video, VideoCallback { source: self.source.clone() }));
         }

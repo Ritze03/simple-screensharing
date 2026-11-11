@@ -493,7 +493,7 @@ ui.stage.hide_own_tip: "Your screen and webcam leave the stage here; others stil
 ui.stage.hide_unfocused: "Hide when unfocused"
 ui.stage.hide_unfocused_tip: "Your own screen's live preview stops while this window is not focused. Your webcam always stays visible"
 ui.stage.layout_crop: "Crop"
-ui.stage.layout_crop_sub: "Fills each cell, edges cropped around the centre"
+ui.stage.layout_crop_sub: "Fills each cell, edges cropped; Shift+drag to pan"
 ui.stage.layout_floating: "Floating"
 ui.stage.layout_floating_sub: "Move and resize each stream yourself"
 ui.stage.layout_heading: "Layout"
