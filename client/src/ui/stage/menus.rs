@@ -156,6 +156,14 @@ fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, 
         {
             out.push(UiAction::SetHideOwnStreams(hide));
         }
+        let mut hide_unfocused = !cx.shell.stage.preview_unfocused;
+        let r = widgets::checkbox(ui, &mut hide_unfocused, &tr("ui.stage.hide_unfocused", "Hide when unfocused"));
+        drive_dump::rect(|| "menu.hide_unfocused".into(), r.rect);
+        if r.on_hover_text(tr("ui.stage.hide_unfocused_tip", "Your own screen's live preview stops while this window is not focused. Your webcam always stays visible"))
+            .changed()
+        {
+            out.push(UiAction::SetHideWhenUnfocused(hide_unfocused));
+        }
     });
     share::pop_sep(ui);
     let reset = widgets::pop_item(ui, &PopItem::new("restart_alt", &tr("ui.stage.reset_layout", "Reset sizes and positions"))).clicked();

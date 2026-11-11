@@ -163,7 +163,7 @@ mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It
 when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
 running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view, on by default),
 Always show names, **Show stats** (numbers on every stream's name tag while hovered), Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
-others still see them), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
+others still see them), **Hide when unfocused** (on by default: your own screen's live preview stops while the window is unfocused; off keeps it running; your webcam never stops; `features/self-preview.md`, user request 2026-11-11), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows" in `APP-SHELL.md`.
 
 **Right click on a sidebar room row** (2026-11-05) opens this same Room settings menu at the pointer, for the clicked room (open or not, connected or not: Connect instead of Leave); a left click still selects, a right click never changes the open room. Native: `PopoverKind::RoomMenu(RoomKey)`, set by `sidebar.rs` `paint_lines` (`secondary_clicked`), drawn by `stage/menus.rs` `room_key_popover` at the top of `sidebar::show_body` (before the rows, so a right click on another row queues its open after the old menu's click-outside close); body is the shared `room_menu`. *Why:* user, "on desktop, make sure that right clicking a room in the left view opens the same context menu, as the bottom button bar has".
@@ -381,8 +381,8 @@ the main window and not a new viewport:* the pop-out already exists for "own win
 ## Layout menu settings are saved (2026-11-04, #131)
 
 Everything the Layout menu sets survives a restart, in both clients: the layout (Split / Crop / Floating), Webcam in
-picture, Always show names, Hide my own streams, Show stats. Defaults for a fresh install, or a view with no saved value:
-**Split, Webcam in picture on, the other three off.** *Why:* the user: "Layout settings should save, with these being the
+picture, Always show names, Hide my own streams, Show stats, Hide when unfocused (native only, stored inverted as `preview_unfocused`). Defaults for a fresh install, or a view with no saved value:
+**Split, Webcam in picture on, Hide when unfocused on, the other three off.** *Why:* the user: "Layout settings should save, with these being the
 defaults." (with a screenshot of the menu: Split, Webcam in picture checked, the rest unchecked).
 
 - **Native** (`AppSettings::stage: StagePrefs` in `settings.toml`, `#[serde(default)]`, so an older file loads with the

@@ -512,6 +512,10 @@ pub struct StagePrefs {
     pub always_names: bool,
     #[serde(default)]
     pub show_stats: bool,
+    /// "Hide when unfocused" unchecked: the own live preview keeps running while the window is unfocused.
+    /// Stored inverted so a missing key (an older file) and a fresh install keep the default, hiding.
+    #[serde(default)]
+    pub preview_unfocused: bool,
     #[serde(default)]
     pub views: std::collections::BTreeMap<String, ViewPrefs>,
 }

@@ -1155,9 +1155,12 @@ async fn the_layout_menu_choices_are_saved_and_loaded() {
     app.apply(&ctx, UiAction::SetStageLayout { view: StageView::Watched, layout: StageLayout::Floating });
     app.apply(&ctx, UiAction::SetHideOwnStreams(true));
     app.apply(&ctx, UiAction::SetShowStats(true));
+    assert!(!app.shell.stage.preview_unfocused, "Hide when unfocused is on by default");
+    app.apply(&ctx, UiAction::SetHideWhenUnfocused(false));
 
     let mut restarted = StageSettings::from_saved(AppSettings::load().stage);
     assert_eq!((restarted.hide_own, restarted.always_names, restarted.show_stats), (true, false, true));
+    assert!(restarted.preview_unfocused, "unchecking Hide when unfocused survives a restart");
     assert_eq!(restarted.layout(&StageView::Watched), StageLayout::Floating);
     assert!(restarted.pip(&StageView::Watched));
     let other = unreachable_join_string(8);

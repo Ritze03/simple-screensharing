@@ -465,6 +465,10 @@ impl App {
                 self.shell.stage.show_stats = on;
                 self.shell.stage.save();
             }
+            UiAction::SetHideWhenUnfocused(on) => {
+                self.shell.stage.preview_unfocused = !on;
+                self.shell.stage.save();
+            }
             UiAction::SetStagePip { view, on } => {
                 self.sync_stage_keys();
                 self.shell.stage.set_pip(view, on);

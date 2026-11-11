@@ -10,6 +10,14 @@
 > the app window is focused** (native) or the page is visible and focused (browser). Otherwise the tile
 > is the hatched placeholder and the preview costs nothing.
 >
+> **Hide when unfocused (2026-11-11, row 173).** A Layout-menu checkbox, on by default (the behaviour above).
+> Off, the own *screen* preview keeps running while the window is unfocused (still stopped when minimized).
+> The own *webcam* preview (tile or picture-in-picture) never hides on focus loss, whatever the checkbox says.
+> *Why (user request 2026-11-11):* "make sure to add a checkbox for 'Hide when unfocused' (on by default, which
+> is the same behavior as right now). Also, never hide the user's own webcam when he tabs out." Stored inverted
+> (`StagePrefs::preview_unfocused`, default false) so old files keep hiding; the rule is the pure
+> `ui::live_preview_allowed`, used by `poll_live_previews` and `tile::ask_live_preview`. Browser client: not changed.
+>
 > *Why (user request 2026-10-15):* "For the sharer, it should show a stream preview, while he is tabbed
 > into the program. Otherwise, its fine to hide it."
 
@@ -48,7 +56,7 @@
   encoder and runs only while the app is focused (so not while the user is in a game); revisit if the 20 points
   matter. Sharpness: a `timeoverlay` test pattern in the 1506x846 own tile, 640x360 (soft, 2.4x stretched) against
   1080p (crisp).
-- **Focus gating, so unfocused costs nothing:** the own tile pushes `UiAction::LivePreviewSeen(capture)` on
+- **Focus gating, so unfocused costs nothing** (default; see "Hide when unfocused" above for the exceptions, a webcam and the unchecked box): the own tile pushes `UiAction::LivePreviewSeen(capture)` on
   every pass it is painted with the window focused and not minimized (`viewport().focused` /
   `.minimized`). `poll_live_previews` opens the valve while that was within 0.6 s (`LIVE_PREVIEW_GRACE`),
   closes it otherwise (unfocused, minimized, other room or view selected, tile scrolled out of the pass),

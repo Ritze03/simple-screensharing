@@ -100,6 +100,9 @@ pub struct StageSettings {
     pub always_names: bool,
     /// "Show stats": every watched stream's name tag carries its numbers while it is hovered (D1). Off until switched on.
     pub show_stats: bool,
+    /// "Hide when unfocused" unchecked (inverted: the default, hiding, is `false`): the own screen live preview keeps
+    /// running while the window is unfocused. A webcam never hides, whatever this says.
+    pub preview_unfocused: bool,
     /// What the file holds (what [`save`](Self::save) writes back, `views` kept in step by `update`).
     saved: StagePrefs,
     /// Each joined room's saved key, learnt by [`sync_rooms`](Self::sync_rooms); never pruned (a suspended room keeps its handle).
@@ -113,7 +116,7 @@ impl StageSettings {
         if let Some(p) = saved.views.get(WATCHED_KEY) {
             views.insert(StageView::Watched, *p);
         }
-        Self { views, hide_own: saved.hide_own, always_names: saved.always_names, show_stats: saved.show_stats, saved, keys: HashMap::new() }
+        Self { views, hide_own: saved.hide_own, always_names: saved.always_names, show_stats: saved.show_stats, preview_unfocused: saved.preview_unfocused, saved, keys: HashMap::new() }
     }
 
     /// Learn the key of every joined room and seed a new one from the file. Cheap; called every frame and
@@ -160,6 +163,7 @@ impl StageSettings {
         self.saved.hide_own = self.hide_own;
         self.saved.always_names = self.always_names;
         self.saved.show_stats = self.show_stats;
+        self.saved.preview_unfocused = self.preview_unfocused;
         let mut settings = AppSettings::load();
         settings.stage = self.saved.clone();
         if let Err(e) = settings.save() {

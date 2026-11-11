@@ -447,6 +447,8 @@ pub enum UiAction {
     SetAlwaysShowNames(bool),
     /// Layout menu "Show stats": numbers on every watched stream's name tag.
     SetShowStats(bool),
+    /// "Hide when unfocused" in the Layout menu; the payload is the checkbox (`true` = hide, the default).
+    SetHideWhenUnfocused(bool),
     /// The Layout menu's "Webcam in picture" for `view`: a webcam sits inside its owner's screen share.
     SetStagePip { view: StageView, on: bool },
     /// The bar's hide / show sidebar button.
@@ -565,6 +567,27 @@ pub struct LiveTile {
 /// How long after the own tile was last painted the live preview keeps
 /// running. A hidden tile (other room, other view) stops it within this.
 const LIVE_PREVIEW_GRACE: f64 = 0.6;
+
+/// Whether the own live preview may run: never while minimized; while unfocused only for a webcam (always) or when
+/// "Hide when unfocused" is off (`keep_unfocused`).
+pub(crate) fn live_preview_allowed(focused: bool, minimized: bool, webcam: bool, keep_unfocused: bool) -> bool {
+    !minimized && (focused || webcam || keep_unfocused)
+}
+
+#[cfg(test)]
+mod live_preview_gate_tests {
+    use super::live_preview_allowed as ok;
+
+    #[test]
+    fn unfocused_hides_a_screen_unless_asked_and_never_a_webcam() {
+        assert!(ok(true, false, false, false), "focused screen runs");
+        assert!(!ok(false, false, false, false), "unfocused screen hides by default");
+        assert!(ok(false, false, false, true), "unfocused screen runs with Hide when unfocused off");
+        assert!(ok(false, false, true, false), "a webcam survives losing focus");
+        assert!(!ok(false, true, true, true), "minimized stops everything");
+        assert!(!ok(true, true, false, false));
+    }
+}
 /// Repaint interval while a live preview runs (~30 fps, the branch's rate).
 const LIVE_PREVIEW_REPAINT: std::time::Duration = std::time::Duration::from_millis(33);
 
@@ -1309,7 +1332,7 @@ impl App {
         for (id, cap) in &self.state.captures {
             let ShareStatus::Active(ShareHandle::Video(h)) = &cap.status else { continue };
             let tile = live.get_mut(id);
-            let wanted = focused && !minimized && tile.as_ref().is_some_and(|t| now - t.seen < LIVE_PREVIEW_GRACE);
+            let wanted = live_preview_allowed(focused, minimized, cap.is_webcam(), self.shell.stage.preview_unfocused) && tile.as_ref().is_some_and(|t| now - t.seen < LIVE_PREVIEW_GRACE);
             h.set_live_preview(wanted);
             let Some(tile) = tile else { continue };
             if !wanted {

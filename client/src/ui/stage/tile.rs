@@ -323,7 +323,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     let rect = s.rect;
     let radius = CornerRadius::same(s.round);
     let webcam = c.is_webcam();
-    ask_live_preview(ui, c, capture, acts);
+    ask_live_preview(ui, c, capture, cx.shell.stage.preview_unfocused, acts);
     let state = cx.destination_state(c, d);
     let recovering = cx.state.recovery(capture).is_some() && matches!(state, DestinationState::Live | DestinationState::Stalled { .. } | DestinationState::Failed(_));
     let (chip, on_air) = if recovering {
@@ -395,8 +395,8 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
 /// Asking for the live preview is what keeps it running: only a focused window paints this
 /// (`App::poll_live_previews`). The own tile of a share does it every pass it is drawn, and so does a webcam's
 /// picture-in-picture, which stands in for its tile.
-pub(super) fn ask_live_preview(ui: &Ui, c: &simple_screensharing_client::session::LocalCapture, capture: CaptureSourceId, acts: &mut Vec<UiAction>) {
-    if c.kind == StreamKind::Video && ui.ctx().input(|i| i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)) {
+pub(super) fn ask_live_preview(ui: &Ui, c: &simple_screensharing_client::session::LocalCapture, capture: CaptureSourceId, keep_unfocused: bool, acts: &mut Vec<UiAction>) {
+    if c.kind == StreamKind::Video && ui.ctx().input(|i| crate::ui::live_preview_allowed(i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false), c.is_webcam(), keep_unfocused)) {
         acts.push(UiAction::LivePreviewSeen(capture));
     }
 }

@@ -112,7 +112,7 @@ pub(super) fn show(ui: &mut Ui, cx: &Cx, i: &Input, pos: PipPos, press: Option<P
         Kind::Mine(capture, _) => {
             if let Some(c) = cx.capture(*capture) {
                 // The PIP stands in for the webcam's own tile, which would have asked for the preview.
-                tile::ask_live_preview(ui, c, *capture, acts);
+                tile::ask_live_preview(ui, c, *capture, cx.shell.stage.preview_unfocused, acts);
             }
             painter.rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
             match cx.shell.live_previews.get(capture).and_then(|t| t.tex.as_ref()) {
