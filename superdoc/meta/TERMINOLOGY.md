@@ -52,3 +52,4 @@ appending. This file stays in context for the whole session.
 - **stableKey** (browser) — a stream's identity across reconnects: room + sharer name + kind + label; the native equivalent is **Wanted stream**. `features/website/stage.md`.
 - **Live preview** (own-tile preview, #78) — the sharer's own Stage tile with a live picture of what they capture, while focused; not the ~30 s room-preview thumbnails. `features/self-preview.md`.
 - **On air vs starting** (UI) — a share's phase in a room (`ui::MyPhase`): on air = a destination is Live, Rebuilding or Stalled; starting = only Starting ones. `meta/glossary-details.md`, `ui/SHARE-FLOW.md`.
+- **Direct link** (browser direct link, row 179) — `<site URL>#join=<encoded join link>`: opens and saves the room in the browser; the key stays in the fragment. `features/website/direct-link.md`.

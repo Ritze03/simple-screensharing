@@ -119,5 +119,6 @@ The long sections moved to `superdoc/features/website/` on 2026-11-07 (row 164);
 - `superdoc/features/website/auto-watch.md`: Settings > Playback "Automatically watch new streams" (default on) and its rule.
 - `superdoc/features/website/viewer-features.md`: Sounds, emoji avatars, decode-error clearing, double-click fullscreen, own-tile preview, who watches a share, rendering above 60 fps.
 - `superdoc/features/website/join-links.md`: Display name and room name in join links.
+- `superdoc/features/website/direct-link.md`: Browser direct link (`site#join=<link>`): copy menu, visiting a link opens and saves the room.
 - `superdoc/features/website/nack-and-big-keyframes.md`: Selective retransmission and big keyframes in the browser sharer.
 - `superdoc/features/website/harness-and-measurements.md`: Measured numbers and how to run the browser test harness.

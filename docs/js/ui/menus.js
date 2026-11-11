@@ -218,11 +218,22 @@ function roomMenu() {
     switchRow("bolt", t("ui.room.auto_connect"), r.auto, stay(() => { r.auto = !r.auto; persistRooms(); }), { title: t("ui.room.auto_connect_tip") }),
     menuItem({ icon: "edit", label: t("ui.room.rename"), onclick: done(() => A.openModal({ kind: "rename", room: r.id, value: r.name })) }),
     menuItem({ icon: "link", label: t("ui.room.copy_invite"), disabled: !joined, title: joined ? null : t("ui.room.copy_invite_offline_tip"), onclick: done(() => A.copyLink(r)) }),
+    menuItem({ icon: "open_in_browser", label: t("ui.room.copy_direct"), disabled: !joined, title: joined ? null : t("ui.room.copy_invite_offline_tip"), onclick: done(() => A.copyDirectLink(r)) }),
     r.state === "disconnected"
       ? menuItem({ icon: "login", label: t("ui.room.connect"), onclick: done(() => connectRoom(r)) })
       : menuItem({ icon: "logout", label: t("ui.bar.leave_room_item"), onclick: done(() => A.leaveRoom(r)) }),
     sep(),
     menuItem({ icon: "delete", label: t("ui.room.forget"), sub: t("ui.popup.forget_sub"), cls: "danger", onclick: done(() => A.openModal({ kind: "forget", room: r.id })) }),
+  ];
+}
+
+/** The Copy invite link button's context menu: the join link on top, the browser direct link below (direct-link.js). */
+function inviteMenu() {
+  const r = roomById(S.menu.roomId);
+  if (!r) return [];
+  return [
+    menuItem({ icon: "link", label: t("ui.room.copy_join"), onclick: done(() => A.copyLink(r)) }),
+    menuItem({ icon: "open_in_browser", label: t("ui.room.copy_direct"), sub: t("ui.room.copy_direct_sub"), onclick: done(() => A.copyDirectLink(r)) }),
   ];
 }
 
@@ -372,7 +383,7 @@ function ddMenu() {
   return M.opts.map(([v, text, sub, icon]) => menuItem({ icon, label: text, sub, on: String(v) === String(M.cur), role: "option", onclick: done(() => M.onPick(v)) }));
 }
 
-const BODIES = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, tile: tileMenu, outgoing: outgoingMenu, alsosend: () => targetsMenu("alsosend"), move: () => targetsMenu("move"), emoji: emojiMenu, dd: ddMenu };
+const BODIES = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, invite: inviteMenu, tile: tileMenu, outgoing: outgoingMenu, alsosend: () => targetsMenu("alsosend"), move: () => targetsMenu("move"), emoji: emojiMenu, dd: ddMenu };
 
 /** The open menu as an element for host `hostId` ("main" | "pop"), or null. */
 export function renderMenu(hostId) {

@@ -48,6 +48,7 @@ A page that was split keeps its old name as a hub: the hub lists its pages, and 
   - [Automatically watch new streams](features/website/auto-watch.md): the Playback option (on by default), the rule, why the join snapshot stays unwatched.
   - [Viewer features](features/website/viewer-features.md): sounds, emoji avatars, fullscreen, own-tile preview, who watches, above 60 fps.
   - [Join links](features/website/join-links.md): display name and room name in join links.
+  - [Browser direct link](features/website/direct-link.md): `site#join=<link>` opens and saves a room; the Copy invite link context menu.
   - [NACK and big keyframes](features/website/nack-and-big-keyframes.md): selective retransmission and large keyframes in the browser.
   - [Harness and measurements](features/website/harness-and-measurements.md): measured numbers, running the harness.
 - [Viewer window](features/viewer-window.md): watches and pop-out windows.

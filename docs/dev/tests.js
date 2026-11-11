@@ -10,6 +10,7 @@ import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame,
 import { NACK_HARD_LIMIT_MS, Reassembler, fragmentFrame, nackRetryInterval, pacePlan } from "../js/core/fragment.js";
 import { SEND_RING_BYTES, SendRing, nackEnabledByDefault } from "../js/core/nack.js";
 import { RefChain, deriveCodecString, sniffCodec } from "../js/core/codec.js";
+import { buildDirectLink, parseDirectHash } from "../js/ui/direct-link.js";
 import { mediaLogLine } from "../js/ui/media-event.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
@@ -2614,4 +2615,22 @@ test("panPos: Crop pan follows the pointer 1:1, clamps so the picture covers the
   near(panPos(0.2, 20, 200), 0.1, 1e-9, "starts from the stored position");
   eq(panPos(0.3, 80, 0), 0.5, "no overflow: centred, does not move");
   eq(panPos(0.3, 80, 0.4), 0.5, "sub-pixel overflow counts as none");
+});
+
+test("direct link: buildDirectLink / parseDirectHash round-trip a join link with certhash and a name, fragment only", () => {
+  const link = formatJoinLink("relay.example.com:4433", hexToBytes("00112233445566778899aabbccddeeff"), new Uint8Array(32).fill(7), new Uint8Array(32).fill(9), "Movie night ☕");
+  const url = buildDirectLink("https://ritze03.github.io/simple-screensharing/", link);
+  ok(url.startsWith("https://ritze03.github.io/simple-screensharing/#join="), "site URL, then the fragment");
+  ok(!url.slice(0, url.indexOf("#")).includes("|"), "nothing of the link before the #");
+  const hash = url.slice(url.indexOf("#"));
+  eq(parseDirectHash(hash), link, "round-trips");
+  eq(parseJoinLink(parseDirectHash(hash)).name, "Movie night ☕", "the name survives");
+});
+
+test("direct link: parseDirectHash rejects other hashes and broken escapes", () => {
+  eq(parseDirectHash(""), null);
+  eq(parseDirectHash("#other=1"), null);
+  eq(parseDirectHash("#join="), null);
+  eq(parseDirectHash("#join=%E0%A4%A"), null, "malformed percent escape");
+  eq(parseDirectHash("#join=a%7Cb"), "a|b");
 });

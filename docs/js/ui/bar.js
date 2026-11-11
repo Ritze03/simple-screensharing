@@ -14,7 +14,7 @@ import { capabilities } from "../core/index.js";
 import { S, PHONE, persistSettings } from "./store.js";
 import { applyLevelLoudness } from "./rooms.js";
 import { t } from "./i18n.js";
-import { h, ic } from "./dom.js";
+import { h, ic, longPress } from "./dom.js";
 import { A } from "./actions.js";
 import { capInRoom, screens, stagedFor, setAudioMuted, webcamInRoom, webcamCap, audioInRoom, startWebcam, stopWebcam, stopDest, camSupported, camsRequested, camsListing, refreshCameras, camChoice, cameras } from "./capture.js";
 import { viewKey, layoutOf, LAYOUTS } from "./stage-state.js";
@@ -114,7 +114,10 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
     ? h("button", { type: "button", class: "cb dim", id: "btn-sidebar", title: S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"), "aria-label": S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"),
       onclick: () => { if (PHONE.matches) S.drawer = true; else S.stage.sidebarHidden = !S.stage.sidebarHidden; A.render(); } }, ic(S.stage.sidebarHidden ? "left_panel_open" : "left_panel_close"))
     : null;
-  const invite = !r ? null : h("button", { type: "button", class: "cb dim", id: "btn-invite", title: t("ui.room.copy_invite_tip"), onclick: () => A.copyLink(r) }, ic("person_add"), h("span", { class: "lbl2", text: t("ui.room.copy_invite") }));
+  const invite = !r ? null : h("button", { type: "button", class: "cb dim", id: "btn-invite", title: t("ui.room.copy_invite_tip"), onclick: () => A.copyLink(r),
+    // Right click (or a long press): "Copy join link" / "Copy browser direct link" (direct-link.js).
+    oncontextmenu: (e) => { e.preventDefault(); openMenu("invite", e.currentTarget, { roomId: r.id, pos: { x: e.clientX, y: e.clientY } }); },
+    onpointerdown: (e) => { const el = e.currentTarget; longPress(e, (pos) => openMenu("invite", el, { roomId: r.id, pos })); } }, ic("person_add"), h("span", { class: "lbl2", text: t("ui.room.copy_invite") }));
   const leave = !r ? null : h("button", { type: "button", class: "cb leave", id: "btn-leave", title: t("ui.bar.leave_room", { room: r.name }), "aria-label": t("ui.bar.leave_room", { room: r.name }), onclick: () => A.leaveRoom(r) }, ic("call_end"));
   const popped = host === "pop";
   const pop = popped || pipSupported()

@@ -27,5 +27,5 @@ Measured numbers and how to run the browser test harness. Part of the browser cl
   `screen:0:0` source that yields no frames); use `canvas.captureStream()` or the harness runner.
 - Headed runs only inside the headless sway rig (`hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 ...`, see `docs/dev/README.md`), never on the user's desktop (user request 2026-10-14); `SSS_GUI_LOCKED=1` is the
   harness's historical opt-in guard.
-- `window.__sss` exposes the UI state for debugging. `index.html#join=<link>` opens the join dialog
+- `window.__sss` exposes the UI state for debugging. `index.html#join=<link>` opens the room (direct link, `direct-link.md`; an invalid one the join dialog)
   prefilled.

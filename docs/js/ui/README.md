@@ -59,7 +59,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 * **Pop-out.** `documentPictureInPicture.requestWindow()` (Chromium 116+) is a real always-on-top window; the tile's canvas
   moves into it (no second decode). One such window per page, so popping out another stream brings the first back.
   Without it, the canvas moves into a fullscreen stage instead. A tile double-click always uses that stage (`popOut(w, onBack, "fullscreen")`).
-* **Join links in the URL.** `index.html#join=<link>` opens the join dialog prefilled (name field too, when the link has one).
+* **Join links in the URL.** `index.html#join=<link>` (the browser direct link, `direct-link.js`, `superdoc/features/website/direct-link.md`) saves and opens the room at once; an invalid link opens the join dialog prefilled with its error. Right click on Copy invite link: join link / direct link.
 * **Display name and room name in links (task #69, user requests 2026-10-15).** The default display name is `user-` + 4 random
   `[a-z0-9]` (`store.js` `autoName()`, own localStorage key `sss.autoname.v1`, so it is stable across reloads) while
   `settings.name` stays `""` until the user chooses one; `displayName()` is the chosen name or the auto one. `settings.nameSet`

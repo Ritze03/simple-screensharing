@@ -4,7 +4,8 @@
 // images) by moving them into the new tree. Numbers that change every second (fps, kbps, meters) are patched in
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
-import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders } from "../core/index.js";
+import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders, stripLinkName } from "../core/index.js";
+import { buildDirectLink, parseDirectHash } from "./direct-link.js";
 import { S, PHONE, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName, encoderOf } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
@@ -45,6 +46,7 @@ const sel = () => roomById(S.selected);
 /* ============================== render ============================== */
 
 let namePromptShown = false;
+let namePrefill = ""; // the display-name suggestion of a direct link (its 5th field), for the "Choose your name" modal
 /**
  * Offer the "Choose your name" modal once per page load while the user never chose a name, as soon as no other modal is
  * open (native `prompt_for_name`). Later / Escape / x / backdrop only close it; Save (or the settings field) ends it for good.
@@ -52,7 +54,7 @@ let namePromptShown = false;
 function promptForName() {
   if (namePromptShown || S.modal || S.settings.nameSet) return;
   namePromptShown = true;
-  S.modal = { kind: "choose-name", value: displayName(), focus: true };
+  S.modal = { kind: "choose-name", value: namePrefill || displayName(), focus: true };
 }
 
 /** The view the central area shows as a stage: Watched streams, or the selected room while it is joined (else the scrolling body). */
@@ -845,15 +847,16 @@ function finishAdd(name, link) {
 
 /* ============================== actions ============================== */
 
-async function clip(text) {
+async function clip(text, msg) {
   try {
     await navigator.clipboard.writeText(text);
-    toast(t("ui.toast.invite_copied"), "content_copy");
+    toast(msg || t("ui.toast.invite_copied"), "content_copy");
   } catch (e) {
     toast(t("ui.toast.copy_failed", { error: e.message }), "error", { err: true });
   }
 }
 const copyLink = (r) => clip(r.inviteLink());
+const copyDirectLink = (r) => clip(buildDirectLink(location.origin + location.pathname, r.inviteLink()), t("ui.toast.direct_link_copied"));
 
 // Escape closes the modal (an open menu takes the key first, in stage.js: Escape in a dropdown closes the dropdown alone).
 document.addEventListener("keydown", (e) => {
@@ -889,19 +892,39 @@ if (caps.webCodecsEncode) {
     invalidate();
   }).catch(() => {});
 }
-// A pasted join link in the URL hash (#join=<link>) opens the join dialog prefilled.
+// A direct link in the URL hash (#join=<link>, direct-link.js): a valid link opens its room at once (saved in the room store;
+// the "Choose your name" modal comes first when no name is set); an invalid one opens the join dialog prefilled, showing the error.
 function joinFromHash() {
-  const m = /^#join=(.+)$/.exec(location.hash);
-  if (!m) return;
-  openAdd("join");
-  S.modal.link = decodeURIComponent(m[1]);
-  prefillName(S.modal);
-  history.replaceState(null, "", location.pathname + location.search);
+  const link = parseDirectHash(location.hash);
+  if (link === null) return;
+  history.replaceState(null, "", location.pathname + location.search); // the key must not linger in the address bar, a reload must not re-add
+  let p;
+  try {
+    p = parseJoinLink(link);
+  } catch (e) {
+    openAdd("join");
+    S.modal.link = link;
+    prefillName(S.modal);
+    S.modal.error = t("ui.err.bad_link", { error: e.message });
+    render();
+    return;
+  }
+  if (p.name) namePrefill = p.name;
+  rememberServer(p);
+  const { entry, existed } = addRoom({ name: p.name || "", link });
+  if (existed && stripLinkName(entry.link) !== stripLinkName(link)) {
+    entry.link = stripLinkName(link); // a refreshed invite (new key or certificate hash) replaces the stored one
+    persistRooms();
+    if (entry.state !== "disconnected") disconnectRoom(entry).then(() => connectRoom(entry));
+  }
+  S.modal = null;
+  select(entry, false);
   render();
+  if (entry.state === "disconnected") connectRoom(entry);
 }
 window.addEventListener("hashchange", joinFromHash);
 Object.assign(A, {
-  render, liveText, liveMeter, openStreamModal, startStage, copyLink, leaveRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
+  render, liveText, liveMeter, openStreamModal, startStage, copyLink, copyDirectLink, leaveRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
   toggleStageFullscreen,
   startAudio: (r) => startAudio(r),
   openModal: (m) => { S.menu = null; S.modal = m; render(); },

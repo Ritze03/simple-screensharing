@@ -11,6 +11,7 @@ export const A = {
   /** Pick a screen for a room (user gesture) and open the stream modal. */
   startStage() {},
   copyLink() {},
+  copyDirectLink() {},
   /** Leave a room: confirm modal when something would be lost, else at once. */
   leaveRoom() {},
   openModal() {},
