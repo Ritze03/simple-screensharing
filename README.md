@@ -41,6 +41,33 @@ sudo pacman -S --needed rust base-devel pkgconf \
 
 </details>
 
+<details>
+<summary><b>Fedora / Nobara</b></summary>
+
+```bash
+sudo dnf install cargo gcc pkgconf-pkg-config \
+  gstreamer1-devel gstreamer1-plugins-base-devel \
+  gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-libav \
+  pipewire-gstreamer libva \
+  pipewire pipewire-utils pipewire-pulseaudio wireplumber xdg-desktop-portal \
+  vulkan-loader libxkbcommon libwayland-client libX11
+```
+
+- On a stock Nobara 44 (GNOME) install only `gstreamer1-devel` and `gstreamer1-plugins-base-devel` are
+  missing; everything else is preinstalled. Rust from [rustup](https://rustup.rs) works in place of `cargo`.
+- **Relay only** (`server/`): just `cargo` and `gcc`.
+- **Portal backend** matching your compositor (screen capture needs one): `xdg-desktop-portal-gnome`,
+  `-kde` or `-wlr` (sway, river, ...).
+- **GStreamer plugins**: the VA-API plugin (`vah264enc`, ...) is part of `gstreamer1-plugins-bad-free`. The
+  software x264 fallback (`x264enc`) is in `gstreamer1-plugins-ugly`, which is in Nobara's repos and in
+  RPM Fusion on Fedora.
+- **GPU drivers**: a Vulkan driver for rendering and a VA-API driver for hardware encode/decode. Nobara ships
+  Mesa with H.264/H.265 VA-API enabled (`mesa-vulkan-drivers-freeworld`, `mesa-libgallium-freeworld`); Intel
+  needs `intel-media-driver`.
+- `pw-cli`/`pw-link`/`pw-dump`/`pw-loopback` (per-app audio) come with `pipewire-utils`.
+
+</details>
+
 ## Run it
 
 ```bash
