@@ -31,6 +31,8 @@ optional, on-demand read.
   before you touch, update after you change, record design rationale (the *why*).
 - **Version policy** — @superdoc/claude-instructions/documentation-version-policy.md — how
   this project bumps doc/version markers.
+- **Changelog** — @superdoc/claude-instructions/changelog.md — every user-facing change adds a
+  dated entry to `CHANGELOG.md` in the same commit.
 - **Testing and verification** — @superdoc/claude-instructions/testing-and-verification.md —
   verify against the real egui binary + a real relay (not the `--gallery`, mocks or a browser);
   how to launch it safely. The launch recipe is `client/.claude/skills/run/SKILL.md`.

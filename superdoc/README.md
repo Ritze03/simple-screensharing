@@ -87,6 +87,7 @@ The rules are in `claude-instructions/testing-and-verification.md`; these pages 
 
 - [Working with the docs](claude-instructions/documentation.md): read before you touch, update after you change, record the why.
 - [Version policy](claude-instructions/documentation-version-policy.md): date-based, no version numbers.
+- [Changelog maintenance](claude-instructions/changelog.md): every user-facing change adds a dated entry to `CHANGELOG.md` in the same commit.
 - [Testing and verification](claude-instructions/testing-and-verification.md): verify against the real binary inside the headless rig; machine safety.
 
 ## meta/
