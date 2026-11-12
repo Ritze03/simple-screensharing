@@ -345,7 +345,7 @@ export function layoutArena(ar) {
   const H = ar.clientHeight;
   if (W < 8 || H < 8) return;
   const ars = ids.map((id) => parseFloat(tiles.get(id).style.getPropertyValue("--ar")) || 16 / 9);
-  const counts = G.bestRows(ars, W, H);
+  const counts = G.gridCounts(ars.length, W, H);
   if (!g.grid || !sameCounts(g.grid.counts, counts)) g.grid = G.evenGrid(counts);
   const placed = G.place(g.grid, ars, W, H, crop);
   const split = crop ? G.place(g.grid, ars, W, H, false).pics : placed.pics;

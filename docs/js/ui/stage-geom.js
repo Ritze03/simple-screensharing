@@ -1,10 +1,10 @@
 // The stage's geometry as pure functions: a line-for-line port of the native `client/src/ui/stage/geom.rs` (which is itself
-// the replica's `bestRows` / `gridRects` / `layoutArena` / float maths), so both clients lay out identically and the same
+// the replica's `gridCounts` / `gridRects` / `layoutArena` / float maths), so both clients lay out identically and the same
 // tests apply (dev/tests.js "stage geometry"). Rects are `{x, y, w, h}` relative to the arena's top-left; `w` x `h` is the
 // arena size.
 //
-// - Split / Crop share one grid (`bestRows`, `Grid`): rows of tiles filled in order, the row count that shows the most
-//   picture area wins. Split draws each picture whole (`contain`) in its cell, Crop fills the cell. Resize bars sit midway
+// - Split / Crop share one grid (`gridCounts`, `Grid`): rows of tiles filled in order, the shape set by the count and the
+//   arena's orientation alone (4 = 2x2). Split draws each picture whole (`contain`) in its cell, Crop fills the cell. Resize bars sit midway
 //   between the two VISIBLE pictures, never on the hidden cell edge, and `dragBar` finds the split that puts the bar under the
 //   pointer.
 // - Floating windows (fractions of the arena) always keep their stream's aspect ratio (`fitFloat`); `resizeFloat` moves the
@@ -28,31 +28,15 @@ export function contain(cell, ar) {
   return { x: cell.x + (cell.w - w) / 2, y: cell.y + (cell.h - h) / 2, w, h };
 }
 
-/** Tiles per row for `ars.length` tiles of aspect ratios `ars` in `w` x `h`: the row count whose pictures add up to the most
- *  area (a tie within 1 px^2 keeps fewer rows). */
-export function bestRows(ars, w, h) {
-  const n = ars.length;
-  let best = null;
-  for (let rows = 1; rows <= n; rows++) {
-    const counts = [];
-    for (let i = 0, left = n; i < rows; i++) {
-      const c = Math.ceil(left / (rows - i));
-      counts.push(c);
-      left -= c;
-    }
-    const rh = (h - GAP * (rows - 1)) / rows;
-    let area = 0;
-    let idx = 0;
-    for (const c of counts) {
-      const cw = (w - GAP * (c - 1)) / c;
-      for (let j = 0; j < c; j++, idx++) {
-        const q = contain({ x: 0, y: 0, w: cw, h: rh }, ars[idx]);
-        area += q.w * q.h;
-      }
-    }
-    if (!best || area > best.area + 1) best = { counts, area };
-  }
-  return best ? best.counts : [];
+/** Tiles per row for `n` tiles in a `w` x `h` arena. The shape depends only on `n` and the orientation: k = ceil(sqrt(n));
+ *  landscape (w >= h) k columns, portrait k rows; rows fill in order, the last holds the remainder. So 4 is always 2x2. */
+export function gridCounts(n, w, h) {
+  if (n <= 0) return [];
+  const k = Math.ceil(Math.sqrt(n) - 1e-9);
+  const cols = w >= h ? k : Math.ceil(n / k);
+  const counts = [];
+  for (let left = n; left > 0; left -= cols) counts.push(Math.min(cols, left));
+  return counts;
 }
 
 /** Equal rows, equal columns: `{ counts, rowFr, colFr }` (shares of the free height / width). */

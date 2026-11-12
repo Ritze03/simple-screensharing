@@ -1976,13 +1976,18 @@ const centerOf = (p, bar) => {
   return G.barCenter(bar, b.rect);
 };
 
-test("stage geometry: best_rows picks the row count with the most picture", () => {
-  eq(G.bestRows([AR, AR], 1600, 500), [2]);
-  eq(G.bestRows([AR, AR], 600, 1000), [1, 1]);
-  eq(G.bestRows([AR, AR, AR], 1000, 700), [2, 1], "three: two rows, the first with 2");
-  eq(G.bestRows([AR, AR, AR, AR], 1600, 900), [2, 2]);
-  eq(G.bestRows([AR], 800, 300), [1]);
-  eq(G.bestRows([], 800, 300), []);
+test("stage geometry: gridCounts depends only on the count and the orientation", () => {
+  const L = (n) => G.gridCounts(n, 1600, 900);
+  const Pt = (n) => G.gridCounts(n, 600, 1000);
+  eq(L(1), [1]); eq(Pt(1), [1]);
+  eq(L(2), [2]); eq(Pt(2), [1, 1]);
+  eq(L(3), [2, 1]); eq(Pt(3), [2, 1]);
+  eq(L(4), [2, 2], "four: a 2x2 window in landscape"); eq(Pt(4), [2, 2], "four: a 2x2 window in portrait");
+  eq(L(5), [3, 2]); eq(Pt(5), [2, 2, 1]);
+  eq(L(6), [3, 3]); eq(Pt(6), [2, 2, 2]);
+  eq(L(9), [3, 3, 3]);
+  eq(G.gridCounts(4, 800, 800), [2, 2], "a square arena is landscape");
+  eq(G.gridCounts(0, 800, 300), []);
 });
 
 test("stage geometry: contain letterboxes and centres; cells tile the arena with gaps", () => {
