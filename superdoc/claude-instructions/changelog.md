@@ -5,6 +5,14 @@
 `CHANGELOG.md` in the **repo root** is the user-facing "what changed". Write for users, in
 plain language, not implementation detail.
 
+## Plain language (hard rule)
+
+Entries must be short and understandable by a user with **no technical knowledge**. Say
+**what got better for the user, never how.** No file names, function names, flags, libraries,
+protocols, config keys, commit ids or implementation details. One short sentence per bullet.
+Drop anything a non-technical user would not notice. Example: a fix for a variable refresh
+rate bug becomes `- **Variable refresh rate**: fixed an issue with variable refresh rate.`
+
 ## The shape
 
 ```
@@ -15,7 +23,7 @@ plain language, not implementation detail.
 ## YYYY-MM-DD
 
 ### Added
-- **Short name**: one or two sentences of what changed for the user.
+- **Short name**: one short sentence of what got better for the user.
 ```
 
 - **`## YYYY-MM-DD`**: the date only, newest block on top. Date-based policy, no version
