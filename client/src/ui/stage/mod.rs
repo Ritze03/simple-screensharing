@@ -927,6 +927,7 @@ pub fn show_main(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
 /// the outage and comes back with the room, like a stream's pop-out (D1).
 pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, modal_ui: &mut dyn FnMut(&egui::Context, &mut Cx)) {
     let views: Vec<StageView> = st.popped.iter().cloned().collect();
+    let windows = live_windows(cx, st);
     for view in views {
         let title = match &view {
             StageView::Room(h) => cx.room_name(*h),
@@ -961,6 +962,7 @@ pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, modal
             if cx.shell.modal_host.get() == Some(vid) {
                 modal_ui(ctx, cx);
             }
+            crate::ui::paint_toasts(ctx, &cx.shell.toasts, vid, &windows);
             drive_dump::in_window(false);
         });
         if closed {
