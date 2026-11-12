@@ -24,7 +24,7 @@
 //! Modals ([`Modal`]) render after the panels: [`stream_settings::show`] for
 //! [`Modal::StreamSettings`], [`modals::show`] for every other kind. Pop-out
 //! viewports are re-declared every frame by [`popout::show`]. Toasts are
-//! painted last, by this file.
+//! painted last, by this file (or by the pop-out stage window that raised them, row 183).
 //!
 //! # The contract every screen follows
 //!
@@ -512,6 +512,14 @@ pub struct Toast {
     pub icon: &'static str,
     /// `ctx.input(|i| i.time)` after which it disappears.
     pub until: f64,
+    /// Viewport that last took input when it was raised (`Shell::input_vp`); see [`toast_host`].
+    pub host: egui::ViewportId,
+}
+
+/// Which viewport paints a toast (row 183): the one that last took input when it was raised if that is still a
+/// live stage window, else the main window (a window closed meanwhile hands its toasts to the main window).
+pub fn toast_host(host: egui::ViewportId, windows: &[egui::ViewportId]) -> egui::ViewportId {
+    if windows.contains(&host) { host } else { egui::ViewportId::ROOT }
 }
 
 /// Which viewport draws the open modal (row 182): none while no modal is open; one that already has it keeps it
@@ -1627,7 +1635,7 @@ impl App {
 
     pub(crate) fn toast(&mut self, text: String, icon: &'static str) {
         let secs = if icon == "error" { ERROR_TOAST_SECS } else { TOAST_SECS };
-        self.shell.toasts.push(Toast { text, icon, until: self.now + secs });
+        self.shell.toasts.push(Toast { text, icon, until: self.now + secs, host: self.shell.input_vp.get() });
     }
 
     /// Lay the window out and run every screen. Returns the actions they pushed.
@@ -1751,7 +1759,7 @@ impl App {
         popout::show(ctx, &mut cx, popout);
         stage::show_windows(ctx, &mut cx, &mut room.stage, &mut modal_ui);
 
-        paint_toasts(ctx, &cx.shell.toasts);
+        paint_toasts(ctx, &cx.shell.toasts, egui::ViewportId::ROOT, &windows);
         actions
     }
 }
@@ -1862,7 +1870,8 @@ fn user_band(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 
 /// Toasts (mockup `.toasts`): bottom centre, 72 px above the window bottom,
 /// stacked upwards, pill-shaped, `PANEL_RAISED` + border, icon in `SUCCESS` (`DANGER` for the "error" icon).
-fn paint_toasts(ctx: &egui::Context, toasts: &[Toast]) {
+pub(crate) fn paint_toasts(ctx: &egui::Context, toasts: &[Toast], vp: egui::ViewportId, windows: &[egui::ViewportId]) {
+    let toasts: Vec<&Toast> = toasts.iter().filter(|t| toast_host(t.host, windows) == vp).collect();
     if toasts.is_empty() {
         return;
     }
@@ -1870,7 +1879,7 @@ fn paint_toasts(ctx: &egui::Context, toasts: &[Toast]) {
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("ui_toasts")));
     let f = font(Weight::Regular, theme::FS_SMALL);
     let mut y = screen.bottom() - 72.0;
-    for t in toasts.iter().rev() {
+    for t in toasts.into_iter().rev() {
         let tw = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(t.text.clone(), f.clone(), theme::TEXT).size().x);
         let w = 14.0 + 16.0 + theme::S2 + tw + 14.0;
         let rect = Rect::from_min_size(pos2(screen.center().x - w / 2.0, y - theme::CTL_H), vec2(w, theme::CTL_H));

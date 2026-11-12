@@ -1414,3 +1414,14 @@ fn modal_host_follows_the_opening_window() {
     assert_eq!(super::modal_host(true, Some(V::ROOT), win, &[win]), Some(V::ROOT));
     assert_eq!(super::modal_host(true, Some(win), V::ROOT, &[]), Some(V::ROOT));
 }
+
+/// Row 183: which viewport paints a toast.
+#[test]
+fn toast_host_is_the_raising_window_while_it_lives() {
+    use egui::ViewportId as V;
+    let win = V::from_hash_of("w");
+    assert_eq!(super::toast_host(win, &[win]), win);
+    assert_eq!(super::toast_host(V::ROOT, &[win]), V::ROOT);
+    // A window that closed hands its toast to the main window.
+    assert_eq!(super::toast_host(win, &[]), V::ROOT);
+}
