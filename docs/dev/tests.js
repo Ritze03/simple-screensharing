@@ -20,6 +20,7 @@ import * as G from "../js/ui/stage-geom.js";
 import { panPos, previewAllowed, autoWatchKeys, joinWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
+import { noteInput, originHost, shownIn, ORIGIN_WINDOW_MS } from "../js/ui/origin.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
 import { Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan } from "../js/ui/sounds.js";
 import { DICT } from "../js/ui/i18n.js";
@@ -2323,6 +2324,22 @@ test("stage: the hover card stays open over the card, the avatar and the gap str
   for (const q of [{ x: 1000, y: 850 }, { x: 1135, y: 963 }, { x: 1135, y: 935 }]) ok(G.cardKeeps(card, av, q), show(q));
   ok(!G.cardKeeps(card, av, { x: 1174, y: 963 }), "the next person's avatar");
   ok(!G.cardKeeps(card, av, { x: 1018, y: 963 }), "the previous person's avatar");
+});
+
+// ------------------------------------------------------------------------------------------------ pop-out: which window a modal / toast opens in (row 184)
+
+test("origin: a modal or toast opens in the stage window only when the last input was there, recently, and it is open", () => {
+  eq(originHost(0, false), "main");
+  noteInput("pop", 1000);
+  eq(originHost(1500, true), "pop");
+  eq(originHost(1000 + ORIGIN_WINDOW_MS, true), "main", "a stale input");
+  eq(originHost(1500, false), "main", "no stage window");
+  noteInput("main", 1600);
+  eq(originHost(1700, true), "main", "the main window was pressed last");
+  eq(shownIn("pop", true), "pop");
+  eq(shownIn("pop", false), "main", "the stage window closed under it");
+  eq(shownIn("main", true), "main");
+  eq(shownIn(undefined, true), "main");
 });
 
 // ------------------------------------------------------------------------------------------------ fullscreen chrome (port of stage/chrome.rs tests)

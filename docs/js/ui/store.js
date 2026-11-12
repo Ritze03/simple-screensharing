@@ -1,6 +1,7 @@
 // Persistence (localStorage) for settings and saved rooms, plus the shared UI state object and its re-render hook.
 // Every localStorage access is wrapped: a private window or blocked storage must not break the page.
 
+import { originHost } from "./origin.js";
 import { DEFAULT_MAX_JITTER_BUFFER_MS, DEFAULT_CATCH_UP_SPEED_PERCENT, clampMaxJitterBufferMs, clampCatchUpSpeedPercent, ENCODER_PRESETS } from "../core/index.js";
 
 const K_SETTINGS = "sss.settings.v1";
@@ -203,7 +204,7 @@ export function dropLog(kind, text) {
 }
 
 export function toast(text, icon = "check_circle", { err = false } = {}) {
-  const t = { id: Math.random(), text, icon, err };
+  const t = { id: Math.random(), text, icon, err, hostId: originHost(performance.now(), true) }; // drawn in the window the user acted in (origin.js)
   S.toasts.push(t);
   invalidate();
   setTimeout(() => {

@@ -21,6 +21,7 @@ import * as G from "./stage-geom.js";
 import { chromeStart, chromeStep, chromeRemaining } from "./chrome.js";
 import { vg, panPos, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, peopleOf, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
 import { renderBar } from "./bar.js";
+import { noteInput } from "./origin.js";
 import { openTileMenu, renderMenu, positionMenu, closeMenu } from "./menus.js";
 import { watchStream, unwatchStream } from "./rooms.js";
 
@@ -649,6 +650,9 @@ export function bindWindow(win, hostId) {
   if (bound.has(win)) return;
   bound.add(win);
   const host = { id: hostId, win, doc: win.document };
+  const note = () => noteInput(hostId, performance.now());
+  win.addEventListener("pointerdown", note, true);
+  win.addEventListener("keydown", note, true);
   const mv = (e) => {
     pointerInside = true;
     if (!pipPointerMove(e)) dragMove(e);
@@ -703,6 +707,12 @@ export function bindWindow(win, hostId) {
       e.stopPropagation();
       e.preventDefault();
       closeMenu();
+      return;
+    }
+    // Escape closes a modal open in this window (the main window's own handler is in app.js)
+    if (S.modal && S.modal.hostId === hostId && hostId !== "main") {
+      S.modal = null;
+      A.render();
     }
   }, true);
   if (hostId === "main") document.addEventListener("fullscreenchange", onFullscreenChange);

@@ -22,6 +22,7 @@ import {
 } from "./capture.js";
 import { popOut, closePopout, popStage as popoutStage, closeStage, stageWindow } from "./popout.js";
 import { A } from "./actions.js";
+import { originHost, shownIn } from "./origin.js";
 import { syncWakeLock } from "./wakelock.js";
 import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
@@ -82,6 +83,7 @@ function render() {
   promptForName();
   syncWakeLock();
   if (S.modal) S.drawer = false; // a dialog replaces the rooms drawer
+  if (S.modal && !S.modal.hostId) S.modal.hostId = originHost(performance.now(), !!stageWindow()); // opens where the user pressed (origin.js)
   const keep = SCROLLERS.map((s) => {
     const n = root.querySelector(s);
     return n ? n.scrollTop : null;
@@ -105,10 +107,9 @@ function render() {
     ? V({ cls: "p-app fs-root", g: 0 }, renderStage(sv, HOST_MAIN, { fullscreen: true }))
     : H({ cls: "p-app st" + (S.drawer ? " drawer-open" : ""), g: 0 }, S.stage.sidebarHidden && sv && !PHONE.matches ? null : renderSide(), renderMain(sv),
       S.drawer ? h("div", { class: "drawer-scrim", onclick: () => { S.drawer = false; render(); } }) : null);
-  if (S.modal) app.appendChild(renderModal());
+  if (S.modal && modalHost() === "main") app.appendChild(renderModal());
   app.appendChild(h("div", { class: "layer" }, overlays("main")));
-  app.appendChild(V({ cls: "toasts", g: 1, attrs: { role: "status", "aria-live": "polite" } },
-    S.toasts.map((x) => H({ cls: "toast" + (x.err ? " err" : ""), g: 2 }, ic(x.icon), T(x.text)))));
+  app.appendChild(toastsEl("main"));
   app.classList.toggle("has-menu", !!(S.menu || S.modal));
   root.replaceChildren(app);
   root.classList.toggle("stage-fs", !!fsStage);
@@ -124,21 +125,26 @@ function render() {
       if (caret && typeof f.setSelectionRange === "function") try { f.setSelectionRange(caret[0], caret[1]); } catch {}
     }
   }
+  root.querySelectorAll('input[type="range"]').forEach(pct);
+  renderPop();
   if (S.modal && S.modal.focus) {
-    // A modal that wants its field focused with the text selected (once, when it opens).
+    // A modal that wants its field focused with the text selected (once, when it opens), in whichever window shows it.
     S.modal.focus = false;
-    const f = root.querySelector(".modal input.field");
+    const f = (modalHost() === "pop" ? stageWindow().root : root).querySelector(".modal input.field");
     if (f) {
       f.focus();
       f.select();
     }
   }
-  root.querySelectorAll('input[type="range"]').forEach(pct);
-  renderPop();
   patchLive();
   const sw = stageWindow();
   afterRender(sw ? [window, sw.win] : [window]);
 }
+/** The window the open modal is drawn in: where it was opened, the main one once the stage window is gone. */
+const modalHost = () => shownIn(S.modal && S.modal.hostId, !!stageWindow());
+/** The toasts raised from window `host`. */
+const toastsEl = (host) => V({ cls: "toasts", g: 1, attrs: { role: "status", "aria-live": "polite" } },
+  S.toasts.filter((x) => shownIn(x.hostId, !!stageWindow()) === host).map((x) => H({ cls: "toast" + (x.err ? " err" : ""), g: 2 }, ic(x.icon), T(x.text))));
 /** The whole stage in its own (Document PiP) window: the same stage tree rendered into that window's document. */
 function renderPop() {
   const sw = stageWindow();
@@ -153,7 +159,18 @@ function renderPop() {
   const body = away
     ? V({ cls: "stg eq minh0", g: 0 }, h("div", { class: "arena" }, h("div", { class: "arena-note" }, ic("sync", "big"), h("b", { text: t("ui.sidebar.status_reconnecting") }))))
     : renderStage(view, host);
-  sw.root.replaceChildren(body, h("div", { class: "layer" }, overlays("pop")));
+  // a field being typed in (a modal's input) keeps its focus and caret across the rebuild
+  const pd = sw.win.document;
+  const act = pd.activeElement;
+  const fid = act && sw.root.contains(act) ? act.id : null;
+  const caret = act && fid && typeof act.selectionStart === "number" ? [act.selectionStart, act.selectionEnd] : null;
+  sw.root.replaceChildren(body, ...(S.modal && modalHost() === "pop" ? [renderModal()] : []), h("div", { class: "layer" }, overlays("pop")), toastsEl("pop"));
+  sw.root.classList.toggle("has-menu", !!(S.menu || S.modal));
+  const f = fid && pd.getElementById(fid);
+  if (f) {
+    f.focus();
+    if (caret && typeof f.setSelectionRange === "function") try { f.setSelectionRange(caret[0], caret[1]); } catch {}
+  }
 }
 /** Run a render that was held back by a drag. */
 A.flush = () => {
@@ -860,7 +877,7 @@ const copyDirectLink = (r) => clip(buildDirectLink(location.origin + location.pa
 
 // Escape closes the modal (an open menu takes the key first, in stage.js: Escape in a dropdown closes the dropdown alone).
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && S.modal) {
+  if (e.key === "Escape" && S.modal && modalHost() === "main") {
     S.modal = null;
     render();
   }
