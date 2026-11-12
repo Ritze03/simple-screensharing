@@ -715,7 +715,13 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         {
             acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(it.id.clone()), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
         }
-        let pannable = crop && matches!(it.kind, Kind::Video(_));
+        let pannable = crop
+            && match &it.kind {
+                Kind::Video(_) => true,
+                // Your own share, only while a live preview is painted (the placeholder has nothing to pan).
+                Kind::Mine(capture, _) => cxr.shell.live_previews.get(capture).is_some_and(|t| t.tex.is_some()),
+                _ => false,
+            };
         if pannable && !dragging && hover == Some(i) && hover_ok && ui.input(|x| x.modifiers.shift) {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }

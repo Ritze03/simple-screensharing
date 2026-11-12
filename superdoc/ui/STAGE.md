@@ -78,6 +78,10 @@ The room view of the desktop client: the black stage with its tiles, layouts, pe
     its spot relative to the centred picture, it does not follow the pan. Painted by `VideoView::paint_panned` (the
     quad shifted, the clip stays the cell). The Crop item's menu subtitle says "Shift+drag to pan".
     *Why:* user request 2026-11-11 ("hold Shift+LeftMouseButton, to move around the image in the cropped area").
+    **Own tiles too (2026-11-12, row 186):** your own webcam and screen tiles pan the same way, while their live preview
+    is painted (the placeholder has nothing to pan, so no pan starts); same `ViewGeom::pan` by `ItemId`, same clamp and
+    reset. The own tile paints through `tile::paint_cover_panned` (the preview texture's UV window shifted; it was
+    already Cover-fit). *Why:* user request 2026-11-12 ("I should be able to do the crop move on my own camera aswell").
   - **Paint order:** egui paints a wgpu callback in the order shapes are added, so a floating window above
     another covers its video correctly; the rounded-corner masks (the video cannot be clipped to a rounded rect)
     are only used outside Floating, where windows overlap and a mask would paint over the one underneath.
