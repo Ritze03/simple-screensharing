@@ -2,8 +2,8 @@
 //! `layoutArena` / float maths, `superdoc/ui/replica/index.html`), so it can be tested without egui
 //! running. Everything is relative to the arena's top-left corner; `w` x `h` is the arena size.
 //!
-//! - **Split / Crop** share one grid ([`best_rows`], [`Grid`]): rows of tiles filled in order, the row
-//!   count that shows the most picture area wins. Split draws each picture whole ([`contain`]) in its cell,
+//! - **Split / Crop** share one grid ([`grid_counts`], [`Grid`]): rows of tiles filled in order, the shape
+//!   fixed by the tile count and the arena's orientation (never by picture area). Split draws each picture whole ([`contain`]) in its cell,
 //!   Crop fills the cell (the video is cropped around its centre). Resize bars ([`Bar`]) sit **midway
 //!   between the two visible pictures**, not on the cell edge, and [`drag_bar`] finds the split that puts
 //!   the bar under the pointer.
@@ -31,34 +31,20 @@ pub fn contain(cell: Rect, ar: f32) -> Rect {
     Rect::from_center_size(cell.center(), vec2(w.max(0.0), h.max(0.0)))
 }
 
-/// Tiles per row for `ars.len()` tiles of aspect ratios `ars` in `w` x `h`: the row count whose pictures
-/// add up to the most area (a tie within 1 px² keeps fewer rows).
-pub fn best_rows(ars: &[f32], w: f32, h: f32) -> Vec<usize> {
-    let n = ars.len();
-    let mut best: Option<(Vec<usize>, f32)> = None;
-    for rows in 1..=n {
-        let mut counts = Vec::with_capacity(rows);
-        let mut left = n;
-        for i in 0..rows {
-            let c = left.div_ceil(rows - i);
-            counts.push(c);
-            left -= c;
-        }
-        let rh = (h - GAP * (rows as f32 - 1.0)) / rows as f32;
-        let (mut area, mut idx) = (0.0, 0);
-        for &c in &counts {
-            let cw = (w - GAP * (c as f32 - 1.0)) / c as f32;
-            for _ in 0..c {
-                let q = contain(Rect::from_min_size(pos2(0.0, 0.0), vec2(cw, rh)), ars[idx]);
-                area += q.width() * q.height();
-                idx += 1;
-            }
-        }
-        if best.as_ref().is_none_or(|b| area > b.1 + 1.0) {
-            best = Some((counts, area));
-        }
+/// Tiles per row for `n` tiles in `w` x `h`. The shape depends only on `n` and the orientation: with
+/// `k = ceil(sqrt(n))`, a landscape arena (`w >= h`) has `k` columns, a portrait one has `ceil(n / k)`
+/// columns; rows fill in order, only the last may be short. 4 is always 2x2, 3 always 2+1.
+pub fn grid_counts(n: usize, w: f32, h: f32) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
     }
-    best.map(|b| b.0).unwrap_or_default()
+    let k = (n as f32).sqrt().ceil() as usize;
+    let cols = if w >= h { k } else { n.div_ceil(k) };
+    let mut counts = vec![cols; n / cols];
+    if n % cols > 0 {
+        counts.push(n % cols);
+    }
+    counts
 }
 
 /// The grid's rows and the share of the free height / width each row / column takes.
@@ -547,15 +533,32 @@ mod tests {
     }
 
     #[test]
-    fn best_rows_picks_the_row_count_with_the_most_picture() {
-        // Two 16:9 in a wide strip: side by side; in a tall column: stacked.
-        assert_eq!(best_rows(&[AR, AR], 1600.0, 500.0), vec![2]);
-        assert_eq!(best_rows(&[AR, AR], 600.0, 1000.0), vec![1, 1]);
-        // Three: two rows, the first with 2 (rows are filled evenly from the top).
-        assert_eq!(best_rows(&[AR; 3], 1000.0, 700.0), vec![2, 1]);
-        assert_eq!(best_rows(&[AR; 4], 1600.0, 900.0), vec![2, 2]);
-        assert_eq!(best_rows(&[AR], 800.0, 300.0), vec![1]);
-        assert!(best_rows(&[], 800.0, 300.0).is_empty());
+    fn grid_shape_depends_only_on_the_count_and_the_orientation() {
+        let (l, p) = ((1600.0, 900.0), (600.0, 1000.0));
+        let c = |n, (w, h): (f32, f32)| grid_counts(n, w, h);
+        assert_eq!(c(1, l), vec![1]);
+        assert_eq!(c(1, p), vec![1]);
+        assert_eq!(c(2, l), vec![2]);
+        assert_eq!(c(2, p), vec![1, 1]);
+        assert_eq!(c(3, l), vec![2, 1]);
+        assert_eq!(c(3, p), vec![2, 1]);
+        // 4 is a window in any shape, even in a very tall or very wide arena.
+        for sz in [l, p, (400.0, 1800.0), (1800.0, 300.0)] {
+            assert_eq!(c(4, sz), vec![2, 2]);
+        }
+        assert_eq!(c(5, l), vec![3, 2]);
+        assert_eq!(c(5, p), vec![2, 2, 1]);
+        assert_eq!(c(6, l), vec![3, 3]);
+        assert_eq!(c(6, p), vec![2, 2, 2]);
+        assert_eq!(c(9, l), vec![3, 3, 3]);
+        assert_eq!(c(9, p), vec![3, 3, 3]);
+        assert_eq!(c(7, l), vec![3, 3, 1]);
+        assert_eq!(c(2, (500.0, 500.0)), vec![2], "square counts as landscape");
+        assert!(c(0, l).is_empty());
+        for n in 1..40 {
+            assert_eq!(c(n, l).iter().sum::<usize>(), n);
+            assert_eq!(c(n, p).iter().sum::<usize>(), n);
+        }
     }
 
     #[test]

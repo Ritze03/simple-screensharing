@@ -503,7 +503,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     let (w, h) = (arena.width(), arena.height());
     let ars: Vec<f32> = vis.iter().map(|i| i.ar).collect();
     let (crop, float) = (layout == StageLayout::Crop, layout == StageLayout::Floating);
-    let counts = geom::best_rows(&ars, w, h);
+    let counts = geom::grid_counts(ars.len(), w, h);
     if geom.grid.as_ref().is_none_or(|g| g.counts != counts) {
         geom.grid = Some(Grid::even(counts));
     }

@@ -11,8 +11,14 @@ The room view of the desktop client: the black stage with its tiles, layouts, pe
   `room::shows_stage`). Code: `client/src/ui/stage/` (`mod.rs` state, items, input, painting; `geom.rs` the pure
   maths with tests; `tile.rs` what a tile shows). Layouts, per view (each room and Watched keep their own):
   **Split** every picture whole in a grid, **Crop** the same cells filled (`Fit::Cover`: the wgpu quad is bigger
-  than the cell and the painter's clip crops it), **Floating** one window per stream. The grid is the row count
-  that shows the most picture area (`geom::best_rows`), rows filled evenly from the top. *Why one grid for Split and
+  than the cell and the painter's clip crops it), **Floating** one window per stream. The grid shape depends only on the
+  tile count `n` and the orientation (`geom::grid_counts`): `k = ceil(sqrt(n))`; landscape (`w >= h`) has `k` columns,
+  portrait `ceil(n / k)` columns; rows fill in order from the top, only the last may be short (its cells stretch).
+  So 4 is always 2x2 (a "window"), 3 is 2+1, 5 is 3+2 / 2+2+1, 6 is 3+3 / 2+2+2, 9 is 3x3. Webcams folded into a
+  screen tile are not tiles. The browser uses the same rule. *Why not maximise picture area (the rule until 2026-11-12):*
+  on a tall half-monitor window it put 4 streams in a lopsided "T" (2 / 1 / 1); the user: "It should prefer an even
+  split, instead of maximizing the filled area. So 4 shared should always look like a 'window'. Both in split and crop
+  mode (2 top, 2 bottom)." (row 188). *Why one grid for Split and
   Crop, and no "even grid" setting:* the user's design call; resizing is by the bars, so an even grid stays one
   double-click away on a bar.
   - **What is on it:** other people's video streams (watched = video; not watched = a dimmed preview, "X is

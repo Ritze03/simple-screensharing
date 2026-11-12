@@ -83,8 +83,8 @@ Playwright `_electron`) is in git: `git log -- superdoc/features/viewer-window.m
   per-tile 16:9 size is computed and the shape with the largest tile area wins (tall windows
   stack, wide ones go side by side). *Why:* the owner asked for "stack them, if that maximises
   the used viewing area". It lived on as `grid_shape` in `client/src/ui/room.rs` (ported from the
-  former Electron frontend's `computeGridShape`) until the stage (I1, 2026-11-04) replaced the grid: the rule is now `best_rows` in
-  `client/src/ui/stage/geom.rs` (rows of tiles in order, the row count that shows the most picture area wins; Split / Crop; `features/website/stage.md` "The stage" for the browser twin).
+  former Electron frontend's `computeGridShape`) until the stage (I1, 2026-11-04) replaced the grid: the rule is now `grid_counts` in
+  `client/src/ui/stage/geom.rs` (rows of tiles in order, shape from the count and orientation only, since 2026-11-12; `ui/STAGE.md`; Split / Crop; `features/website/stage.md` "The stage" for the browser twin).
 - **Verification lesson:** the Electron-era checks drove the real shell with synthetic mouse
   events and fabricated stream keys; the egui equivalent is the `run` skill plus the headless rig (`hs-rig.sh`, `hs-drive.sh`)
   (`client/.claude/skills/run/SKILL.md`, `client/scripts/`).
