@@ -110,7 +110,7 @@ outside it.
 
 At most one popover (`Nav.popover`, anchored to the button's rect) and one modal
 (`Nav.modal`). Opening a modal closes the popover; Escape closes the popover before a
-modal; Escape, x and a backdrop click close every modal. A modal is drawn in the window that opened it (main or a popped-out stage, `ui::modal_host`, `STAGE.md`). A toast is painted in the window that last took input when it was raised, else main (`ui::toast_host`; a closed window hands it to main), last in that window
+modal; Escape, x and a backdrop click close every modal. A modal is drawn in the window that opened it (main or a popped-out stage, `ui::modal_host`, `STAGE.md`). A toast is painted in a popped-out stage window only if that window took input within the last 2 s when it was raised (`ui::toast_origin`, as the browser), else main (`ui::toast_host`; a closed window hands it to main), last in that window
 (`mod.rs` / `stage::show_windows`; 2.6 s; error toasts stay 6 s, `ERROR_TOAST_SECS`).
 
 Settings cards (Logs, Relay diagnostics, Sounds, Avatar), Boost, Level loudness and the native Playback sliders: `SETTINGS.md`. Module list: `MODULE-MAP.md`.

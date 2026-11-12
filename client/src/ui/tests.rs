@@ -1425,3 +1425,13 @@ fn toast_host_is_the_raising_window_while_it_lives() {
     // A window that closed hands its toast to the main window.
     assert_eq!(super::toast_host(win, &[]), V::ROOT);
 }
+
+/// Row 185: a toast follows a stage window only when it took input within 2 s.
+#[test]
+fn toast_origin_needs_recent_stage_input() {
+    use egui::ViewportId as V;
+    let win = V::from_hash_of("w");
+    assert_eq!(super::toast_origin(win, 10.0, 11.5), win);
+    assert_eq!(super::toast_origin(win, 10.0, 12.5), V::ROOT);
+    assert_eq!(super::toast_origin(V::ROOT, 10.0, 10.5), V::ROOT);
+}

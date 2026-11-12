@@ -226,12 +226,12 @@ a `modal_ui` callback and draws it inside the window closure otherwise (scrim, f
 window; the main window stays usable meanwhile). If the window closes (or the stage comes back) with the modal open, it moves to
 the main window next frame. Bar and tile menus (`Nav::popover`) were already drawn with the window's own ctx by `menus::show`; Escape
 in the window now closes one (`App::update` only sees the main window's keys). Tooltips are egui's, per viewport. Toasts follow the same
-rule (row 183): `Toast.host` records `Shell::input_vp` when it is raised, and `ui::toast_host` picks the painting viewport: that window while it is
+rule (row 183): `Toast.host` is set when it is raised by `ui::toast_origin`: the stage window in `Shell::input_vp` only if it took input within `TOAST_INPUT_WINDOW_SECS` (2 s, `Shell::input_at`), else main (row 185: a toast nobody just triggered, e.g. "Connected", stays on main; same rule as the browser's `originHost`). `ui::toast_host` picks the painting viewport: that window while it is
 still live (`live_windows`), else the main window, so a toast of a window that closed meanwhile moves to main instead of vanishing. Main paints its
 toasts last in `App::update`, each window inside `show_windows`. *Why:* user request 2026-11-12: "toasts (e.g. Invite link copied) triggered by an
-action in the popped-out stage window should appear in that pop-out window". Modal *Why:* user request 2026-11-12: "The End call button opens a modal. This modal
+action in the popped-out stage window should appear in that pop-out window"; 2-s window: parity with the browser, user OK 2026-11-12. Modal *Why:* user request 2026-11-12: "The End call button opens a modal. This modal
 isnt visible in the popped out view and instead shows on the main window itself. When something is pressed in the popped out
-section, the menus/modals and so on should also show in the popped out window." Rule tests: `ui::tests::modal_host_follows_the_opening_window`, `toast_host_is_the_raising_window_while_it_lives`.
+section, the menus/modals and so on should also show in the popped out window." Rule tests: `ui::tests::modal_host_follows_the_opening_window`, `toast_host_is_the_raising_window_while_it_lives`, `toast_origin_needs_recent_stage_input`.
 Per-stream pop-outs (`popout.rs`) have no modals; they are unchanged (`popout_survives_resume`).
 
 **Stage motion and draw order** (task I12, 2026-11-04; `stage/geom.rs` `ease`, `Glide`, `stage/mod.rs` `draw_arena`, `stage/pip.rs`

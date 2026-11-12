@@ -512,8 +512,17 @@ pub struct Toast {
     pub icon: &'static str,
     /// `ctx.input(|i| i.time)` after which it disappears.
     pub until: f64,
-    /// Viewport that last took input when it was raised (`Shell::input_vp`); see [`toast_host`].
+    /// Viewport chosen when it was raised (`toast_origin`); see [`toast_host`].
     pub host: egui::ViewportId,
+}
+
+/// A toast goes to the stage window only if it took input within this many seconds (row 185; the browser's `originHost` rule).
+pub const TOAST_INPUT_WINDOW_SECS: f64 = 2.0;
+
+/// Viewport a toast raised at `now` is assigned to (row 185): the viewport that took input at `input_at` if it is a
+/// stage window (not main) and that was within [`TOAST_INPUT_WINDOW_SECS`], else the main window.
+pub fn toast_origin(input_vp: egui::ViewportId, input_at: f64, now: f64) -> egui::ViewportId {
+    if input_vp != egui::ViewportId::ROOT && now - input_at <= TOAST_INPUT_WINDOW_SECS { input_vp } else { egui::ViewportId::ROOT }
 }
 
 /// Which viewport paints a toast (row 183): the one that last took input when it was raised if that is still a
@@ -546,6 +555,8 @@ pub(crate) fn took_input(ctx: &egui::Context) -> bool {
 pub struct Shell {
     /// Viewport that last got a press, release or key (`took_input`): where a modal opened next appears.
     pub input_vp: std::cell::Cell<egui::ViewportId>,
+    /// `ctx.input(|i| i.time)` of that input (row 185): a toast only follows `input_vp` while this is recent.
+    pub input_at: std::cell::Cell<f64>,
     /// Viewport drawing the open modal (`modal_host`); `None` while no modal is open.
     pub modal_host: std::cell::Cell<Option<egui::ViewportId>>,
     /// The stage's layout choices (set by the Layout menu through `UiAction`s).
@@ -1635,7 +1646,7 @@ impl App {
 
     pub(crate) fn toast(&mut self, text: String, icon: &'static str) {
         let secs = if icon == "error" { ERROR_TOAST_SECS } else { TOAST_SECS };
-        self.shell.toasts.push(Toast { text, icon, until: self.now + secs, host: self.shell.input_vp.get() });
+        self.shell.toasts.push(Toast { text, icon, until: self.now + secs, host: toast_origin(self.shell.input_vp.get(), self.shell.input_at.get(), self.now) });
     }
 
     /// Lay the window out and run every screen. Returns the actions they pushed.
@@ -1645,6 +1656,7 @@ impl App {
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
         if took_input(ctx) {
             cx.shell.input_vp.set(egui::ViewportId::ROOT);
+            cx.shell.input_at.set(ctx.input(|i| i.time));
         }
         if let Some(fs) = cx.nav.fullscreen {
             if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {

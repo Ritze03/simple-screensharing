@@ -956,6 +956,7 @@ pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, modal
             drive_dump::in_window(true);
             if crate::ui::took_input(ctx) {
                 cx.shell.input_vp.set(vid);
+                cx.shell.input_at.set(ctx.input(|i| i.time));
             }
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::STAGE_BG)).show(ctx, |ui| show(ui, cx, st, Host::Window, &view));
             // The modal opened from this window is drawn here, over it (row 182).
