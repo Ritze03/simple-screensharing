@@ -39,7 +39,7 @@ const site = await L.serveSite(0);
 // A fake camera for getUserMedia (Chromium's own moving test picture; `getDisplayMedia` is stubbed by the harness, never real, and no audio is requested
 // anywhere: the camera is always `audio: false`), and the camera permission granted through CDP instead of the fake-UI flag.
 const open = async (name, url = site.url) => {
-  const b = await L.openApp(url, { name, flags: ["--use-fake-device-for-media-stream"] });
+  const b = await L.openApp(url, { name, settings: { autoWatch: false }, flags: ["--use-fake-device-for-media-stream"] });
   await b.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
   return b;
 };
@@ -345,6 +345,19 @@ try {
     first += c;
   });
   check(cmid, "in Crop the bars are in the middle of the gap between the cells");
+  // row 189: four streams are a 2x2 window in Crop and Split, in a tall and in a wide window
+  const is22 = (ts) => ts.length === 4 && Math.max(ts[0].b, ts[1].b) <= Math.min(ts[2].y, ts[3].y) && ts[0].r <= ts[1].x && ts[2].r <= ts[3].x;
+  for (const [vw, vh] of [[700, 1000], [1440, 900]]) {
+    await P.setViewport(vw, vh);
+    for (const lay of ["crop", "split"]) {
+      await setLayout(lay);
+      await sleep(400);
+      check(is22(await tiles(P)), `four tiles are a 2x2 window in ${lay} at ${vw}x${vh}`, JSON.stringify((await grid()).counts));
+      await shot(P, `05b_2x2_${lay}_${vw}`);
+    }
+  }
+  await setLayout("crop");
+  await sleep(300);
   const cv = cg.find((x) => x.id === "v0.0");
   await drag(P, cv.cx, cv.cy, 60, 0);
   near(((await guts(P)).find((x) => x.id === "v0.0")).cx - cv.cx, 60, 1.5, "a dragged bar follows the pointer 1:1 in Crop too");
@@ -1336,9 +1349,9 @@ try {
 
   section("two members with one name are two people (the user's report: hovering You showed nothing, hovering the other showed both cards)");
   {
-    const T1 = await L.openApp(site.url, { name: "Twin", settings: { emoji: "🦊" } });
-    const T2 = await L.openApp(site.url, { name: "Twin", settings: { emoji: "🐻" } });
-    const TV = await L.openApp(site.url + "?fakeaudio=1", { name: "Wes" });
+    const T1 = await L.openApp(site.url, { name: "Twin", settings: { autoWatch: false, emoji: "🦊" } });
+    const T2 = await L.openApp(site.url, { name: "Twin", settings: { autoWatch: false, emoji: "🐻" } });
+    const TV = await L.openApp(site.url + "?fakeaudio=1", { name: "Wes", settings: { autoWatch: false } });
     const Q = TV.page;
     await L.createRoom(T1.page, { name: "twins", server: RELAY, hash: HASH });
     await L.waitJoined(T1.page);
@@ -1436,7 +1449,7 @@ try {
     const D1 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🦊" } });
     const D2 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🐻" } });
     const D3 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🐼" } });
-    const WV = await L.openApp(site.url, { name: "Wim" });
+    const WV = await L.openApp(site.url, { name: "Wim", settings: { autoWatch: false } });
     const Q = WV.page;
     await L.createRoom(D1.page, { name: "dana-one", server: RELAY, hash: HASH });
     await L.waitJoined(D1.page);

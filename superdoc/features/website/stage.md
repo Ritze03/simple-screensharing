@@ -26,18 +26,26 @@ reconnecting, not connected) keeps the scrolling body with its banner and a `⋯
 | --- | --- |
 | `stage.js` | the stage: tiles (watched video, idle "X is sharing Y", own share), arena layout, resize bars and drags, the people strip and hover card, the viewers dropdown, fullscreen + its auto-hiding chrome, the window listeners |
 | `stage-state.js` | what a view shows (`collect`) and the per-view layout (`vg`: order, z, floating rects, grid; UI-private, per session, not persisted), keyed by `stableKey`. The Layout switches (layout Split / Crop / Float per view, Webcam in picture per view, Hide own, Always show names, Show stats) are different: they live in `S.stage` and are saved (`store.js` `persistStage` into `settings.stage`, keyed by saved room) |
-| `stage-geom.js` | the pure maths, a line-for-line port of native `stage/geom.rs` (`bestRows`, `place`, `dragBar`, `fitFloat`, `resizeFloat`, `cardKeeps`), same tests |
+| `stage-geom.js` | the pure maths, a line-for-line port of native `stage/geom.rs` (`gridCounts`, `place`, `dragBar`, `fitFloat`, `resizeFloat`, `cardKeeps`), same tests |
 | `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs`, same tests |
 | `bar.js` | the control bar (split buttons, groups, Leave, pop out, fullscreen) |
 | `menus.js` | every dropdown and context menu: Share, Audio, Layout, Room, the stream menu, the avatar picker, "Also send to / Move to", and the dropdown *field* (`selectField`) |
 | `actions.js` | the hooks app.js hands the stage modules (they cannot import it: app.js imports them) |
 
-**Layouts** (per view; each room and Watched keep their own): **Split** every picture whole in a grid (the row count that shows the most picture area,
-rows filled evenly from the top), **Crop** the same cells filled (the picture is `max(100cqw, 100cqh * ar)` and the tile clips it), **Floating**
+**Layouts** (per view; each room and Watched keep their own): **Split** every picture whole in a grid (shape from the count and the arena's orientation only, see "Grid shape" below;
+rows filled in order from the top), **Crop** the same cells filled (the picture is `max(100cqw, 100cqh * ar)` and the tile clips it), **Floating**
 one window per stream. A drag on a resize bar, a floating window or a reorder updates styles directly and holds `render()` back until the pointer is up
 (`isDragging`; a slider being dragged does the same, `sliderHeld` in app.js): the full re-render would replace the element under the pointer.
 Positions are applied after the new tree is inserted (`afterRender` -> `layoutArena`), the video `<canvas>` of a watch is re-adopted by the new tree as before.
 A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a floating window keeps its stream's aspect ratio without black bars.
+
+**Grid shape** (Split and Crop; `stage-geom.js` `gridCounts(n, w, h)`, pure, tested in `dev/tests.js`; mirrors native `geom.rs`, row 188): the shape depends only on the
+stream count `n` and whether the arena is landscape (`w >= h`) or portrait. `k = ceil(sqrt(n))`; landscape `cols = k`, `rows = ceil(n / k)`; portrait `rows = k`,
+`cols = ceil(n / k)`. Rows fill in order, the last holds the remainder (its cells share the full width). 1 -> 1x1; 2 -> one row of 2 (portrait: 2 rows of 1); 3 -> 2+1;
+**4 -> always 2x2**; 5 -> 3+2 (portrait 2+2+1); 6 -> 3+3 (portrait 2+2+2); 9 -> 3x3. Resize bars, double-click-to-even and Reset sizes work on this grid as before
+(`vg.grid` is rebuilt whenever the counts change); webcam-in-picture folding happens before the count.
+Why: the old rule picked the per-row counts that maximised the filled picture area, which on a tall half-monitor window turned 4 streams into a 2/1/1 "T".
+The user wanted an even, predictable "window" (2 top, 2 bottom) over the last bit of filled area (user request 2026-11-12; parity with native, row 189).
 
 **Crop pan (row 178, 2026-11-11).** In Crop, **Shift + left-drag** on a watched tile's picture pans it inside its cell (the picture follows the pointer 1:1; the cursor is `grab` while Shift is held over a
 cropped tile, `grabbing` during the drag). The offset is per stream, `vg(view).pan[itemId] = { x, y }` (0..1 like CSS `object-position`, 0.5 centred; item ids are `stableKey`-based, so it survives a
