@@ -341,7 +341,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     let live_tex = cx.shell.live_previews.get(&capture).and_then(|t| t.tex.as_ref());
     if let Some(tex) = live_tex {
         ui.painter().rect_filled(rect, radius, theme::TILE_BG);
-        paint_cover(ui.painter(), rect, tex, radius, Color32::WHITE);
+        paint_cover_panned(ui.painter(), rect, tex, radius, Color32::WHITE, s.pan);
     } else {
         widgets::paint_hatch(ui.painter(), rect, radius, 8.0, theme::ELEV_19, theme::ELEV_14);
         let (icon, what) = if webcam { ("videocam", tr("ui.room.my_webcam", "Your webcam")) } else { ("cast", tr("ui.room.my_screen", "Your screen")) };
@@ -412,6 +412,11 @@ const OVL_H: f32 = 29.0;
 
 /// Cover-fit a preview texture into `rect` (crop, never letterbox), tinted by `tint`.
 pub(super) fn paint_cover(p: &egui::Painter, rect: Rect, tex: &egui::TextureHandle, radius: CornerRadius, tint: Color32) {
+    paint_cover_panned(p, rect, tex, radius, tint, egui::Vec2::ZERO);
+}
+
+/// [`paint_cover`] with the picture shifted by `pan` points from the centre (Crop's pan, already clamped by `geom::pan_shift`).
+pub(super) fn paint_cover_panned(p: &egui::Painter, rect: Rect, tex: &egui::TextureHandle, radius: CornerRadius, tint: Color32, pan: egui::Vec2) {
     let [tw, th] = tex.size();
     let (ta, ra) = (tw as f32 / th.max(1) as f32, rect.width() / rect.height());
     let uv = if ta > ra {
@@ -421,6 +426,7 @@ pub(super) fn paint_cover(p: &egui::Painter, rect: Rect, tex: &egui::TextureHand
         let k = ta / ra;
         Rect::from_min_max(pos2(0.0, 0.5 - k / 2.0), pos2(1.0, 0.5 + k / 2.0))
     };
+    let uv = uv.translate(egui::vec2(-pan.x * uv.width() / rect.width(), -pan.y * uv.height() / rect.height()));
     p.add(RectShape::filled(rect, radius, tint).with_texture(tex.id(), uv));
 }
 
