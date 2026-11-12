@@ -1396,3 +1396,21 @@ async fn auto_watch_setting_is_on_by_default_and_persists() {
     assert!(!app.shell.auto_watch);
     assert!(!simple_screensharing_client::rooms::AppSettings::load().auto_watch, "saved to settings.toml");
 }
+
+/// Row 182: which viewport draws the open modal.
+#[test]
+fn modal_host_follows_the_opening_window() {
+    use egui::ViewportId as V;
+    let win = V::from_hash_of("w");
+    let other = V::from_hash_of("o");
+    // No modal, no host.
+    assert_eq!(super::modal_host(false, Some(win), win, &[win]), None);
+    // A fresh modal goes to the window that last got input, else the main window.
+    assert_eq!(super::modal_host(true, None, win, &[win]), Some(win));
+    assert_eq!(super::modal_host(true, None, V::ROOT, &[win]), Some(V::ROOT));
+    assert_eq!(super::modal_host(true, None, other, &[win]), Some(V::ROOT));
+    // It stays where it is while input moves elsewhere; a closed window hands it back to the main window.
+    assert_eq!(super::modal_host(true, Some(win), V::ROOT, &[win]), Some(win));
+    assert_eq!(super::modal_host(true, Some(V::ROOT), win, &[win]), Some(V::ROOT));
+    assert_eq!(super::modal_host(true, Some(win), V::ROOT, &[]), Some(V::ROOT));
+}

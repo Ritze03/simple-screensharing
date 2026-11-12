@@ -19,7 +19,7 @@
 //!   immediate viewport:* the stage needs `Cx` and the video views, which a deferred viewport's closure
 //!   (`Send + Sync + 'static`, `viewer-window.md`) cannot hold; immediate runs inside our own frame. During a
 //!   reconnect the window is gone and comes back with the room (a suspended room keeps its handle). What is
-//!   left out: modals opened from it appear in the main window.
+//!   modals opened from it appear in that window (row 182).
 //! - **Per-view state** (`StageState`, UI-private, per session; only the layout, webcam in picture and the Layout switches are saved, see [`StageSettings`]): each room and "Watched" keep
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
 //!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. **A person is a connection**
@@ -925,7 +925,7 @@ pub fn show_main(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
 /// The popped-out stages: one immediate viewport each, drawing the same stage ([`Host::Window`]). Closing the
 /// window brings the stage back; so does a room that is gone. A suspended room is not gone: its window is away for
 /// the outage and comes back with the room, like a stream's pop-out (D1).
-pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
+pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, modal_ui: &mut dyn FnMut(&egui::Context, &mut Cx)) {
     let views: Vec<StageView> = st.popped.iter().cloned().collect();
     for view in views {
         let title = match &view {
@@ -949,16 +949,38 @@ pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
             builder = builder.with_icon(icon);
         }
         let mut closed = false;
-        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("stage_window", &view)), builder, |ctx, _class| {
+        let vid = window_id(&view);
+        ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
             closed = ctx.input(|i| i.viewport().close_requested());
             drive_dump::in_window(true);
+            if crate::ui::took_input(ctx) {
+                cx.shell.input_vp.set(vid);
+            }
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::STAGE_BG)).show(ctx, |ui| show(ui, cx, st, Host::Window, &view));
+            // The modal opened from this window is drawn here, over it (row 182).
+            if cx.shell.modal_host.get() == Some(vid) {
+                modal_ui(ctx, cx);
+            }
             drive_dump::in_window(false);
         });
         if closed {
             st.popped.remove(&view);
         }
     }
+}
+
+/// The viewport id of a popped-out stage's window.
+fn window_id(view: &StageView) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("stage_window", view))
+}
+
+/// The windows [`show_windows`] declares this frame (a suspended or gone room has none).
+pub fn live_windows(cx: &Cx, st: &StageState) -> Vec<egui::ViewportId> {
+    st.popped
+        .iter()
+        .filter(|v| !matches!(v, StageView::Room(h) if cx.stage_room(*h).is_none()))
+        .map(window_id)
+        .collect()
 }
 
 /// The stage `view`, filling `ui`'s whole rect: the streams, then the people strip and the control bar (under
@@ -986,6 +1008,10 @@ fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageV
         let (f11, esc) = ctx.input(|i| (i.key_pressed(egui::Key::F11), i.key_pressed(egui::Key::Escape)));
         if f11 || (esc && fullscreen && cx.nav.popover.is_none()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
+        // The main window's Escape rule cannot see this window's key: an open menu closes here.
+        if esc && cx.nav.popover.is_some() {
+            cx.act(UiAction::ClosePopover);
         }
     }
     // Fullscreen: the chrome hides itself (`chrome.rs`); an open menu, modal, dropdown or drag holds it up.

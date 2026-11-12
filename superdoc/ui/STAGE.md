@@ -218,9 +218,18 @@ per-stream pop-outs:* a deferred closure is `Send + Sync + 'static` and cannot h
 inside our own frame, so there is no `Shared` round trip. **A reconnect** (2026-11-04, I5): while a room is suspended the window
 is away and the stage stays popped (`AppState::reconnects` holds the same `RoomHandle`); it opens again with the room. *Why:* D1,
 "a pop-out comes back after a reconnect or relay restart", the same as a stream's pop-out; only a room that is really gone (left,
-cancelled) brings the stage home. *Left out:* a modal opened from it (Rename, Stream settings…) appears in the main window and
-wants its input there (a click on it works; Escape in the popped window does not reach it). Per-stream pop-outs are unchanged
-(`popout.rs`, `popout_survives_resume`).
+cancelled) brings the stage home. **Modals and menus open in the window that opened them** (row 182, 2026-11-12):
+`ui::modal_host` picks the viewport that draws the open modal: a new modal goes to the viewport that last got a press, release or
+key (`Shell::input_vp`, set by `took_input` in `draw` and in the stage window's closure), if that is a live stage window, else the
+main window; it keeps its host until closed. `draw` draws it in the main ctx only when the host is the root; `show_windows` takes
+a `modal_ui` callback and draws it inside the window closure otherwise (scrim, focus and Escape / x / backdrop then belong to that
+window; the main window stays usable meanwhile). If the window closes (or the stage comes back) with the modal open, it moves to
+the main window next frame. Bar and tile menus (`Nav::popover`) were already drawn with the window's own ctx by `menus::show`; Escape
+in the window now closes one (`App::update` only sees the main window's keys). Tooltips are egui's, per viewport. *Left out:*
+toasts are still painted by the main window only. *Why:* user request 2026-11-12: "The End call button opens a modal. This modal
+isnt visible in the popped out view and instead shows on the main window itself. When something is pressed in the popped out
+section, the menus/modals and so on should also show in the popped out window." Rule test: `ui::tests::modal_host_follows_the_opening_window`.
+Per-stream pop-outs (`popout.rs`) have no modals; they are unchanged (`popout_survives_resume`).
 
 **Stage motion and draw order** (task I12, 2026-11-04; `stage/geom.rs` `ease`, `Glide`, `stage/mod.rs` `draw_arena`, `stage/pip.rs`
 `PipGlide`; replica `.st-tile` / `.arena.nofx` / `.st-tile.dragging` / `.pip.snap`).

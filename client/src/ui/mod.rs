@@ -514,9 +514,32 @@ pub struct Toast {
     pub until: f64,
 }
 
+/// Which viewport draws the open modal (row 182): none while no modal is open; one that already has it keeps it
+/// while that is the main window or a still-open stage window (a closed window hands it back to the main window);
+/// a fresh modal goes to the viewport that last got input if that is a stage window, else the main window.
+pub fn modal_host(open: bool, current: Option<egui::ViewportId>, last_input: egui::ViewportId, windows: &[egui::ViewportId]) -> Option<egui::ViewportId> {
+    if !open {
+        return None;
+    }
+    match current {
+        Some(h) if h == egui::ViewportId::ROOT || windows.contains(&h) => Some(h),
+        _ if windows.contains(&last_input) => Some(last_input),
+        _ => Some(egui::ViewportId::ROOT),
+    }
+}
+
+/// This viewport got a press, release or key this frame.
+pub(crate) fn took_input(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })))
+}
+
 /// UI-level state that more than one screen reads, owned by the shell.
 #[derive(Default)]
 pub struct Shell {
+    /// Viewport that last got a press, release or key (`took_input`): where a modal opened next appears.
+    pub input_vp: std::cell::Cell<egui::ViewportId>,
+    /// Viewport drawing the open modal (`modal_host`); `None` while no modal is open.
+    pub modal_host: std::cell::Cell<Option<egui::ViewportId>>,
     /// The stage's layout choices (set by the Layout menu through `UiAction`s).
     pub stage: StageSettings,
     /// The "Choose your name" modal was already offered this run (Later /
@@ -1612,6 +1635,9 @@ impl App {
         let mut actions = Vec::new();
         let App { state, nav, shell, videos, sidebar, room, stream_settings, audio_settings, webcam_settings, modals, popout, .. } = self;
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
+        if took_input(ctx) {
+            cx.shell.input_vp.set(egui::ViewportId::ROOT);
+        }
         if let Some(fs) = cx.nav.fullscreen {
             if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {
                 // Only the stream: no sidebar, bands, modals or toasts.
@@ -1707,17 +1733,23 @@ impl App {
             });
         });
 
-        // Modals over the panels.
-        match cx.nav.modal.clone() {
-            Some(Modal::StreamSettings { capture, room }) => stream_settings::show(ctx, &mut cx, stream_settings, capture, room),
-            Some(Modal::AudioSettings { room }) => audio_settings::show(ctx, &mut cx, audio_settings, room),
-            Some(Modal::WebcamSettings { room }) => webcam_settings::show(ctx, &mut cx, webcam_settings, room),
-            Some(m) => modals::show(ctx, &mut cx, modals, &m),
+        // Modals over the panels, in the window that opened them (row 182).
+        let mut modal_ui = |ctx: &egui::Context, cx: &mut Cx| match cx.nav.modal.clone() {
+            Some(Modal::StreamSettings { capture, room }) => stream_settings::show(ctx, cx, stream_settings, capture, room),
+            Some(Modal::AudioSettings { room }) => audio_settings::show(ctx, cx, audio_settings, room),
+            Some(Modal::WebcamSettings { room }) => webcam_settings::show(ctx, cx, webcam_settings, room),
+            Some(m) => modals::show(ctx, cx, modals, &m),
             None => {}
+        };
+        let windows = stage::live_windows(&cx, &room.stage);
+        let host = modal_host(cx.nav.modal.is_some(), cx.shell.modal_host.get(), cx.shell.input_vp.get(), &windows);
+        cx.shell.modal_host.set(host);
+        if host == Some(egui::ViewportId::ROOT) {
+            modal_ui(ctx, &mut cx);
         }
         // Pop-out windows: re-declared every frame they should exist.
         popout::show(ctx, &mut cx, popout);
-        stage::show_windows(ctx, &mut cx, &mut room.stage);
+        stage::show_windows(ctx, &mut cx, &mut room.stage, &mut modal_ui);
 
         paint_toasts(ctx, &cx.shell.toasts);
         actions
