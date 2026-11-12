@@ -21,9 +21,10 @@ const check = (cond, what, extra = "") => {
 const near = (a, b, eps, what) => check(Math.abs(a - b) <= eps, what, `${(+a).toFixed(3)} vs ${(+b).toFixed(3)} (+-${eps})`);
 
 const site = await L.serveSite(0);
-const A = await L.openApp(site.url, { name: "Alice" });
+const A = await L.openApp(site.url, { name: "Alice", flags: ["--use-fake-device-for-media-stream"] });
+await A.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
 const B = await L.openApp(site.url, { name: "Bob" });
-const P = B.page;
+let P = B.page;
 const state = () => P.eval(`(() => {
   const ar = document.querySelector('.arena'); const t = ar.querySelector('.st-tile'); const v = t.querySelector('.vid');
   const tr = t.getBoundingClientRect(), vr = v.getBoundingClientRect();
@@ -151,6 +152,41 @@ try {
   s = await state();
   check(s.pan === null && Math.abs(s.px - 0.5) < 1e-6 && Math.abs(s.vid.x - s.tile.x + over / 2) < 1.5, "Reset sizes and positions recentres the picture", `px ${s.px}`);
   await P.screenshot(OUT + "croppan_2_reset.png");
+
+  // Row 187: the same on the sharer's OWN webcam tile (live preview), Crop with a cropping aspect
+  await A.page.eval(`import(new URL("js/ui/capture.js", location.href).href).then((m) => m.stopAll())`);
+  await A.page.waitFor(`!__sss.S.captures.some((c) => c.state === 'live')`, { timeout: 15000, what: "Alice stopped the screen" });
+  await A.page.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "Alice's webcam button" });
+  await A.page.click("#btn-webcam");
+  await A.page.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "Alice's webcam live" });
+  P = A.page;
+  await A.page.setViewport(700, 900);
+  await P.waitFor(`document.querySelector('.arena .st-tile.mine.cam .vid > video.live-preview:not([hidden])')`, { what: "own webcam live preview" });
+  await L.sleep(800);
+  await menuItem(/Crop/);
+  await L.sleep(400);
+  check((await P.eval(`document.querySelectorAll('.arena .st-tile').length`)) === 1, "Alice's stage has only her webcam tile");
+  s = await state();
+  const cam = await P.eval(`(() => { const v = document.querySelector('.arena .st-tile .vid > video.live-preview'); const r = v.getBoundingClientRect(); return { x: r.x, w: r.width, h: r.height, vw: v.videoWidth, vh: v.videoHeight, fit: getComputedStyle(v).objectFit }; })()`);
+  check(s.crop && s.vid.w > s.tile.w + 20, "own webcam: Crop crops the sides", `tile ${s.tile.w.toFixed(0)}x${s.tile.h.toFixed(0)}, picture ${s.vid.w.toFixed(0)}x${s.vid.h.toFixed(0)}, source ${cam.vw}x${cam.vh}`);
+  near(cam.w / cam.h, cam.vw / cam.vh, 0.02, "own webcam: the preview fills its picture box at the source aspect (cover)");
+  const overC = s.vid.w - s.tile.w;
+  const c0 = s.vid.x;
+  await drag(-40, 20);
+  s = await state();
+  near(s.vid.x - c0, -40, 1.5, "own webcam: Shift+drag moves the picture 1:1");
+  near(s.px, 0.5 + 40 / overC, 0.01, "own webcam: stored x position");
+  check(s.pan && s.pan.y === 0.5, "own webcam: y stays centred (no vertical overflow)");
+  await P.screenshot(OUT + "croppan_3_own_panned.png");
+  await sweep(-1);
+  s = await state();
+  check(s.px === 1 && Math.abs(s.vid.x + s.vid.w - (s.tile.x + s.tile.w)) < 1, "own webcam: clamped, the picture covers the cell", `px ${s.px}`);
+  await sweep(1);
+  s = await state();
+  check(s.px === 0 && Math.abs(s.vid.x - s.tile.x) < 1, "own webcam: clamped at the other side");
+  await menuItem(/Reset sizes/);
+  s = await state();
+  check(s.pan === null && Math.abs(s.px - 0.5) < 1e-6, "own webcam: Reset sizes and positions recentres", `px ${s.px}`);
 } catch (e) {
   failed++;
   console.log("FAIL", e.message);

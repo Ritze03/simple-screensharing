@@ -46,7 +46,9 @@ picture always covers the cell; an axis with overflow < 1 px stays centred, so a
 places the picture with `left/top: p*100%` + `translate(-p*100%)` (CSS only inside Crop; Split and Floating ignore the stored offset and show it again when Crop returns); percentages mean a resize keeps the
 framing and stays clamped. `tilePointerDown` starts a `drag.kind = "pan"` (pointer capture on the tile) only when Shift is down, the layout is Crop and the tile is a live picture; buttons and the webcam in
 picture return earlier, so PIP keeps priority under the pointer, and Shift-drag starts no tile reorder. A plain drag, click and double-click (fullscreen) are unchanged. "Reset sizes and positions" clears
-`pan` too. Fullscreen: the stage's fullscreen is the same tiles, so pan works there; a tile's own fullscreen / pop-out shows the whole picture (`object-fit: contain`), nothing to pan. The Crop menu's
+`pan` too. **Own tiles (row 187, 2026-11-12):** your own webcam (and own screen) tile pans the same way: its `.vid` is a normal Crop picture box (`--ar` from the capture's `getSettings()`) and the
+`video.live-preview` inside fills it, so the same gate, clamp, item-id key and Reset apply; no extra code was needed, `dev/e2e/crop-pan.mjs` now proves it on the own webcam (1:1, clamp, Reset). The
+placeholder (no live preview) is not a picture and has nothing visible to pan. *Why (user request 2026-11-12):* "I should be able to do the crop move on my own camera aswell." Fullscreen: the stage's fullscreen is the same tiles, so pan works there; a tile's own fullscreen / pop-out shows the whole picture (`object-fit: contain`), nothing to pan. The Crop menu's
 sub-line says "Shift+drag to pan". *Why (user request 2026-11-11, parity with native row 177):* "For the cropping option, it would be really nice, if i could hold Shift+LeftMouseButton, to move around the
 image in the cropped area (Essentially an offset)." Tests: `dev/tests.js` `panPos`, `dev/e2e/crop-pan.mjs` (real Shift+drag over CDP: 1:1, clamp, y axis fixed, plain drag, resize, Split, Reset).
 
