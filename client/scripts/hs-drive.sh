@@ -39,6 +39,7 @@
 #   modal                     print the sharer's modal dump
 #   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect (DX<0: from the right
 #                             edge, `L60`: 60 pt from the left edge)
+#   pickup [N]                click the green pick-up button of client N (default VIEWER); needs HS_AUTO_PICKUP=0 at `up`
 #   watch [T]                 viewer (VIEWER=N, default 2): click "Watch stream" on stage tile T (default 0)
 #   hover [T]                 viewer: switch the Layout menu's "Show stats" on (every stream) and hover tile T and park the pointer on its
 #                             name tag (tooltip shows "Decoded X fps / shown Y fps")
@@ -284,6 +285,7 @@ case "$STEP" in
     ;;
   modal) cat "$UI_DUMP" ;;
   mclick) modal_open; mclick "$@" ;;
+  pickup) uclick "${1:-$VIEWER}" ctl.pickup ;;
   watch) uclick "$VIEWER" "watch.${1:-0}" L40 ;;
   hover)
     t="${1:-0}"

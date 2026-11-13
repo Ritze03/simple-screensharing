@@ -264,10 +264,12 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
     let name = cx.member_name(key.0, key.1);
     let label = share_label(&info.label);
     let listening = audio_only && cx.is_watching(key);
-    let btns_h = theme::CTL_H;
+    // Not in the call: look only, no Watch / Listen / Pop out (`AppState::in_call`).
+    let in_call = cx.state.in_call(key.0);
+    let btns_h = if in_call { theme::CTL_H } else { 0.0 };
     // Short tiles keep only the button, like the replica's container query.
     let full = rect.height() >= 200.0;
-    let block_h = if full { 52.0 + theme::S2 + 18.0 + 4.0 + 16.0 + theme::S3 + btns_h } else { btns_h };
+    let block_h = if full { 52.0 + theme::S2 + 18.0 + 4.0 + 16.0 + if in_call { theme::S3 } else { 0.0 } + btns_h } else { btns_h };
     let top = rect.center().y - block_h / 2.0;
     let mut y = top;
     if full {
@@ -291,6 +293,10 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
         };
         paint_text(ui, line(y, 16.0), &specs, font(Weight::Mono, theme::FS_SMALL), theme::TEXT_DIM, Align::Center);
         y += 16.0 + theme::S3;
+    }
+    if !in_call {
+        // No overflow menu either: its only items are Watch and Pop out.
+        return;
     }
     let (watch, pop, listen, unlisten) =
         (tr("ui.stage.watch_stream", "Watch stream"), tr("ui.room.pop_out", "Pop out"), tr("ui.room.listen", "Listen"), tr("ui.room.stop_listening", "Stop listening"));

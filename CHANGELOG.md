@@ -7,6 +7,15 @@ All notable user-facing changes, newest first. Categories:
 **Removed** (things taken out),
 **Info** (notes worth knowing).
 
+## 2026-11-13
+
+### Added
+
+- **Pick up**: connecting to a room (by hand or at start-up) no longer puts you in the call. You
+  see who is there and who is sharing, and press the green button to join in and watch.
+- **Leave call**: the red button now only leaves the call and keeps you connected to the room;
+  disconnecting is the red button when you are not in the call, or "Disconnect" in the Room menu.
+
 ## 2026-11-12
 
 ### Added

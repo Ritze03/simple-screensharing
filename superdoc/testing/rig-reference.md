@@ -117,3 +117,14 @@ parallel. The user also stopped audio tests (below).
 - **2026-10-14 (user request): everything moved into a private headless sway rig.** The user, back at their desk, asked to keep testing in headless sway and to stop audio tests. The real-desktop rules (a forbidden-output table, the desktop compositor's own tools, a GUI lock, `ydotool` driving, the real portal picker, a music player as test audio source, headed Chromium on real outputs) were dropped from the rule page; the scripts that need them are kept as legacy in `client/scripts/` with a banner. Details of the user's real desktop: `.claude/local/test-machine.md` in the main checkout.
 - **Until 2026-10-14** the rule mandated a real Electron shell plus the built `src-tauri` sidecar, driven with Playwright's `_electron` driver. All of that described the deleted Electron/HTML frontend; the app is now a single egui binary.
 - Full old text of every version: `git log -- superdoc/claude-instructions/testing-and-verification.md`.
+
+## Auto pick-up (row 192)
+
+A client connects "not in the call" (`ui/STAGE.md`): no Watch buttons, no Share button, nothing decoded until the green button.
+The rig's clients start with `SSS_UI_AUTO_PICKUP=1` (set by `hs-lib.sh`, default on) and pick each room up as soon as it is
+joined, so `shareauto`, `watch` and every older flow work unchanged. To test the not-in-call states,
+set `HS_AUTO_PICKUP=0` for `hs-rig.sh up`, then `hs-drive.sh pickup N` (client 1, the sharer, must
+be picked up before `shareauto`). Rects: `ctl.pickup` (green), `ctl.leave` (red: Leave call in the call, Disconnect outside it; the
+hang-up confirm modal has no dumped rects, click it by window coordinates). With auto-watch on, picking up the viewer starts
+every running video stream by itself, so a `watch.N` rect then never appears. *Why a hook:* the rig's scripts predate the
+call and click Share and Watch at once; the pick-up tests switch the hook off.

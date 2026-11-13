@@ -45,6 +45,9 @@ call, not in side panels.
   "Connecting"); `Reconnecting` is only a suspended room (TERMINOLOGY) that the lib is
   retrying (`AppState::reconnect_info`). Both show the panels and a "stop connecting" Leave.
   *Why:* the first Connect of a saved room used to read "Reconnecting" (stage-6 QC).
+  **In the call / not in the call** (row 192) is not a `ConnState`: a `Joined` room reads `AppState::in_call`
+  (header pill "In the call" vs "Connected"). Every connect starts not in the call; the red bar button hangs up
+  in the call (`HangUp`, room stays) and disconnects outside it (`Leave`). `STAGE.md`.
   A failed Connect (`start_connect` error) raises an error toast and the room's Disconnected
   view shows an inline warning banner above the empty state, text
   `ui.room.connect_failed` ("Couldn't connect: <error>"), cleared on the next Connect.
@@ -141,7 +144,9 @@ These were decided in the earlier UIs and are still the rules.
   pop-out.** Starts and stops are explicit actions (`Watch`, `StageShare`, `GoLive`,
   `Unwatch`, ...); `VideoViews` is synced by the shell every frame regardless of `Nav.view`,
   so an off-screen room's streams keep decoding.
-- **Leaving raises a confirm iff the room has an outgoing share or a live watch**
+- **Hanging up** (`Modal::HangUpConfirm`) follows the same rule as leaving: a confirm iff something is shared or watched,
+  and the room stays connected afterwards.
+- **Leaving (disconnecting) raises a confirm iff the room has an outgoing share or a live watch**
   (`Modal::LeaveConfirm`); otherwise it leaves immediately. *Why:* nothing to lose means a
   confirm is only a speed bump on the commonest case, but leaving a room you stream to is
   "killing an outgoing broadcast, not navigating", and a popped-out window vanishing

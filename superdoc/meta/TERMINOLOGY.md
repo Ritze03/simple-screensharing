@@ -37,6 +37,9 @@ appending. This file stays in context for the whole session.
 - **Gamescope capture** (row 142) — sharing a gamescope session's PipeWire `Video/Source` node directly, with no portal or picker. `features/stream/capture-sources.md`.
 - **Wanted stream** — a watch carried over a reconnect, identified by owner name + kind + label, never by `ConnId`/`StreamId`. `session::WantedStream`, `architecture/client-reconnect-and-watches.md`.
 
+- **In the call / not in the call** — a connected room is "not in the call" until you pick up: you see people and previews, watch nothing, share nothing. `AppState::in_call`; `ui/STAGE.md`.
+- **Pick up** — the green bar button that puts a connected room into the call (and, with auto-watch, watches what runs). `ui/STAGE.md`.
+- **Hang up vs Disconnect** — red button in the call = hang up (room stays connected); outside it = Disconnect (room closes). Room menu has both. `ui/STAGE.md`.
 - **Join link** — `server|room-id|key[|certhash[|name]]`: everything a client needs to enter a room; the optional name is a percent-encoded suggestion. `architecture/protocol-spec.md` §11.4.
 - **Cert hash** (`certhash`) — SHA-256 of the relay's leaf TLS certificate, base64url; what a browser pins via WebTransport `serverCertificateHashes`. `architecture/protocol-spec.md` §11.3.
 - **vbox / hbox / slot / fill** — the egui layout model: vertical container, `HBox` row, fixed-width cell, and the cell taking the remaining width (browser: `V`/`H`/`SL`/`FILL`). `ui/STYLING-GUIDE.md`.

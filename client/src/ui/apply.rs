@@ -19,7 +19,8 @@ impl App {
     /// the "Screen or gamescope" question. Why a look-up per click and no cached list: a cached "no gamescope" would
     /// hide a game started a minute ago, and `pw-dump` takes ~30 ms off the UI thread.
     fn stage_share(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool) {
-        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) || self.shell.gamescope_probe.is_some() {
+        // Sharing into a room you have not picked up is not offered (D3); a stray action stops here too.
+        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) || !self.state.in_call(room) || self.shell.gamescope_probe.is_some() {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -37,7 +38,7 @@ impl App {
 
     /// Stage the capture: the portal's picker, or the gamescope node `node` (no picker).
     pub(super) fn stage_share_now(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool, node: Option<simple_screensharing_client::capture::gamescope::Node>) {
-        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) {
+        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) || !self.state.in_call(room) {
             return;
         }
         let capture = match node {
@@ -50,6 +51,8 @@ impl App {
 
     pub(super) fn apply(&mut self, ctx: &egui::Context, action: UiAction) {
         match action {
+            // Not in the call: no sharing into the room (D3); the UI offers none, this drops a stray action.
+            UiAction::ShareAudio { room, .. } | UiAction::StartWebcam(room) | UiAction::AddDestination { room, .. } if !self.state.in_call(room) => {}
             UiAction::LivePreviewSeen(id) => {
                 self.shell.live_previews.entry(id).or_default().seen = ctx.input(|i| i.time);
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -135,6 +138,22 @@ impl App {
                     self.nav.popover = None;
                 }
             }
+            UiAction::PickUp(handle) => {
+                self.pick_up_room(handle);
+                self.videos.sync(&self.state);
+            }
+            UiAction::HangUp(handle) => {
+                if !self.state.request_hang_up(handle) {
+                    self.nav.modal = Some(Modal::HangUpConfirm { room: handle });
+                    self.nav.popover = None;
+                }
+            }
+            UiAction::HangUpConfirmed(handle) => {
+                self.state.hang_up(handle);
+                if self.nav.modal == Some(Modal::HangUpConfirm { room: handle }) {
+                    self.nav.modal = None;
+                }
+            }
             UiAction::LeaveConfirmed(handle) => {
                 self.state.disconnect_room(handle);
                 if self.nav.modal == Some(Modal::LeaveConfirm { room: handle }) {
@@ -199,7 +218,9 @@ impl App {
 
             // --- watching ------------------------------------------------
             UiAction::Watch((room, owner, stream)) => {
-                if let Some(r) = self.state.rooms.get_mut(&room)
+                // Not in the call: look only (the UI offers no Watch then; this keeps a stray action out too).
+                if self.state.in_call(room)
+                    && let Some(r) = self.state.rooms.get_mut(&room)
                     && !r.watches.lock().unwrap().contains_key(&(owner, stream))
                 {
                     r.toggle_watch(owner, stream);
@@ -250,7 +271,9 @@ impl App {
                 }
             }
             UiAction::ToggleListen((room, owner, stream)) => {
-                if let Some(r) = self.state.rooms.get_mut(&room) {
+                if self.state.in_call(room)
+                    && let Some(r) = self.state.rooms.get_mut(&room)
+                {
                     r.toggle_listen(owner, stream);
                 }
             }

@@ -190,7 +190,7 @@ fn invite_menu(ui: &mut Ui, h: simple_screensharing_client::session::RoomHandle,
     }
 }
 
-/// The Room settings menu: a header, Auto-connect, Rename, Copy invite link, Leave, Forget.
+/// The Room settings menu: a header, Auto-connect, Rename, Copy invite link, Pick up / Leave call, Disconnect, Forget.
 fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAction>, close: &mut bool) {
     let joined = r.handle.filter(|_| r.conn == ConnState::Joined);
     let people = joined.and_then(|h| cx.session(h)).map_or(0, |s| s.members.len());
@@ -231,7 +231,19 @@ fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAct
         out.push(UiAction::CopyDirectLink(h));
         *close = true;
     }
-    let leave = tr("ui.bar.leave_room_item", "Leave room");
+    // The call: Pick up when connected only, Leave call once in it (the red / green buttons of the bar).
+    if let Some(h) = joined {
+        let (icon, label, action) = if cx.state.in_call(h) {
+            ("call_end", tr("ui.bar.hang_up_item", "Leave call"), UiAction::HangUp(h))
+        } else {
+            ("call", tr("ui.bar.pick_up_item", "Pick up"), UiAction::PickUp(h))
+        };
+        if widgets::pop_item(ui, &PopItem::new(icon, &label)).clicked() {
+            out.push(action);
+            *close = true;
+        }
+    }
+    let leave = tr("ui.bar.disconnect_item", "Disconnect");
     if widgets::pop_item(ui, &PopItem::new("logout", &leave).enabled(r.conn != ConnState::Disconnected)).clicked() {
         match (r.conn, r.handle) {
             (ConnState::Joined, Some(h)) => out.push(UiAction::Leave(h)),

@@ -427,7 +427,7 @@ pub(super) fn sync_level_taps(cx: &mut Cx, taps: &mut Option<Vec<u32>>, open: bo
     }
 }
 
-/// The other joined rooms a capture could go to, for the Also send to / Move
+/// The other joined rooms (in the call: no sharing into one you have not picked up) a capture could go to, for the Also send to / Move
 /// to lists (shared with the stream-settings modal's two popovers).
 pub(super) struct RoomTargets {
     capture: CaptureSourceId,
@@ -441,6 +441,11 @@ pub(super) struct RoomTargets {
     already: String,
 }
 
+/// A room a share may go to: connected and picked up. Why: a room you are not "in the call" of is look-only.
+pub(super) fn is_target(conn: ConnState, in_call: bool) -> bool {
+    conn == ConnState::Joined && in_call
+}
+
 impl RoomTargets {
     pub(super) fn of(cx: &Cx, capture: CaptureSourceId, room: RoomHandle) -> Self {
         let c = cx.capture(capture);
@@ -448,8 +453,7 @@ impl RoomTargets {
         let rooms = cx
             .rooms()
             .into_iter()
-            .filter(|e| e.conn == ConnState::Joined)
-            .filter_map(|e| e.handle.map(|h| (h, e.name)))
+            .filter_map(|e| e.handle.filter(|h| is_target(e.conn, cx.state.in_call(*h))).map(|h| (h, e.name)))
             .filter(|(h, _)| *h != room)
             .map(|(h, name)| {
                 let n = cx.session(h).map(|s| s.members.len()).unwrap_or(0);
@@ -705,5 +709,12 @@ mod tests {
         assert_eq!(level_lit(0.25), 2);
         assert_eq!(level_lit(0.7), 4);
         assert_eq!(level_lit(1.0), 5);
+    }
+
+    #[test]
+    fn only_rooms_in_the_call_are_share_targets() {
+        assert!(is_target(ConnState::Joined, true));
+        assert!(!is_target(ConnState::Joined, false), "connected but not picked up: no sharing into it");
+        assert!(!is_target(ConnState::Reconnecting, true) && !is_target(ConnState::Disconnected, true));
     }
 }

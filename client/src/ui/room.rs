@@ -62,6 +62,8 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
 
     let joined = r.handle.filter(|_| r.conn == ConnState::Joined);
     let pill_l = match r.conn {
+        // Connected but not picked up yet: "Connected"; in the call: "In the call" (`AppState::in_call`).
+        ConnState::Joined if joined.is_some_and(|h| cx.state.in_call(h)) => tr("ui.room.in_call", "In the call"),
         ConnState::Joined => tr("ui.room.connected", "Connected"),
         ConnState::Connecting => tr("ui.room.connecting_pill", "Connecting"),
         ConnState::Reconnecting => tr("ui.room.reconnecting_pill", "Reconnecting"),

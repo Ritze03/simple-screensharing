@@ -35,7 +35,10 @@
 `false`), `AppState::set_room_auto_connect`, and `AppState::auto_connect_queue` drained one room at a
 time by `poll_auto_connect_queue`. *Why a queue:* `pending_connect` is a single slot, so firing
 several `start_connect`s at startup would orphan every one but the last. Nothing else makes a
-saved room rejoin itself at launch. (A first misreading wired this checkbox to "auto-start audio
+saved room rejoin itself at launch. **Auto-connect only connects** (row 192, user: "All connects, both auto an manual"): every connect, auto or
+manual, leaves you **not in the call** (see you who is there, watch nothing) until the green Pick up button;
+a room that reconnects after a drop keeps its state. `ui/APP-SHELL.md`, `ui/STAGE.md`.
+(A first misreading wired this checkbox to "auto-start audio
 sharing"; the owner's correction: it means "connect to the room on startup".)
 
 ---

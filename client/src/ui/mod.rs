@@ -176,6 +176,9 @@ pub enum Modal {
     /// "Leave X?" — raised by [`UiAction::Leave`] when the room has active
     /// shares or watches; confirm with [`UiAction::LeaveConfirmed`].
     LeaveConfirm { room: RoomHandle },
+    /// "Leave the call in X?" — raised by [`UiAction::HangUp`] when the room has active shares or watches; confirm
+    /// with [`UiAction::HangUpConfirmed`]. The room stays connected.
+    HangUpConfirm { room: RoomHandle },
     /// "What do you want to share?": raised by the Share button or menu entry when a gamescope node or OBS virtual
     /// camera exists (`capture::gamescope`, rows 142, 173). Screen or one of the `nodes` push [`UiAction::SharePicked`].
     /// `auto` as for [`UiAction::ShareNow`]. Rendered by `modals`.
@@ -313,11 +316,18 @@ pub enum UiAction {
     /// Mint a new room on `server` and save it as `room_name` (no connect);
     /// result in `Shell::create_result`. Join it with `JoinRoom`.
     CreateRoom { server: String, room_name: String },
-    /// "Leave": leave now, or open [`Modal::LeaveConfirm`] if the room has
-    /// shares/watches.
+    /// "Disconnect" (the Room menu, the red button outside the call): disconnect now, or open
+    /// [`Modal::LeaveConfirm`] if the room has shares/watches. Named `Leave` from before the call existed.
     Leave(RoomHandle),
-    /// Leave without asking (the confirm modal's button). Closes the modal.
+    /// Disconnect without asking (the confirm modal's button). Closes the modal.
     LeaveConfirmed(RoomHandle),
+    /// The green pick-up button: into the call (`AppState::pick_up`), then watch what is running (`App::pick_up_room`).
+    PickUp(RoomHandle),
+    /// The red button in the call: out of the call, the room stays connected (`AppState::request_hang_up`), or open
+    /// [`Modal::HangUpConfirm`] if the room has shares/watches.
+    HangUp(RoomHandle),
+    /// Hang up without asking (the confirm modal's button). Closes the modal.
+    HangUpConfirmed(RoomHandle),
     /// Leave (if connected) and remove from the saved list. Closes the modal.
     Forget(RoomKey),
     Rename { room: RoomKey, name: String },
@@ -1380,6 +1390,11 @@ impl App {
         let on = self.shell.auto_watch;
         let mut starts = Vec::new();
         for (h, room) in self.state.rooms.iter() {
+            // Not in the call: nothing is watched and nothing is marked seen, so a stream that starts now is still
+            // news at pick-up (`App::pick_up_room` watches everything running anyway).
+            if !self.state.in_call(*h) {
+                continue;
+            }
             let seen = self.shell.auto_seen.entry(*h).or_default();
             for s in seen.take_new(room.client.conn_id(), &room.streams) {
                 if on {
@@ -1389,6 +1404,27 @@ impl App {
         }
         for (h, s) in starts {
             let Some(room) = self.state.rooms.get_mut(&h) else { continue };
+            if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
+                room.toggle_watch(s.owner, s.stream_id);
+            }
+        }
+    }
+
+    /// The pick-up (button or rig hook, [`drive_dump::auto_pickup`]): into the call, then, with "Automatically watch
+    /// new streams" on, watch every video stream already running in the room (screens and webcams; not ours, not
+    /// audio-only). Why: pick-up is the explicit consent that the old "the join list stays unwatched" rule lacked.
+    fn pick_up_room(&mut self, handle: RoomHandle) {
+        if self.state.in_call(handle) {
+            return;
+        }
+        self.state.pick_up(handle);
+        if !self.shell.auto_watch {
+            return;
+        }
+        let Some(room) = self.state.rooms.get_mut(&handle) else { return };
+        let me = room.client.conn_id();
+        let running: Vec<StreamInfo> = room.streams.iter().filter(|s| s.owner != me && s.kind == StreamKind::Video).cloned().collect();
+        for s in running {
             if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
                 room.toggle_watch(s.owner, s.stream_id);
             }
@@ -1472,7 +1508,7 @@ impl App {
         {
             self.nav.modal = None;
         }
-        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room } | Modal::SharePick { room, .. }) = &self.nav.modal
+        if let Some(Modal::LeaveConfirm { room } | Modal::HangUpConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room } | Modal::SharePick { room, .. }) = &self.nav.modal
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;
@@ -1545,6 +1581,9 @@ impl App {
         if awaited || self.nav.view == View::Welcome {
             self.nav.view = View::Room(js);
             self.state.active_room = Some(handle);
+        }
+        if drive_dump::auto_pickup() {
+            self.pick_up_room(handle);
         }
         let name = self.state.rooms.get(&handle).map(|r| room_label(&self.state.room_store, &r.join_string)).unwrap_or_default();
         self.toast(tr_with("ui.toast.connected", "Connected to %{room}", &[("room", &name.to_string())]), "check_circle");

@@ -43,6 +43,14 @@ pub fn fake_audio() -> bool {
     *F.get_or_init(|| std::env::var_os("SSS_UI_FAKE_AUDIO").is_some())
 }
 
+/// `SSS_UI_AUTO_PICKUP=1`: every room is picked up (`App::pick_up_room`, the green button's path) as soon as it is
+/// joined. A TEST AID of the rig only (`client/scripts/launch-lib.sh` sets it by default, `HS_AUTO_PICKUP=0` turns it
+/// off): a normal launch always connects "not in the call".
+pub fn auto_pickup() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("SSS_UI_AUTO_PICKUP").is_some_and(|v| v != "0"))
+}
+
 /// What follows belongs to the popped-out stage window (`pw.` names) or, with `false`, to the main one again.
 pub fn in_window(on: bool) {
     PREFIX.set(if on { "pw." } else { "" });

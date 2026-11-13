@@ -399,6 +399,7 @@ pub const ICONS: &[(&str, char)] = &[
     ("apps", '\u{e5c3}'),
     ("arrow_drop_down", '\u{e5c5}'),
     ("bolt", '\u{ea0b}'),
+    ("call", '\u{e0b0}'),
     ("call_end", '\u{e0b1}'),
     ("cast", '\u{e307}'),
     ("check", '\u{e5ca}'),

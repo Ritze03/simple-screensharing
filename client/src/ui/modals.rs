@@ -207,6 +207,13 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
                 UiAction::LeaveConfirmed(*room),
             );
         }
+        Modal::HangUpConfirm { room } => {
+            let name = cx.room_name(*room);
+            let title = tr_with("ui.modal.hang_up_title", "Leave the call in %{room}?", &[("room", &name)]);
+            let body = tr("ui.modal.hang_up_body", "The call ends for you. You stay connected to the room and can pick up again.");
+            let ok = tr("ui.modal.hang_up_ok", "Leave call");
+            confirm(ctx, cx, "hang_up_confirm", &title, &body, Some(*room), &ok, UiAction::HangUpConfirmed(*room));
+        }
         Modal::ForgetConfirm { room } => {
             let entry = cx.room(room);
             let name = entry.as_ref().map(|r| r.name.clone()).unwrap_or_default();

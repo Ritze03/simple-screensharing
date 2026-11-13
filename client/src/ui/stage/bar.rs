@@ -112,6 +112,9 @@ pub(super) struct Bar {
     pub fullscreen: bool,
     room: Option<RoomEntry>,
     joined: Option<RoomHandle>,
+    /// A joined room we have not picked up (`AppState::in_call`): the bar holds only Room settings, the green
+    /// pick-up button and the red Disconnect button.
+    idle: bool,
     share: Option<(RoomHandle, ShareState)>,
     layout: StageLayout,
     strip_on: bool,
@@ -125,11 +128,13 @@ impl Bar {
             StageView::Room(h) => cx.rooms().into_iter().find(|r| r.handle == Some(*h)),
             StageView::Watched => None,
         };
+        let joined = room.as_ref().and_then(|r| r.handle).filter(|_| room.as_ref().is_some_and(|r| r.conn == ConnState::Joined));
         Self {
             view: view.clone(),
             host,
             fullscreen,
-            joined: room.as_ref().and_then(|r| r.handle).filter(|_| room.as_ref().is_some_and(|r| r.conn == ConnState::Joined)),
+            idle: joined.is_some_and(|h| !cx.state.in_call(h)),
+            joined,
             room,
             share: share::share_target(cx, view),
             layout: cx.shell.stage.layout(view),
@@ -144,10 +149,11 @@ impl Bar {
     }
 
     fn mid_w(&self, leave_down: bool) -> f32 {
-        let g1 = if self.share.is_some() { group_w(&[SPLIT_W; 3]) } else { 0.0 };
-        let g2 = if self.room.is_some() { group_w(&[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W]) } else { group_w(&[SPLIT_W, LEVEL_W, PEOPLE_W]) };
+        let g1 = if self.share.is_some() && !self.idle { group_w(&[SPLIT_W; 3]) } else { 0.0 };
+        let g2 = if self.idle { group_w(&[SPLIT_W]) } else if self.room.is_some() { group_w(&[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W]) } else { group_w(&[SPLIT_W, LEVEL_W, PEOPLE_W]) };
         let leave = if self.room.is_some() && !leave_down { LEAVE_W } else { 0.0 };
-        let parts: Vec<f32> = [g1, g2, leave].into_iter().filter(|w| *w > 0.0).collect();
+        let pickup = if self.idle { LEAVE_W } else { 0.0 };
+        let parts: Vec<f32> = [g1, g2, pickup, leave].into_iter().filter(|w| *w > 0.0).collect();
         parts.iter().sum::<f32>() + BAR_GAP * parts.len().saturating_sub(1) as f32
     }
 
@@ -241,26 +247,28 @@ impl Bar {
         let mut x = mid.left();
         let y = mid.top();
         // Group 1: Share screen, Share audio, Webcam.
-        if let Some((room, state)) = self.share {
+        if let Some((room, state)) = self.share.filter(|_| !self.idle) {
             let r = Rect::from_min_size(pos2(x, y), vec2(group_w(&[SPLIT_W; 3]), GROUP_H));
             group_frame(ui, r);
             self.share_buttons(ui, cx, r, room, state);
             x = r.right() + BAR_GAP;
         }
         // Group 2: Layout, Room settings, People.
-        let parts: &[f32] = if self.room.is_some() { &[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W] } else { &[SPLIT_W, LEVEL_W, PEOPLE_W] };
+        let parts: &[f32] = if self.idle { &[SPLIT_W] } else if self.room.is_some() { &[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W] } else { &[SPLIT_W, LEVEL_W, PEOPLE_W] };
         let r = Rect::from_min_size(pos2(x, y), vec2(group_w(parts), GROUP_H));
         group_frame(ui, r);
         let mut bx = r.left() + GROUP_PAD;
         let by = r.top() + GROUP_PAD;
         let open = |cx: &Cx, m: BarMenu| cx.popover_of(&PopoverKind::Bar(m)).is_some();
         let layout_tip = tr_with("ui.bar.layout_tip", "Layout: %{layout}", &[("layout", &layout_name(self.layout))]);
-        let lr = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
-        let (main, caret) = split(ui, lr, &Split { name: "layout", icon: layout_icon(self.layout), tone: Tone::Off, enabled: true, tip: &layout_tip, caret_tip: &tr("ui.bar.layout_caret", "Choose a layout"), open: open(cx, BarMenu::Layout) });
-        if main || caret {
-            cx.toggle_popover(PopoverKind::Bar(BarMenu::Layout), lr);
+        if !self.idle {
+            let lr = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
+            let (main, caret) = split(ui, lr, &Split { name: "layout", icon: layout_icon(self.layout), tone: Tone::Off, enabled: true, tip: &layout_tip, caret_tip: &tr("ui.bar.layout_caret", "Choose a layout"), open: open(cx, BarMenu::Layout) });
+            if main || caret {
+                cx.toggle_popover(PopoverKind::Bar(BarMenu::Layout), lr);
+            }
+            bx += SPLIT_W + GROUP_GAP;
         }
-        bx += SPLIT_W + GROUP_GAP;
         if self.room.is_some() {
             let rr = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
             let tip = tr("ui.bar.room_settings", "Room settings");
@@ -269,6 +277,10 @@ impl Bar {
                 cx.toggle_popover(PopoverKind::Bar(BarMenu::Room), rr);
             }
             bx += SPLIT_W + GROUP_GAP;
+        }
+        if self.idle {
+            self.call_buttons(ui, cx, r, leave_at);
+            return;
         }
         // Level loudness is a global viewer setting (`AppState::level_loudness`), so it shows wherever the people
         // button does, in a room and in Watched.
@@ -289,16 +301,37 @@ impl Bar {
             // The strip is UI state of the stage, not shared (`StageState::strip_hidden`).
             st.strip_hidden = !st.strip_hidden;
         }
-        // Leave, as tall as a group.
-        if let Some(room) = &self.room {
-            let lr = leave_at.unwrap_or_else(|| Rect::from_min_size(pos2(r.right() + BAR_GAP, y), vec2(LEAVE_W, GROUP_H)));
-            let tip = tr_with("ui.bar.leave_room", "Leave %{room}", &[("room", &room.name)]);
-            if leave_btn(ui, lr, &tip, room.conn != ConnState::Disconnected) {
-                match (room.conn, room.handle) {
-                    (ConnState::Joined, Some(h)) => cx.act(UiAction::Leave(h)),
-                    (ConnState::Connecting | ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(room.key.clone())),
-                    _ => {}
-                }
+        self.call_buttons(ui, cx, r, leave_at);
+    }
+
+    /// The red button, as tall as a group: Leave call (hang up) in the call, Disconnect outside it; and, outside the
+    /// call, the green pick-up button left of it. `after` is the group before them, `leave_at` where Leave sits when
+    /// it moved to the second row.
+    fn call_buttons(&self, ui: &mut Ui, cx: &mut Cx, after: Rect, leave_at: Option<Rect>) {
+        let Some(room) = &self.room else { return };
+        let mut x = after.right() + BAR_GAP;
+        let y = after.top();
+        if let (true, Some(h)) = (self.idle, self.joined) {
+            let tip = tr_with("ui.bar.pick_up", "Pick up: join the call in %{room}", &[("room", &room.name)]);
+            if call_btn(ui, Rect::from_min_size(pos2(x, y), vec2(LEAVE_W, GROUP_H)), "pickup", "call", theme::SUCCESS, &tip, true) {
+                cx.act(UiAction::PickUp(h));
+            }
+            x += LEAVE_W + BAR_GAP;
+        }
+        let lr = leave_at.unwrap_or_else(|| Rect::from_min_size(pos2(x, y), vec2(LEAVE_W, GROUP_H)));
+        let (icon, tip) = if self.idle {
+            ("logout", tr_with("ui.bar.disconnect_room", "Disconnect from %{room}", &[("room", &room.name)]))
+        } else if room.conn == ConnState::Joined {
+            ("call_end", tr_with("ui.bar.hang_up", "Leave the call in %{room}", &[("room", &room.name)]))
+        } else {
+            ("call_end", tr_with("ui.bar.leave_room", "Leave %{room}", &[("room", &room.name)]))
+        };
+        if call_btn(ui, lr, "leave", icon, theme::DANGER, &tip, room.conn != ConnState::Disconnected) {
+            match (room.conn, room.handle) {
+                (ConnState::Joined, Some(h)) if self.idle => cx.act(UiAction::Leave(h)),
+                (ConnState::Joined, Some(h)) => cx.act(UiAction::HangUp(h)),
+                (ConnState::Connecting | ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(room.key.clone())),
+                _ => {}
             }
         }
     }
@@ -518,14 +551,15 @@ fn group_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, on: bool, tip: &str)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip.to_owned()).clicked()
 }
 
-/// Leave: a red 64 x 50 button (a group's height), `call_end`.
-fn leave_btn(ui: &mut Ui, rect: Rect, tip: &str, enabled: bool) -> bool {
-    drive_dump::rect(|| "ctl.leave".into(), rect);
-    let resp = ui.interact(rect, Id::new("bar_leave"), if enabled { Sense::click() } else { Sense::hover() });
-    let fill = if resp.hovered() && enabled { widgets::lerp_color(theme::DANGER, Color32::WHITE, 0.12) } else { theme::DANGER };
+/// The red Leave call / Disconnect button (`ctl.leave`, `base` = `DANGER`) and its green twin, pick up (`ctl.pickup`,
+/// `SUCCESS`): a 64 x 50 button (a group's height) with an icon.
+fn call_btn(ui: &mut Ui, rect: Rect, name: &str, icon: &str, base: Color32, tip: &str, enabled: bool) -> bool {
+    drive_dump::rect(|| format!("ctl.{name}"), rect);
+    let resp = ui.interact(rect, Id::new(("bar_call", name)), if enabled { Sense::click() } else { Sense::hover() });
+    let fill = if resp.hovered() && enabled { widgets::lerp_color(base, Color32::WHITE, 0.12) } else { base };
     let a = if enabled { 1.0 } else { DISABLED_OPACITY };
     ui.painter().rect_filled(rect, CornerRadius::same(12), fade(fill, a));
-    paint_icon(ui, rect, "call_end", 22.0, fade(theme::PRIMARY_TEXT, a));
+    paint_icon(ui, rect, icon, 22.0, fade(theme::PRIMARY_TEXT, a));
     let r = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     r.on_hover_text(tip.to_owned()).clicked() && enabled
 }

@@ -115,9 +115,13 @@ follows their video watch, `sync_audio_watches`). Now `App::auto_watch_new_strea
 `drain_events`) compares each joined room's roster with `AutoWatchSeen` and calls `RoomSession::toggle_watch` for each
 stream that is new: **video streams only** (screen or webcam); audio-only streams are never auto-listened (same as the
 browser, `features/website/auto-watch.md`; a sender's audio still rides along with the video watch). Rules:
-- **Streams already running when you join are listed, not watched, except webcams** (row 181): on the room's very first
-  pass (`AutoWatchSeen.me` unset) the foreign webcams of the join list are watched, screen shares only recorded. Your own
-  streams are never watched; a stream already watched is left alone (`toggle_watch` would otherwise stop it).
+- **Nothing is watched while you are not in the call** (row 192): `auto_watch_new_streams` skips the room (and marks nothing
+  seen). **Picking up** with the option on watches **every video stream already running** (screens and webcams, never
+  your own, never audio-only; `App::pick_up_room`); off, they are listed with Watch buttons. This replaces the earlier
+  rule "join list: webcams watched, screens only listed" (row 181). *Why (user, D7):* "press on this new button to actually
+  watch all of the screen shares if it is automatic for him"; the old rule was a judgement call against surprise decoding, and
+  pick-up is now the explicit consent. Your own streams are never watched; a stream already watched is left alone
+  (`toggle_watch` would otherwise stop it).
 - The roster is recorded **also while the option is off**, so switching it on does not pull in what was already there.
 - "Seen" is the roster of the last pass by `(owner, stream id)`: a stream that keeps running is never started twice, so a
   watch you stopped stays stopped; a stream that stops and starts again is new. A **reconnect** (own `ConnId` changes) is a

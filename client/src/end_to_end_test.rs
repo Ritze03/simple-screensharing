@@ -1824,6 +1824,7 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
         connect_with_retry(&join_string, "viewer").await.expect("client B failed to connect");
     let mut viewer = crate::session::AppState::default();
     let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    viewer.pick_up(room_handle); // in the call, so sibling audio and watches run
     let ctx = egui::Context::default();
 
     // --- Step 1: video-only share, and the viewer watches it. ---
@@ -2055,6 +2056,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         connect_with_retry(&join_string, "viewer").await.expect("client B failed to connect");
     let mut viewer = crate::session::AppState::default();
     let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    viewer.pick_up(room_handle); // in the call, so sibling audio and watches run
     let ctx = egui::Context::default();
 
     // --- Step 1: sharer starts video, viewer watches it. ---
@@ -2297,6 +2299,7 @@ async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend
 
     let mut state = crate::session::AppState::default();
     let room_handle = state.insert_room(client, snapshot, events, join_string);
+    state.pick_up(room_handle); // in the call, so sibling audio and watches run
 
     let capture_id = state.alloc_capture_id();
     state.captures.insert(
@@ -2876,6 +2879,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
 
     let mut state = crate::session::AppState::default();
     let room_handle = state.insert_room(client, snapshot, events, join_string);
+    state.pick_up(room_handle); // in the call, so sibling audio and watches run
 
     let video_capture_id = state.alloc_capture_id();
     let destination_id = state.alloc_destination_id();
@@ -2977,6 +2981,7 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
 
     let mut state = crate::session::AppState::default();
     let room_handle = state.insert_room(client, snapshot, events, join_string);
+    state.pick_up(room_handle); // in the call, so sibling audio and watches run
 
     let make_destination = |state: &mut crate::session::AppState| -> (crate::session::DestinationId, crate::protocol::StreamId) {
         let destination_id = state.alloc_destination_id();
@@ -3415,6 +3420,7 @@ mod session_logic {
         // using it (not a hand-rolled `RoomSession`) tests the real wiring.
         state.framerate = TEST_FPS;
         let room = state.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+        state.pick_up(room); // in the call, so sibling audio and watches run
         state.active_room = Some(room);
         let decoder = crate::decode::StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         let frames = decoder.frames();
@@ -3670,6 +3676,7 @@ async fn live_audio_share_soak() {
     let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "viewer").await.expect("client B");
     let mut viewer = crate::session::AppState::default();
     let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    viewer.pick_up(room_handle); // in the call, so sibling audio and watches run
     let ctx = egui::Context::default();
 
     let split = |v: String| v.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect::<Vec<_>>();
@@ -3783,6 +3790,7 @@ async fn live_audio_only_share_through_the_app_state() {
     let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "viewer").await.expect("client B");
     let mut viewer = crate::session::AppState::default();
     let room_b = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    viewer.pick_up(room_b); // in the call, so sibling audio and watches run
     let ctx = egui::Context::default();
 
     // No screen capture exists anywhere: this is the whole point.
