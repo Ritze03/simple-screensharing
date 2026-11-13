@@ -125,6 +125,8 @@ The rig's clients start with `SSS_UI_AUTO_PICKUP=1` (set by `hs-lib.sh`, default
 joined, so `shareauto`, `watch` and every older flow work unchanged. To test the not-in-call states,
 set `HS_AUTO_PICKUP=0` for `hs-rig.sh up`, then `hs-drive.sh pickup N` (client 1, the sharer, must
 be picked up before `shareauto`). Rects: `ctl.pickup` (green), `ctl.leave` (red: Leave call in the call, Disconnect outside it; the
-hang-up confirm modal has no dumped rects, click it by window coordinates). With auto-watch on, picking up the viewer starts
+hang-up and leave confirm modals dump their footer buttons: `modal.trail.0` Cancel, `modal.trail.1` the red OK). The hook also fires when a
+room *reconnects* (`App::on_joined` runs again), so testing that a reconnect keeps not-in-the-call needs `HS_AUTO_PICKUP=0`; an empty
+`SSS_UI_AUTO_PICKUP` counts as off. With auto-watch on, picking up the viewer starts
 every running video stream by itself, so a `watch.N` rect then never appears. *Why a hook:* the rig's scripts predate the
 call and click Share and Watch at once; the pick-up tests switch the hook off.

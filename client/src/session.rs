@@ -1591,7 +1591,7 @@ pub struct ReconnectState {
     was_active_room: bool,
     /// The room's [`RoomSession::in_call`] when the connection dropped, put back on the new session:
     /// a reconnect is not a new connect, so it keeps the state the room had.
-    pub in_call: bool,
+    in_call: bool,
     /// Set by the legacy no-key `cancel_connect()`; the entry is dropped at the
     /// next poll unless `start_connect`/`reconnect_now` revives it first. See
     /// `AppState::cancel_connect`.

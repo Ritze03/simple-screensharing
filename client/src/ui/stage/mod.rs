@@ -710,7 +710,13 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         {
             acts.push(UiAction::EnterStreamFullscreen(*key));
         }
+        // A room that is not in the call is look-only (D3): its tiles have no menu (Watch / Pop out / Listen).
+        let in_call = match &it.kind {
+            Kind::Video(key) | Kind::Idle(key, _) | Kind::Audio(key, _) => cxr.state.in_call(key.0),
+            Kind::Mine(..) => true,
+        };
         if resp.secondary_clicked()
+            && in_call
             && let Some(p) = resp.interact_pointer_pos()
         {
             acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(it.id.clone()), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
@@ -1052,7 +1058,9 @@ fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageV
     let bar = bar::Bar::new(cx, st, view, host, fullscreen);
     let arr = bar.arrange(ui, full.width());
     let people = strip::people(cx, view, &items);
-    let strip_h = if st.strip_hidden || people.is_empty() { 0.0 } else { theme::STRIP_H };
+    // Not in the call, the strip is always shown (D3, F4): the People button is hidden then, so a hidden strip
+    // could not be brought back; the saved `strip_hidden` is left alone.
+    let strip_h = if (st.strip_hidden && !bar.idle) || people.is_empty() { 0.0 } else { theme::STRIP_H };
     let bar_h = arr.height();
     let arena = if fullscreen {
         full.shrink(theme::S2)

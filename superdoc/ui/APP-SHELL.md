@@ -67,8 +67,9 @@ call, not in side panels.
   *Why:* the user's request, 2026-11-04.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
-- **Leave sits in the control bar** (red, as tall as the button groups; before I3 in the room header). *Why:* the
-  replica's call; it is a room-level action, so it is not in the Share group.
+- **The call buttons sit in the control bar** (as tall as the button groups; before I3 Leave was in the room header): a green
+  **Pick up** while the room is not in the call, and the red button, which is **Leave call** (hang up, room stays connected) in the
+  call and **Disconnect** outside it. *Why:* the replica's call; they are room-level actions, so not in the Share group. `STAGE.md`.
 - **Narrow windows (800 px minimum, a ~528 px stage when the sidebar shows).** *Why 800 (PR #4, 2026-11-03; 960
   before):* so the window half-tiles on a 1920 px screen. The control bar degrades in a fixed order (`stage::bar::arrange`,
   pure, tested): the **Copy invite link label** goes first, then the bar takes **two rows** (the middle part on top, the

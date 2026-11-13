@@ -114,7 +114,7 @@ pub(super) struct Bar {
     joined: Option<RoomHandle>,
     /// A joined room we have not picked up (`AppState::in_call`): the bar holds only Room settings, the green
     /// pick-up button and the red Disconnect button.
-    idle: bool,
+    pub(super) idle: bool,
     share: Option<(RoomHandle, ShareState)>,
     layout: StageLayout,
     strip_on: bool,

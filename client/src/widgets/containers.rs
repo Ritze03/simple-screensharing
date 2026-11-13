@@ -250,7 +250,9 @@ pub fn modal_footer(ui: &mut Ui, leading: &[Btn], note: Option<&str>, trailing: 
     let mut click = FooterClick::None;
     for (i, b) in leading.iter().enumerate() {
         let w = r.cell(i).width();
-        if r.show(ui, i, Align::Min, |ui| b.large().show_sized(ui, w)).clicked() {
+        let resp = r.show(ui, i, Align::Min, |ui| b.large().show_sized(ui, w));
+        crate::ui::drive_dump::rect(|| format!("modal.lead.{i}"), resp.rect);
+        if resp.clicked() {
             click = FooterClick::Leading(i);
         }
     }
@@ -264,7 +266,9 @@ pub fn modal_footer(ui: &mut Ui, leading: &[Btn], note: Option<&str>, trailing: 
     }
     for (i, b) in trailing.iter().enumerate() {
         let w = r.cell(k + i).width();
-        if r.show(ui, k + i, Align::Min, |ui| b.large().show_sized(ui, w)).clicked() {
+        let resp = r.show(ui, k + i, Align::Min, |ui| b.large().show_sized(ui, w));
+        crate::ui::drive_dump::rect(|| format!("modal.trail.{i}"), resp.rect);
+        if resp.clicked() {
             click = FooterClick::Trailing(i);
         }
     }

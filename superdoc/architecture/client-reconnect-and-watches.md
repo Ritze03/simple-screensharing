@@ -79,6 +79,12 @@ timeout) because nothing sent `Leave` or closed the QUIC connection. Both fixed 
   re-announces arrive, because a sharer that reconnected is indistinguishable from one that
   stopped and started again, and after a relay restart the owners rejoin at different moments.
   Selected watch and per-owner volume carry over; mute and pop-out do not.
+- **The call state is carried (2026-11-13).** `ReconnectState::in_call` records `RoomSession::in_call` when
+  the connection drops and `restore_after_reconnect` puts it back on the new session; while suspended,
+  `AppState::in_call` reads it from there. `Why:` (D2, user: every connect starts not in the call, a
+  reconnect is not a new connect) an in-the-call room stays in the call and an idle one stays idle.
+  Watches and shares are only resumed for an in-call room (`apply_rewatch` is gated on the flag), and a
+  hang-up clears `rewatch` so nothing is pulled back after a reconnect. `session-model.md` "In the call".
 - **Clean exit.** `disconnect_room` (user Leave, Forget) sends `Leave` and closes the connection
   (`ScreenshareClient::leave_and_close`, code `0x300`). `AppState::shutdown` /
   `shutdown_blocking(timeout)` do that for every room, close the endpoint with a bounded (500 ms)

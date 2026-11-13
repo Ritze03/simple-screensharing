@@ -105,6 +105,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `chrome`, `chrome_alpha`, `stage_full W H`, `popover`, `modal`, `stage_fs`, `stream_fs`, `open` | state: fullscreen chrome, open menu / modal, fullscreen, the stream settings modal |
 | `fps`, `fps_options`, `codec.I`, `preset.I`, `gop` (Keyframe select; value `gop`, `gop_options`), `quality.0\|1` (Encoding segments Performance\|Quality; value `quality`), `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |
 | `pip.N`, `pip.N.grip` (`pip.fs` in stream fullscreen), `pipinfo N spot=C,R w=.. handle=tl\|tr\|bl\|br who=..`, `menu.pip` | a webcam in picture (task I8): N is its parent's tile index (`pw.` prefix in a popped-out stage); `spot` is column,row 0..2 (`free` only while dragged); the handle is on the corner facing the middle |
+| `modal.lead.N`, `modal.trail.N` | the buttons of a modal's footer row (`widgets::modal_footer`), counted from 0 on each side: for the confirm dialogs (Leave room, Hang up) `modal.trail.0` is Cancel and `modal.trail.1` the red OK (`uclick 2 modal.trail.1`). |
 | `webcam.camera`, `webcam.mode`, `webcam.bitrate`, `webcam.footer` (`uclick N webcam.footer L60` = Start / Stop webcam), `webcam_codec.I`, `webcam_modes N`, `webcam_mode KEY`, `webcam camera=.. codec=.. kbps=..` | the webcam modal (`webcam_settings.rs`); the bar button is `ctl.webcam` / `ctl.webcam.arrow`, its menu rows `menu.<camera name>` and `menu.All_webcam_settings…` |
 
 | Script | Purpose |

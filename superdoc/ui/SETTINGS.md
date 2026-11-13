@@ -125,14 +125,14 @@ browser, `features/website/auto-watch.md`; a sender's audio still rides along wi
 - The roster is recorded **also while the option is off**, so switching it on does not pull in what was already there.
 - "Seen" is the roster of the last pass by `(owner, stream id)`: a stream that keeps running is never started twice, so a
   watch you stopped stays stopped; a stream that stops and starts again is new. A **reconnect** (own `ConnId` changes) is a
-  new baseline: re-announced streams (webcams too) are listed, not watched, so a webcam stopped by hand stays stopped. Reconnect restoration of what you watched (`Wanted stream`,
+  new baseline: re-announced streams are listed, not watched here, so a webcam stopped by hand stays stopped. Reconnect restoration of what you watched (`Wanted stream`,
   `RoomSession::apply_rewatch`) is separate and works whatever this says.
 - Off: new streams are listed until clicked, as before.
 
-**Why (row 181):** user request 2026-11-11: "When autoconnect is on and someone connects the room it should automatically connect to
-all of the cameras." Read as: with the option on, joining a room also watches the webcams already on there (a webcam is
-a small, person-sized picture; a running screen share stays a click). Webcam = `capture::webcam::is_webcam_label`.
-Tests: `auto_watch_seen_tests::{join_list_watches_only_foreign_webcams, a_reconnect_baseline_watches_nothing}`.
+**History (row 181):** user request 2026-11-11 ("When autoconnect is on and someone connects the room it should automatically
+connect to all of the cameras") made joining watch the webcams already there; since row 192 (D7) the pick-up watches every running
+video stream instead, and the first roster pass is a plain baseline (`AutoWatchSeen::take_new` returns nothing for it).
+Tests: `auto_watch_seen_tests::{baseline_returns_no_webcam_either, a_reconnect_baseline_watches_nothing}`.
 
 **Why:** user request 2026-11-11 ("automatically watch new streams ... on by default"). **Why in the UI layer:** the gate
 needs a setting and `session.rs` was held by another row; `toggle_watch` is the public entry the click uses, so a

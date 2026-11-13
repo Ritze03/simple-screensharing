@@ -614,6 +614,13 @@ pub struct Shell {
     auto_seen: HashMap<RoomHandle, AutoWatchSeen>,
 }
 
+/// Start watching `s` unless it already is (`toggle_watch` would stop it).
+fn watch_if_not_watched(room: &mut simple_screensharing_client::session::RoomSession, s: &StreamInfo) {
+    if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
+        room.toggle_watch(s.owner, s.stream_id);
+    }
+}
+
 /// What auto-watch has already seen in one room: the `(owner, stream id)` of every stream on the roster at the last
 /// pass, and the own `ConnId` they were seen under (a reconnect gives a new one and starts a new baseline).
 #[derive(Default)]
@@ -624,20 +631,18 @@ pub struct AutoWatchSeen {
 
 impl AutoWatchSeen {
     /// Return the video streams to watch now (not mine), then remember the roster. Streams that appeared since the
-    /// last call are returned. The first call for a room is the join list: only its webcams are returned (a screen
-    /// share already running is listed, not watched; row 181). The first call after a reconnect (`me` changed) is a
-    /// plain baseline: nothing, so a webcam stopped by hand stays stopped (the resume restores the rest). A stream
-    /// that stops leaves the set, so a restart is new; one that keeps running stays seen, so a watch the user stopped
-    /// is not started again. Audio-only streams are never returned.
+    /// last call are returned. The first call for a room and the first after a reconnect (`me` changed) are plain
+    /// baselines that return nothing: what is already running is watched by the pick-up (`App::pick_up_room`) or, after
+    /// a reconnect, by the resume. A stream that stops leaves the set, so a restart is new; one that keeps running
+    /// stays seen, so a watch the user stopped is not started again. Audio-only streams are never returned.
     pub fn take_new(&mut self, me: u64, streams: &[StreamInfo]) -> Vec<StreamInfo> {
-        let first = self.me.is_none();
         let baseline = self.me != Some(me);
         self.me = Some(me);
         let now: std::collections::HashSet<(u64, u8)> = streams.iter().map(|s| (s.owner, s.stream_id)).collect();
         let fresh = streams
             .iter()
             .filter(|s| s.owner != me && s.kind == StreamKind::Video)
-            .filter(|s| if baseline { first && simple_screensharing_client::capture::webcam::is_webcam_label(&s.label) } else { !self.ids.contains(&(s.owner, s.stream_id)) })
+            .filter(|s| !baseline && !self.ids.contains(&(s.owner, s.stream_id)))
             .cloned()
             .collect();
         self.ids = now;
@@ -657,7 +662,7 @@ mod auto_watch_seen_tests {
     fn baseline_own_audio_and_known_are_not_news() {
         let mut seen = AutoWatchSeen::default();
         let early = info(101, 1, StreamKind::Video);
-        assert!(seen.take_new(1, &[early.clone()]).is_empty(), "a screen already running at join: listed, not watched");
+        assert!(seen.take_new(1, &[early.clone()]).is_empty(), "the first pass is a baseline: what runs at join is the pick-up's job");
         let late = info(102, 1, StreamKind::Video);
         let mine = info(1, 2, StreamKind::Video);
         let audio = info(103, 3, StreamKind::Audio);
@@ -671,20 +676,17 @@ mod auto_watch_seen_tests {
     }
 
     #[test]
-    fn join_list_watches_only_foreign_webcams() {
+    fn baseline_returns_no_webcam_either() {
         let mut seen = AutoWatchSeen::default();
-        let screen = info(101, 1, StreamKind::Video);
         let theirs = cam(101, 2);
-        let mine = cam(1, 3);
-        assert_eq!(seen.take_new(1, &[screen.clone(), theirs.clone(), mine.clone()]), vec![theirs.clone()], "join list: their webcam only");
-        assert!(seen.take_new(1, &[screen, theirs, mine]).is_empty(), "then nothing again");
+        assert!(seen.take_new(1, &[info(101, 1, StreamKind::Video), theirs.clone(), cam(1, 3)]).is_empty(), "join list: nothing, webcams included");
+        assert_eq!(seen.take_new(1, &[theirs.clone(), cam(102, 1)]), vec![cam(102, 1)], "a later webcam is new");
     }
 
     #[test]
     fn a_reconnect_baseline_watches_nothing() {
         let mut seen = AutoWatchSeen::default();
-        let theirs = cam(101, 2);
-        assert_eq!(seen.take_new(1, &[theirs.clone()]).len(), 1);
+        assert!(seen.take_new(1, &[cam(101, 2)]).is_empty());
         assert!(seen.take_new(9, &[cam(201, 2)]).is_empty(), "after a reconnect a webcam stopped by hand is not pulled back");
         assert_eq!(seen.take_new(9, &[cam(201, 2), cam(202, 1)]), vec![cam(202, 1)], "a later webcam is new as ever");
     }
@@ -1403,9 +1405,8 @@ impl App {
             }
         }
         for (h, s) in starts {
-            let Some(room) = self.state.rooms.get_mut(&h) else { continue };
-            if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
-                room.toggle_watch(s.owner, s.stream_id);
+            if let Some(room) = self.state.rooms.get_mut(&h) {
+                watch_if_not_watched(room, &s);
             }
         }
     }
@@ -1425,9 +1426,7 @@ impl App {
         let me = room.client.conn_id();
         let running: Vec<StreamInfo> = room.streams.iter().filter(|s| s.owner != me && s.kind == StreamKind::Video).cloned().collect();
         for s in running {
-            if !room.watches.lock().unwrap().contains_key(&(s.owner, s.stream_id)) {
-                room.toggle_watch(s.owner, s.stream_id);
-            }
+            watch_if_not_watched(room, &s);
         }
     }
 
@@ -1621,13 +1620,18 @@ impl App {
         let mut orphaned = Vec::new();
         self.shell.staged.retain(|room, s| {
             let capture_ok = state.captures.get(&s.capture).is_some_and(|c| c.destinations.is_empty() && !matches!(c.status, ShareStatus::Stopping(_)));
-            let room_ok = state.rooms.contains_key(room) || state.reconnects.contains_key(room);
+            // Out of the call (hung up while the picker or the settings modal was open) counts like a vanished room:
+            // a staged share must not go live into a room the user left (D3/D4).
+            let room_ok = (state.rooms.contains_key(room) || state.reconnects.contains_key(room)) && state.in_call(*room);
             if capture_ok && !room_ok {
                 orphaned.push(s.capture);
             }
             capture_ok && room_ok
         });
         for capture in orphaned {
+            if matches!(self.nav.modal, Some(Modal::StreamSettings { capture: c, .. }) if c == capture) {
+                self.nav.modal = None;
+            }
             self.state.stop_share(capture);
         }
         let selected = match &self.nav.view {

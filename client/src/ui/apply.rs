@@ -52,7 +52,13 @@ impl App {
     pub(super) fn apply(&mut self, ctx: &egui::Context, action: UiAction) {
         match action {
             // Not in the call: no sharing into the room (D3); the UI offers none, this drops a stray action.
-            UiAction::ShareAudio { room, .. } | UiAction::StartWebcam(room) | UiAction::AddDestination { room, .. } if !self.state.in_call(room) => {}
+            UiAction::ShareAudio { room, .. }
+            | UiAction::StartWebcam(room)
+            | UiAction::AddDestination { room, .. }
+            | UiAction::GoLive { room, .. }
+            | UiAction::MoveDestination { room, .. }
+            | UiAction::MoveCaptureHere { room, .. }
+                if !self.state.in_call(room) => {}
             UiAction::LivePreviewSeen(id) => {
                 self.shell.live_previews.entry(id).or_default().seen = ctx.input(|i| i.time);
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));

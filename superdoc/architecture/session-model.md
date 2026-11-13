@@ -131,6 +131,33 @@ that calls `self.state.disconnect_room(handle)` and then clears `expanded_rooms`
 behavior before/after, verified line-by-line) before it was carried over to the real,
 larger split described in the `session.rs` module-map row above.
 
+### In the call / not in the call (row 192, 2026-11-13)
+
+`RoomSession::in_call` is `false` after every connect; `AppState::in_call(handle)` is the accessor (it
+also answers for a suspended room, from `ReconnectState::in_call`). The state is this client's own: the
+relay and the wire know no call concept.
+
+- `AppState::pick_up(handle)` sets the flag (and discards sounds collected meanwhile, so the pick-up is
+  silent). It does **not** start any watch; that is the UI's job (`ui/mod.rs` `App::pick_up_room`, which
+  also honours "Automatically watch new streams"). Starting a watch, a listen or a share is likewise left
+  to the UI, which offers none while the room is not in the call.
+- `AppState::hang_up(handle)` is destination-scoped like `disconnect_room` (same capture rule: dropped
+  only with its last destination) and stops every video and audio watch, but keeps the `RoomSession`:
+  no `Leave`, no roster change. It clears `rewatch` and `resume_after_stop`, so nothing is pulled back
+  later. `request_hang_up` follows the `request_leave_room` pattern: it returns a `bool` (done, or the
+  caller raises its own confirm dialog via `leave_needs_confirm`), because `session.rs` holds no UI-only
+  state.
+- Gated while `!in_call`: `sync_audio_watches`, `apply_rewatch` and the room's sounds
+  (`RoomSounds::drain_for(now, in_call)` returns nothing).
+- A staged capture (no destination yet) is nothing live, so hang-up does not touch it in `session.rs`;
+  `ui/mod.rs` `App::poll_staged` drops it and stops its capture when its room is no longer in the call.
+
+`Why:` (D1) a UI/session flag only, so the running relay and `protocol/` stay untouched and old and new
+clients mix freely. `Why:` (D4, user: "Dont disconnect the room, only switch to 'not in call'") the red
+button hangs up and keeps the connection, so people still see you and the roster. `Why:` (D2, user:
+every connect, automatic and manual, starts not in the call) a reconnect is not a new connect, so the
+flag is carried over it (`client-reconnect-and-watches.md`).
+
 ## Per-destination lifecycle (state machine, wire PTS, stall protocol)
 
 Lives in `capture.rs`'s **`destination`** submodule (state, pure logic — no GStreamer, no
