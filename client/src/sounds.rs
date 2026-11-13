@@ -182,6 +182,13 @@ impl RoomSounds {
         self.mine = mine;
     }
 
+    /// [`Self::drain`], but nothing comes out unless `audible`. Always drains, so what happened while
+    /// silent is gone and cannot sound later (picking up a call is not a burst of old news).
+    pub fn drain_for(&mut self, now: Instant, audible: bool) -> Vec<Sound> {
+        let played = self.drain(now);
+        if audible { played } else { Vec::new() }
+    }
+
     /// What to play for this pass: each sound at most once however many events asked for it (8 members joining
     /// in one frame are one sound), none while quiet.
     pub fn drain(&mut self, now: Instant) -> Vec<Sound> {
@@ -436,6 +443,24 @@ mod tests {
         assert_eq!(pass(&mut r, &[3], &[(3, vec![11])]), [Sound::Leave]);
         assert_eq!(pass(&mut r, &[3], &[(3, vec![])]), [Sound::Leave]);
         assert!(pass(&mut r, &[3], &[(3, vec![])]).is_empty());
+    }
+
+    /// Not in the call: the detector still runs, nothing sounds, and picking up is no burst of old news.
+    #[test]
+    fn nothing_sounds_while_not_in_the_call_and_pick_up_is_no_burst() {
+        let now = Instant::now();
+        let mut r = RoomSounds::default();
+        // Out of the call: a stream starts, someone watches mine, someone else's stream stops.
+        r.stream_started(false, false);
+        r.stream_stopped(false, true);
+        r.viewers(mine(&[3]), lists(&[(3, vec![10])]));
+        assert!(r.drain_for(now, false).is_empty());
+        // Pick up: what happened before is gone, and the viewer is already part of the baseline.
+        assert!(r.drain_for(now, true).is_empty(), "the discarded edges must not come back");
+        assert!(pass(&mut r, &[3], &[(3, vec![10])]).is_empty(), "a viewer from before pick-up is no join");
+        // After pick-up news sounds again.
+        r.stream_started(false, false);
+        assert_eq!(r.drain_for(now, true), [Sound::Start]);
     }
 
     #[test]

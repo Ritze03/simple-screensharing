@@ -987,6 +987,17 @@ pub struct RoomSession {
     /// same way as `rewatch`, but kept apart because the deadlines differ
     /// per entry and the two have different causes.
     pub resume_after_stop: Vec<(WantedStream, Instant)>,
+
+    /// Whether this client is "in the call" in this room. A purely local state: the wire and the relay
+    /// have no call concept (connected = in the roster; watching = a private per-stream Subscribe).
+    /// `false` for every freshly connected room (auto-connect and manual connect alike): the user sees
+    /// the people and who is sharing, but nothing is watched until [`AppState::pick_up`]. Set by
+    /// `pick_up`, cleared by [`AppState::hang_up`], carried over a reconnect in
+    /// [`ReconnectState::in_call`].
+    ///
+    /// `Why` a client-only flag: "the running relay stays untouched"; a call on the wire would need a
+    /// relay change for what is only a choice of this client to start watching.
+    pub in_call: bool,
 }
 
 impl RoomSession {
@@ -1045,7 +1056,8 @@ impl RoomSession {
     /// both are empty (the normal case), so `drain_events` calls it for every
     /// room every pass.
     pub fn apply_rewatch(&mut self, now: Instant) {
-        if self.rewatch.is_empty() && self.resume_after_stop.is_empty() {
+        // Not in the call: nothing starts watching by itself (hang-up clears both lists anyway).
+        if !self.in_call || (self.rewatch.is_empty() && self.resume_after_stop.is_empty()) {
             return;
         }
         if self.rewatch_deadline.is_some_and(|deadline| now >= deadline) {
@@ -1370,6 +1382,10 @@ impl RoomSession {
     /// Idempotent and allocation-light; returns immediately in the common
     /// case of nothing being watched at all.
     pub fn sync_audio_watches(&mut self) {
+        // Not in the call: no audio watch may start; hang-up has already torn every one down.
+        if !self.in_call {
+            return;
+        }
         if self.watches.lock().unwrap().is_empty() && self.audio_watches.lock().unwrap().is_empty() {
             return;
         }
@@ -1573,6 +1589,9 @@ pub struct ReconnectState {
     shares: Vec<SuspendedShare>,
     wanted: Vec<WantedStream>,
     was_active_room: bool,
+    /// The room's [`RoomSession::in_call`] when the connection dropped, put back on the new session:
+    /// a reconnect is not a new connect, so it keeps the state the room had.
+    pub in_call: bool,
     /// Set by the legacy no-key `cancel_connect()`; the entry is dropped at the
     /// next poll unless `start_connect`/`reconnect_now` revives it first. See
     /// `AppState::cancel_connect`.
@@ -4469,6 +4488,7 @@ impl AppState {
                 rewatch: Vec::new(),
                 rewatch_deadline: None,
                 resume_after_stop: Vec::new(),
+                in_call: false,
             },
         );
     }
@@ -4557,6 +4577,76 @@ impl AppState {
             false
         } else {
             self.disconnect_room(handle);
+            true
+        }
+    }
+
+    /// Whether this client is in the call in `handle`'s room ([`RoomSession::in_call`]). For a room
+    /// that is suspended (waiting to reconnect) it is the value the room had when the connection
+    /// dropped ([`ReconnectState::in_call`]), so the UI keeps showing the right state through an
+    /// outage; `false` for an unknown handle.
+    pub fn in_call(&self, handle: RoomHandle) -> bool {
+        match self.rooms.get(&handle) {
+            Some(room) => room.in_call,
+            None => self.reconnects.get(&handle).is_some_and(|r| r.in_call),
+        }
+    }
+
+    /// "Pick up": enter the call in a connected room. Only sets the flag; starting to watch what is
+    /// running is the UI's job. Anything the sound detector collected while out of the call is
+    /// discarded, so the pick-up itself is silent. No-op for an unknown or suspended room.
+    pub fn pick_up(&mut self, handle: RoomHandle) {
+        let Some(room) = self.rooms.get_mut(&handle) else { return };
+        if room.in_call {
+            return;
+        }
+        let _ = room.sounds.drain_for(Instant::now(), false);
+        room.in_call = true;
+    }
+
+    /// "Hang up": leave the call but stay connected. Stops every watch in the room (video and audio,
+    /// each with its unsubscribe, the same as the user stopping it), forgets pending re-watches, and
+    /// stops our own destinations into this room exactly as [`Self::disconnect_room`] does (a capture
+    /// is dropped only when this was its last destination). The `RoomSession` stays in `rooms`:
+    /// no `Leave` is sent, `active_room` is untouched, we stay in the roster.
+    ///
+    /// `Why` destination-scoped and session-keeping: user, "Dont disconnect the room, only switch to
+    /// 'not in call'"; one capture may feed other rooms that are still in their call.
+    pub fn hang_up(&mut self, handle: RoomHandle) {
+        let Some(room) = self.rooms.get_mut(&handle) else { return };
+        room.rewatch.clear();
+        room.rewatch_deadline = None;
+        room.resume_after_stop.clear();
+        // While `in_call` is still true, so `toggle_watch`'s audio sync tears the auto audio down.
+        let video: Vec<(ConnId, StreamId)> = room.watches.lock().unwrap().keys().copied().collect();
+        for (owner, stream_id) in video {
+            room.toggle_watch(owner, stream_id);
+        }
+        let audio: Vec<(ConnId, StreamId)> = room.audio_watches.lock().unwrap().keys().copied().collect();
+        for (owner, stream_id) in audio {
+            room.teardown_audio_watch(owner, stream_id);
+        }
+        room.in_call = false;
+        for destination_id in room.destinations.clone() {
+            let Some((capture_id, capture, _)) = find_destination(&self.captures, destination_id) else {
+                continue;
+            };
+            if capture.destinations.len() <= 1 {
+                self.drop_capture_fire_and_forget(capture_id);
+            } else {
+                self.stop_destination(destination_id);
+            }
+        }
+    }
+
+    /// The hang-up counterpart of [`Self::request_leave_room`]: hangs up now and returns `true` when
+    /// nothing is at stake, otherwise `false` ([`Self::leave_needs_confirm`]) and the caller raises its
+    /// confirm dialog, then calls [`Self::hang_up`].
+    pub fn request_hang_up(&mut self, handle: RoomHandle) -> bool {
+        if self.leave_needs_confirm(handle) {
+            false
+        } else {
+            self.hang_up(handle);
             true
         }
     }
@@ -4761,7 +4851,9 @@ impl AppState {
             let me = room.client.conn_id();
             let mine = room.streams.iter().filter(|s| s.owner == me).map(|s| s.stream_id).collect();
             room.sounds.viewers(mine, room.viewers.iter().map(|(id, (v, _))| (*id, v.as_slice())));
-            sounds.extend(room.sounds.drain(now));
+            // Not in the call: the detector keeps running (so its baseline is "what is there now" at
+            // pick-up, no burst) but nothing sounds.
+            sounds.extend(room.sounds.drain_for(now, room.in_call));
 
             // Right after this room's `StreamStarted`/`StreamStopped` events
             // have been applied to `room.streams` — the only inputs that can
@@ -4866,6 +4958,7 @@ impl AppState {
         spawn_leave(room.client.clone());
 
         let me = room.client.conn_id();
+        let in_call = room.in_call;
         let wanted = room.wanted_streams();
         // Last-known roster for the People panel, without ourselves and our
         // own streams: those belong to the dead connection's `ConnId`.
@@ -4903,6 +4996,7 @@ impl AppState {
                 shares,
                 wanted,
                 was_active_room,
+                in_call,
                 cancelled: false,
             },
         );
@@ -5114,6 +5208,8 @@ impl AppState {
             self.active_room = Some(handle);
         }
         if let Some(room) = self.rooms.get_mut(&handle) {
+            // Before `apply_rewatch`, which only runs for a room in the call.
+            room.in_call = entry.in_call;
             room.rewatch = entry.wanted;
             room.rewatch_deadline = Some(now + REWATCH_GRACE);
             // The room replays everything it had (a restarted relay: everyone re-announces and re-watches).
@@ -7049,12 +7145,29 @@ mod reconnect_tests {
             shares: Vec::new(),
             wanted: Vec::new(),
             was_active_room: false,
+            in_call: false,
             cancelled: false,
         }
     }
 
     fn connect_err(cause: CloseCause) -> ConnectResult {
         Err(ConnectError { message: format!("{cause:?}"), cause })
+    }
+
+    #[tokio::test]
+    async fn a_waiting_room_reports_the_call_state_it_had() {
+        let (_home, mut state, js) = saved_state("callstate");
+        assert!(!state.in_call(RoomHandle(7)), "unknown handle");
+        state.pick_up(RoomHandle(7)); // no-op for a room without a session
+        let mut entry = fake_entry(RoomHandle(7), &js);
+        entry.in_call = true;
+        state.reconnects.insert(RoomHandle(7), entry);
+        assert!(state.in_call(RoomHandle(7)));
+        state.reconnects.get_mut(&RoomHandle(7)).unwrap().in_call = false;
+        assert!(!state.in_call(RoomHandle(7)));
+        // A hang-up or confirm check on a room without a session touches nothing.
+        assert!(state.request_hang_up(RoomHandle(7)));
+        assert!(state.reconnects.contains_key(&RoomHandle(7)));
     }
 
     #[tokio::test]
@@ -7409,6 +7522,9 @@ mod reconnect_e2e {
         .await;
         let wh = *watcher.rooms.keys().next().unwrap();
         let sh = *sharer.rooms.keys().next().unwrap();
+        // Every connect starts out of the call (`RoomSession::in_call`).
+        watcher.pick_up(wh);
+        sharer.pick_up(sh);
 
         let capture_id = share_test_source(&mut sharer, sh).await;
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| {
@@ -7474,6 +7590,94 @@ mod reconnect_e2e {
         drop(relay);
     }
 
+    /// "In the call" through a real relay: a connect starts out of the call; `pick_up` and `hang_up` flip it; a
+    /// hang-up stops the watch and our own share into that room and keeps the room connected; the flag survives
+    /// a relay restart in both states (and the not-in-the-call room does not start watching by itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process (and a real GStreamer capture)"]
+    async fn call_state_survives_a_reconnect_and_hang_up_keeps_the_room() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+
+        let mut watcher = AppState::default();
+        let mut sharer = AppState::default();
+        let join_string = watcher.create_room(&format!("127.0.0.1:{port}"), "call").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        watcher.join_room(join_string.clone(), "watcher".into(), String::new()).expect("join");
+        sharer.join_room(join_string.clone(), "sharer".into(), "call".into()).expect("join");
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "both joined", |s| !s[0].rooms.is_empty() && !s[1].rooms.is_empty()).await;
+        let wh = *watcher.rooms.keys().next().unwrap();
+        let sh = *sharer.rooms.keys().next().unwrap();
+
+        // A fresh connect is not in the call; an unknown handle never is.
+        assert!(!watcher.in_call(wh) && !sharer.in_call(sh));
+        assert!(!watcher.in_call(RoomHandle(999)));
+        // Nothing at stake: the hang-up is immediate (and a no-op).
+        assert!(watcher.request_hang_up(wh));
+        assert!(watcher.rooms.contains_key(&wh));
+
+        sharer.pick_up(sh);
+        let capture_id = share_test_source(&mut sharer, sh).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| stream_of(s[0], wh, "sharer").is_some()).await;
+
+        // --- a restart while out of the call: back out of the call, nothing watched ---
+        let relay = restart_relay(relay, port).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(5), "watcher notices the drop", |s| !s[0].rooms.contains_key(&wh)).await;
+        assert!(!watcher.in_call(wh), "a suspended room reports the state it had");
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "both rooms back", |s| s[0].rooms.contains_key(&wh) && s[1].rooms.contains_key(&sh)).await;
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_secs(1)).await;
+        assert!(!watcher.in_call(wh), "a reconnect is not a pick-up");
+        assert!(watcher.rooms[&wh].watches.lock().unwrap().is_empty() && watcher.rooms[&wh].rewatch.is_empty());
+        assert!(sharer.in_call(sh), "an in-the-call room stays in the call across a reconnect");
+
+        // --- pick up, watch, restart: still in the call and the watch is back ---
+        watcher.pick_up(wh);
+        assert!(watcher.in_call(wh));
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "own destination live", |s| {
+            s[1].captures[&capture_id].destinations.values().all(|d| d.state() == capture::destination::DestinationState::Live)
+                && stream_of(s[0], wh, "sharer").is_some()
+        })
+        .await;
+        let (owner, stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, stream);
+        let relay = restart_relay(relay, port).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(5), "watcher notices the second drop", |s| !s[0].rooms.contains_key(&wh)).await;
+        assert!(watcher.in_call(wh));
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "watch resumed", |s| {
+            s[0].in_call(wh) && stream_of(s[0], wh, "sharer").is_some_and(|key| frames_decoded(s[0], wh, key) > 5)
+        })
+        .await;
+
+        // --- hang up: the watcher stops watching, the room stays; the sharer's share into the room stops ---
+        assert!(!watcher.request_hang_up(wh), "a watch is at stake: the caller must confirm");
+        assert!(watcher.in_call(wh));
+        watcher.hang_up(wh);
+        assert!(!watcher.in_call(wh));
+        {
+            let room = &watcher.rooms[&wh];
+            assert!(room.watches.lock().unwrap().is_empty() && room.audio_watches.lock().unwrap().is_empty());
+            assert!(room.rewatch.is_empty() && room.resume_after_stop.is_empty());
+        }
+        assert!(watcher.rooms.contains_key(&wh) && watcher.active_room.is_some());
+
+        assert!(sharer.leave_needs_confirm(sh));
+        assert!(!sharer.request_hang_up(sh));
+        sharer.hang_up(sh);
+        assert!(!sharer.in_call(sh) && sharer.rooms.contains_key(&sh));
+        assert!(sharer.rooms[&sh].destinations.is_empty() && sharer.captures.is_empty(), "the capture had one destination: it is dropped");
+        // Still in the roster: the other side keeps seeing us.
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_secs(1)).await;
+        assert!(watcher.rooms[&wh].members.iter().any(|m| m.display_name == "sharer"));
+        assert!(stream_of(&watcher, wh, "sharer").is_none(), "our share into the room ended");
+
+        watcher.shutdown(Duration::from_secs(2)).await;
+        sharer.shutdown(Duration::from_secs(3)).await;
+        drop(relay);
+    }
+
     /// Notification sounds (task I9) through a real relay and two real `AppState`s: the watcher hears the sharer's
     /// stream start and stop, the sharer hears the watcher join and leave its stream, and nobody hears their own
     /// share start or stop. Counts [`crate::sounds::requested`]: nothing plays (the output is never enabled in tests).
@@ -7497,6 +7701,9 @@ mod reconnect_e2e {
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "both joined", |s| !s[0].rooms.is_empty() && !s[1].rooms.is_empty()).await;
         let wh = *watcher.rooms.keys().next().unwrap();
         let sh = *sharer.rooms.keys().next().unwrap();
+        // Every connect starts out of the call (`RoomSession::in_call`).
+        watcher.pick_up(wh);
+        sharer.pick_up(sh);
         let sharer_conn = sharer.rooms[&sh].client.conn_id();
         // Joining a room, and a member joining it, is not a sound.
         run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(500)).await;
@@ -7570,6 +7777,9 @@ mod reconnect_e2e {
         .await;
         let wh = *watcher.rooms.keys().next().unwrap();
         let sh = *sharer.rooms.keys().next().unwrap();
+        // Every connect starts out of the call (`RoomSession::in_call`).
+        watcher.pick_up(wh);
+        sharer.pick_up(sh);
 
         let capture_id = share_test_source(&mut sharer, sh).await;
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| stream_of(s[0], wh, "sharer").is_some())
