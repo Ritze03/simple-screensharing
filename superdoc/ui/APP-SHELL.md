@@ -145,8 +145,8 @@ These were decided in the earlier UIs and are still the rules.
   pop-out.** Starts and stops are explicit actions (`Watch`, `StageShare`, `GoLive`,
   `Unwatch`, ...); `VideoViews` is synced by the shell every frame regardless of `Nav.view`,
   so an off-screen room's streams keep decoding.
-- **Hanging up** (`Modal::HangUpConfirm`) follows the same rule as leaving: a confirm iff something is shared or watched,
-  and the room stays connected afterwards.
+- **Hanging up** (`AppState::hang_up`) never asks: it is cheap to undo (the room stays connected, pick up again). Only
+  leaving (disconnecting) confirms.
 - **Leaving (disconnecting) raises a confirm iff the room has an outgoing share or a live watch**
   (`Modal::LeaveConfirm`); otherwise it leaves immediately. *Why:* nothing to lose means a
   confirm is only a speed bump on the commonest case, but leaving a room you stream to is

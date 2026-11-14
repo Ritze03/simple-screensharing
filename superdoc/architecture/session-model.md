@@ -144,9 +144,8 @@ relay and the wire know no call concept.
 - `AppState::hang_up(handle)` is destination-scoped like `disconnect_room` (same capture rule: dropped
   only with its last destination) and stops every video and audio watch, but keeps the `RoomSession`:
   no `Leave`, no roster change. It clears `rewatch` and `resume_after_stop`, so nothing is pulled back
-  later. `request_hang_up` follows the `request_leave_room` pattern: it returns a `bool` (done, or the
-  caller raises its own confirm dialog via `leave_needs_confirm`), because `session.rs` holds no UI-only
-  state.
+  later. There is no confirm variant: the UI hangs up at once (row 207; `request_leave_room` and
+  `leave_needs_confirm` remain for Disconnect only).
 - Gated while `!in_call`: `sync_audio_watches`, `apply_rewatch` and the room's sounds
   (`RoomSounds::drain_for(now, in_call)` returns nothing).
 - A staged capture (no destination yet) is nothing live, so hang-up does not touch it in `session.rs`;
