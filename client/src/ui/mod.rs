@@ -176,9 +176,6 @@ pub enum Modal {
     /// "Leave X?" — raised by [`UiAction::Leave`] when the room has active
     /// shares or watches; confirm with [`UiAction::LeaveConfirmed`].
     LeaveConfirm { room: RoomHandle },
-    /// "Leave the call in X?" — raised by [`UiAction::HangUp`] when the room has active shares or watches; confirm
-    /// with [`UiAction::HangUpConfirmed`]. The room stays connected.
-    HangUpConfirm { room: RoomHandle },
     /// "What do you want to share?": raised by the Share button or menu entry when a gamescope node or OBS virtual
     /// camera exists (`capture::gamescope`, rows 142, 173). Screen or one of the `nodes` push [`UiAction::SharePicked`].
     /// `auto` as for [`UiAction::ShareNow`]. Rendered by `modals`.
@@ -323,11 +320,8 @@ pub enum UiAction {
     LeaveConfirmed(RoomHandle),
     /// The green pick-up button: into the call (`AppState::pick_up`), then watch what is running (`App::pick_up_room`).
     PickUp(RoomHandle),
-    /// The red button in the call: out of the call, the room stays connected (`AppState::request_hang_up`), or open
-    /// [`Modal::HangUpConfirm`] if the room has shares/watches.
+    /// The red button in the call: out of the call at once, the room stays connected (`AppState::hang_up`), no confirm.
     HangUp(RoomHandle),
-    /// Hang up without asking (the confirm modal's button). Closes the modal.
-    HangUpConfirmed(RoomHandle),
     /// Leave (if connected) and remove from the saved list. Closes the modal.
     Forget(RoomKey),
     Rename { room: RoomKey, name: String },
@@ -1505,7 +1499,7 @@ impl App {
         {
             self.nav.modal = None;
         }
-        if let Some(Modal::LeaveConfirm { room } | Modal::HangUpConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room } | Modal::SharePick { room, .. }) = &self.nav.modal
+        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room } | Modal::SharePick { room, .. }) = &self.nav.modal
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;

@@ -423,13 +423,9 @@ function pickUpRoom(r) {
   pickUp(r);
   render();
 }
-/** Hang up: leave the call, stay connected. The confirm modal when something would be lost (an outgoing share or a live watch, same rule as Disconnect), else at once. */
+/** Hang up: leave the call, stay connected, at once and never with a confirm (cheap to undo: pick up again). */
 function hangUpRoom(r) {
   S.menu = null;
-  if (capsInRoom(r.id).length || r.watches.size) {
-    S.modal = { kind: "hangup", room: r.id };
-    return render();
-  }
   hangUp(r);
   render();
 }
@@ -586,21 +582,6 @@ function renderModal() {
   else if (M.kind === "settings") modal = renderSettings(close, lgBtn, spacer);
   else if (M.kind === "webcam") modal = renderWebcamModal(M, close, lgBtn, spacer);
   else if (M.kind === "add") modal = renderAdd(M, close, lgBtn, spacer);
-  else if (M.kind === "hangup") {
-    const r = roomById(M.room);
-    if (!r) { S.modal = null; return h("div"); }
-    const cs = capsInRoom(r.id);
-    const w = r.watches.size;
-    modal = modalShell("", t("ui.modal.hang_up_title", { room: r.name }), null, close, [
-      h("p", { text: t("ui.modal.hang_up_body") }),
-      ...cs.map((c) => banner("warning", (c.kind === "audio" ? t("ui.modal.warn_audio_stops", { room: r.name }) : t("ui.modal.stream_stops", { room: r.name })) + (c.dests.size > 1 ? " " + t("ui.modal.keeps_going") : ""))),
-      w ? banner("warning", w === 1 ? t("ui.modal.stop_watching_one") : t("ui.modal.stop_watching_n", { count: w })) : null,
-    ], [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-danger-solid", t("ui.modal.hang_up_ok"), () => {
-      S.modal = null;
-      hangUp(r);
-      render();
-    }, null, false, "btn-confirm")], null, t("ui.close"));
-  }
   else if (M.kind === "leave" || M.kind === "forget") {
     const r = roomById(M.room);
     if (!r) { S.modal = null; return h("div"); }

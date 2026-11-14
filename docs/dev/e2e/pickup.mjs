@@ -98,12 +98,10 @@ try {
   check((await strip(A)).includes("Bob"), "Alice still sees Bob");
   await B.page.screenshot(OUT + PFX + "in-call.png");
 
-  // ---- hang up: confirm, stays connected ----
+  // ---- hang up: at once with a watch running, no confirm, stays connected ----
   await B.page.click("#btn-leave");
-  await B.page.waitFor(`!!document.querySelector("#btn-confirm")`, { what: "hang-up confirm" });
-  await B.page.screenshot(OUT + PFX + "hangup-confirm.png");
-  await B.page.click("#btn-confirm");
   await B.page.waitFor(`!__sss.S.rooms[0].inCall`, { what: "hung up" });
+  check(!(await has(B, "#btn-confirm")) && (await room(B, `__sss.S.modal`)) === null, "hang up asks nothing");
   await L.sleep(500);
   check((await room(B, `r.state`)) === "joined" && (await room(B, `r.watches.size`)) === 0, "hang up: still connected, nothing watched");
   check((await has(B, "#btn-pickup")) && (await count(B, ".st-tile.idle")) === 1 && !(await has(B, "[data-watch]")), "back to look-only: pick-up button, idle tile, no Watch button");
@@ -113,7 +111,6 @@ try {
   await B.page.waitFor(`__sss.S.rooms[0].inCall && __sss.S.rooms[0].watches.size === 1`, { timeout: 25000, what: "re-pick-up watches" });
   check(true, "picking up again watches again");
   await B.page.click("#btn-leave");
-  await B.page.click("#btn-confirm");
   await B.page.waitFor(`!__sss.S.rooms[0].inCall`, { what: "hung up 2" });
 
   // ---- red again (not in the call): Disconnect, no confirm ----
@@ -153,8 +150,6 @@ try {
 
   // ---- Alice hangs up: her share into the room stops, she stays connected ----
   await A.page.click("#btn-leave");
-  await A.page.waitFor(`!!document.querySelector("#btn-confirm")`, { what: "Alice's hang-up confirm" });
-  await A.page.click("#btn-confirm");
   await A.page.waitFor(`!__sss.S.rooms[0].inCall && __sss.S.captures.length === 0`, { timeout: 15000, what: "Alice's share stopped" });
   check((await room(A, `r.state`)) === "joined", "Alice hung up: her share stopped, room still connected");
   await Z.page.waitFor(`!__sss.S.rooms[0].streams.some((s) => !s.self && s.kind === "video")`, { timeout: 15000, what: "stream gone for Zoe" });

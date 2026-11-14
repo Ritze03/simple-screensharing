@@ -4721,18 +4721,6 @@ impl AppState {
         }
     }
 
-    /// The hang-up counterpart of [`Self::request_leave_room`]: hangs up now and returns `true` when
-    /// nothing is at stake, otherwise `false` ([`Self::leave_needs_confirm`]) and the caller raises its
-    /// confirm dialog, then calls [`Self::hang_up`].
-    pub fn request_hang_up(&mut self, handle: RoomHandle) -> bool {
-        if self.leave_needs_confirm(handle) {
-            false
-        } else {
-            self.hang_up(handle);
-            true
-        }
-    }
-
     /// Poll the in-flight connect attempt, if any. Call once per frame.
     ///
     /// Returns what (if anything) just resolved, so a caller with UI-only
@@ -7247,8 +7235,8 @@ mod reconnect_tests {
         assert!(state.in_call(RoomHandle(7)));
         state.reconnects.get_mut(&RoomHandle(7)).unwrap().in_call = false;
         assert!(!state.in_call(RoomHandle(7)));
-        // A hang-up or confirm check on a room without a session touches nothing.
-        assert!(state.request_hang_up(RoomHandle(7)));
+        // A hang-up on a room without a session touches nothing.
+        state.hang_up(RoomHandle(7));
         assert!(state.reconnects.contains_key(&RoomHandle(7)));
     }
 
@@ -7697,8 +7685,8 @@ mod reconnect_e2e {
         // A fresh connect is not in the call; an unknown handle never is.
         assert!(!watcher.in_call(wh) && !sharer.in_call(sh));
         assert!(!watcher.in_call(RoomHandle(999)));
-        // Nothing at stake: the hang-up is immediate (and a no-op).
-        assert!(watcher.request_hang_up(wh));
+        // Hanging up a room that is not in the call is a no-op.
+        watcher.hang_up(wh);
         assert!(watcher.rooms.contains_key(&wh));
 
         sharer.pick_up(sh);
@@ -7734,7 +7722,6 @@ mod reconnect_e2e {
         .await;
 
         // --- hang up: the watcher stops watching, the room stays; the sharer's share into the room stops ---
-        assert!(!watcher.request_hang_up(wh), "a watch is at stake: the caller must confirm");
         assert!(watcher.in_call(wh));
         watcher.hang_up(wh);
         assert!(!watcher.in_call(wh));
@@ -7746,7 +7733,6 @@ mod reconnect_e2e {
         assert!(watcher.rooms.contains_key(&wh) && watcher.active_room.is_some());
 
         assert!(sharer.leave_needs_confirm(sh));
-        assert!(!sharer.request_hang_up(sh));
         sharer.hang_up(sh);
         assert!(!sharer.in_call(sh) && sharer.rooms.contains_key(&sh));
         assert!(sharer.rooms[&sh].destinations.is_empty() && sharer.captures.is_empty(), "the capture had one destination: it is dropped");

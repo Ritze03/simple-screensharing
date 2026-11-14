@@ -149,16 +149,7 @@ impl App {
                 self.videos.sync(&self.state);
             }
             UiAction::HangUp(handle) => {
-                if !self.state.request_hang_up(handle) {
-                    self.nav.modal = Some(Modal::HangUpConfirm { room: handle });
-                    self.nav.popover = None;
-                }
-            }
-            UiAction::HangUpConfirmed(handle) => {
                 self.state.hang_up(handle);
-                if self.nav.modal == Some(Modal::HangUpConfirm { room: handle }) {
-                    self.nav.modal = None;
-                }
             }
             UiAction::LeaveConfirmed(handle) => {
                 self.state.disconnect_room(handle);

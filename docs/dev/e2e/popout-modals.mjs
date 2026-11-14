@@ -35,12 +35,15 @@ try {
   const where = (sel) => P.eval(`({ main: document.querySelectorAll(${JSON.stringify(sel)}).length, pop: __sss.stageWindow() ? __sss.stageWindow().win.document.querySelectorAll(${JSON.stringify(sel)}).length : -1 })`);
   const shot = async (n) => { await P.screenshot(OUT + "popmodal-" + n + "-main.png"); await Q.screenshot(OUT + "popmodal-" + n + "-pop.png"); };
 
-  // 1) Hang up (the red button in the call) in the pop-out
-  await Q.click("#btn-leave");
-  await P.waitFor("__sss.S.modal && __sss.S.modal.kind === 'hangup'", { what: "hang-up modal" });
+  // 1) Disconnect (Room menu, in the call; the red button hangs up with no dialog) in the pop-out
+  const disconnectItem = { js: "[...document.querySelectorAll('.menu.m-room .mi')].find((e) => /^logout/.test(e.innerText.trim()))" };
+  await Q.click("#btn-room");
+  await sleep(300);
+  await Q.click(disconnectItem);
+  await P.waitFor("__sss.S.modal && __sss.S.modal.kind === 'leave'", { what: "disconnect modal" });
   await sleep(300);
   let w = await where(".scrim .modal");
-  check(w.pop === 1 && w.main === 0, "Hang up pressed in the pop-out: the confirmation is in the pop-out, not in the main page", JSON.stringify(w));
+  check(w.pop === 1 && w.main === 0, "Disconnect chosen in the pop-out: the confirmation is in the pop-out, not in the main page", JSON.stringify(w));
   await shot("1-leave");
   await Q.key("Escape");
   await sleep(300);
@@ -98,10 +101,12 @@ try {
   await P.screenshot(OUT + "popmodal-7-moved-main.png");
   await P.key("Escape");
   await sleep(200);
-  // 7) Hang up on the main page
-  await P.click("#btn-leave");
+  // 7) Disconnect on the main page
+  await P.click("#btn-room");
   await sleep(300);
-  check((await P.eval("document.querySelectorAll('.scrim .modal').length")) === 1 && (await P.eval("__sss.S.modal.hostId")) === "main", "Hang up on the main page: modal on main");
+  await P.click(disconnectItem);
+  await sleep(300);
+  check((await P.eval("document.querySelectorAll('.scrim .modal').length")) === 1 && (await P.eval("__sss.S.modal.hostId")) === "main", "Disconnect on the main page: modal on main");
   await P.screenshot(OUT + "popmodal-8-main-leave.png");
   await P.eval("__sss.S.modal = null; __sss.render(); true");
 } catch (e) {

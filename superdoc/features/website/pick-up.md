@@ -21,7 +21,7 @@ whole stage code already reads `state`.
   audio-only) is watched; off, they stay listed with Watch buttons.
 - **`hangUp(r)`** (the red button in the call / Room menu "Leave call"): `inCall = false`, `resume` cleared, `capture.js:stopDestsInRoom` (shares into this room only; a capture that also feeds
   another room keeps running; a staged, not yet live share here is discarded and its setup modal closes), every watch and listen stopped (`unwatchStream`, which unsubscribes). The room stays
-  connected. `app.js:hangUpRoom` asks first (modal kind `hangup`, `#btn-confirm`) when something would stop, like the Disconnect confirm.
+  connected. `app.js:hangUpRoom` hangs up at once, never with a confirm (row 207: cheap to undo, same as native and the `ctl hangup` hotkey); only Disconnect (`leaveRoom`) asks.
 - **Disconnect**: `app.js:leaveRoom` (unchanged flow, strings now say "Disconnect"): Room menu item, and the red button while not in the call (no confirm: nothing to lose).
 
 ## What is gated (every "may watch / share / hear" reads `inCall`)
@@ -40,7 +40,7 @@ whole stage code already reads `state`.
 
 The CSS is `.cb.pickup` (green, 64x50, the twin of `.cb.leave`) in `docs/css/app.css`. Icons `call` and `logout` are ligatures of the bundled Material Symbols font, like `call_end`.
 New i18n keys (en + de, wording copied from native): `ui.bar.hang_up`, `ui.bar.hang_up_item`, `ui.bar.pick_up`, `ui.bar.pick_up_item`, `ui.bar.disconnect_room`, `ui.room.in_call`,
-`ui.modal.hang_up_title|_body|_ok`; changed: `ui.modal.leave_title|leave_room` and `ui.bar.leave_room_item` is renamed `ui.bar.disconnect_item` (en "Disconnect", de "Verbindung trennen", as native); `ui.bar.leave_room` is gone.
+changed: `ui.modal.leave_title|leave_room` and `ui.bar.leave_room_item` is renamed `ui.bar.disconnect_item` (en "Disconnect", de "Verbindung trennen", as native); `ui.bar.leave_room` is gone.
 
 ## Differences from native
 
@@ -55,7 +55,7 @@ New i18n keys (en + de, wording copied from native): `ui.bar.hang_up`, `ui.bar.h
 
 `dev/tests.js`: `pickUpWatchKeys`, `shareTargets`, `inCallAfterConnect`, `RoomSounds` pick-up baseline. `dev/e2e/pickup.mjs <relay host:port> <certhash> [--relay-bin <bin> --relay-dir <dir>]`
 drives the real UI (video only, a spy where a sound would play): not in the call (people strip, idle tile without Watch, no share button, green and red buttons, nothing watched, hidden strip
-shown), pick-up watches and decodes with no sound, hang-up with confirm keeps the room and the person in the sharer's strip, red outside the call disconnects without confirm, manual
+shown), pick-up watches and decodes with no sound, hang-up (no confirm, with a watch running) keeps the room and the person in the sharer's strip, red outside the call disconnects without confirm, manual
 Connect starts out of the call, option off lists with a Watch button, with the restart option a reconnect keeps both states, the sharer's hang-up stops her share. `dev/e2e-lib.mjs:waitJoined`
 presses pick-up by default (`pickUp: false` opts out). With auto-watch on that watches everything at once, so scripts that click Watch on idle tiles (`stage.mjs`, `native-webcam.mjs`, `phone.mjs`) open
 their viewer with `settings: { autoWatch: false }`. `pickup.mjs` also covers sounds: out of the call a stop and restart of the share records nothing in the `SoundOut.play` spy, in the call it records `stop` and `start`.

@@ -7,6 +7,12 @@ All notable user-facing changes, newest first. Categories:
 **Removed** (things taken out),
 **Info** (notes worth knowing).
 
+## 2026-11-15
+
+### Fixed
+
+- **Leave call**: leaving a call no longer asks for confirmation.
+
 ## 2026-11-14
 
 ### Added
