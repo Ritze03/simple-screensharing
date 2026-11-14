@@ -1253,7 +1253,7 @@ try {
   await B.page.waitFor("document.querySelectorAll('.st-tile').length >= 3", { timeout: 20000, what: "Bob's stage" });
   const bobTiles = () => B.page.eval(`[...document.querySelectorAll('.arena > .st-tile')].map((t) => ({ id: t.dataset.id, idle: t.classList.contains('idle') }))`);
   const bob0 = await bobTiles();
-  check(!(await B.page.eval("!!document.querySelector('.pip')")) && bob0.some((t) => /Webcam$/.test(t.id) && t.idle) && bob0.some((t) => /\/Alice\/video\/Screen$/.test(t.id) && t.idle), "a viewer who has watched neither stream sees both as tiles (a webcam you cannot see playing in a picture would have no Watch button)", JSON.stringify(bob0.map((t) => t.id.split("/").pop())));
+  check(!(await B.page.eval("!!document.querySelector('.pip')")) && bob0.some((t) => /Webcam$/.test(t.id) && t.idle) && bob0.some((t) => /\/Alice\/video\/Screen$/.test(t.id) && t.idle), "a viewer who has watched neither stream sees both as tiles (a webcam you cannot see playing in a picture would have no Watch button)", JSON.stringify(bob0.map((t) => t.id.split("/").slice(-3).join("/") + (t.idle ? "" : " PLAYING"))) + " " + (await B.page.eval(`JSON.stringify({ pip: !!document.querySelector('.pip'), watches: [...__sss.S.rooms[0].watches.keys()], inCall: __sss.S.rooms[0].inCall, autoWatch: __sss.S.settings.autoWatch })`)));
   await B.page.click({ js: "document.querySelector('.st-tile[data-id$=\"/Webcam\"] [data-watch]')" });
   await B.page.waitFor("__sss.S.rooms[0].watches.size === 1", { what: "Bob watches the webcam only" });
   await sleep(500);

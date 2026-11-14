@@ -107,8 +107,12 @@ export async function goLiveAuto(page) {
 
 /** Click through the real share flow of the Share menu: its arrow -> "Share your screen" -> stream settings (codec, fps) -> Go live. */
 export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {}) {
-  await page.click("#btn-share ~ .caret");
-  await page.waitFor("document.querySelector('.menu.m-share')", { what: "share menu" });
+  // The bar is rebuilt wholesale on every roster / streams event: one landing between the press and the release of a click (seen with a second sharer
+  // joining a room, a few ms apart) removes the pressed node, so the browser fires no click at all and the menu never opens. Press again until it does.
+  for (let t = 0; t < 4 && !(await page.eval("!!document.querySelector('.menu.m-share')")); t++) {
+    await page.click("#btn-share ~ .caret");
+    await page.waitFor("document.querySelector('.menu.m-share')", { timeout: t < 3 ? 1500 : 15000, what: "share menu" }).catch((e) => { if (t === 3) throw e; });
+  }
   await page.click({ js: "[...document.querySelectorAll('.menu.m-share .mi')].find((e) => /^screen_share/.test(e.innerText.trim()))" });
   await page.waitFor("document.querySelector('#st-fps')", { what: "stream modal" });
   await pickFps(page, fps);
