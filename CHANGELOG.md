@@ -7,6 +7,13 @@ All notable user-facing changes, newest first. Categories:
 **Removed** (things taken out),
 **Info** (notes worth knowing).
 
+## 2026-11-14
+
+### Added
+
+- **Pick up on the website**: the website now also connects you without putting you in the
+  call; press the green button to join in and watch.
+
 ## 2026-11-13
 
 ### Added

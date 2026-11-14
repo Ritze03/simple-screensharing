@@ -255,10 +255,17 @@ export function itemNumbers(it) {
 export const autoWatchKeys = ({ enabled, joined, streams, known, watching }) =>
   enabled && joined ? streams.filter((s) => s.kind === "video" && !s.self && !known.has(s.key) && !watching.has(s.key)).map((s) => s.key) : [];
 
-/** Which streams to watch when you join a room (row 181, same option): the webcams of others already on, only on the FIRST join of the room in this page.
- *  A screen share already running is listed, not watched; a reconnect gives nothing (the stableKey resume restores what you watched, and a webcam you stopped stays stopped). */
-export const joinWatchKeys = ({ enabled, first, streams, watching }) =>
-  enabled && first ? streams.filter((s) => s.kind === "video" && !s.self && isWebcamLabel(s.label) && !watching.has(s.key)).map((s) => s.key) : [];
+/** Which streams to watch when you pick up (D7, same option): every video stream of others already running, screens and webcams, never your own, never audio-only, none
+ *  that is watched already; none with the option off. (History: until row 197 only the webcams of the first join were watched, screens only listed, to avoid surprise decoding;
+ *  pick-up is now the explicit consent.) */
+export const pickUpWatchKeys = ({ enabled, streams, watching }) =>
+  enabled ? streams.filter((s) => s.kind === "video" && !s.self && !watching.has(s.key)).map((s) => s.key) : [];
+
+/** The rooms a share may go to besides `exceptId` ("Also send to" / "Move to"): only connected rooms that are in the call (a not-in-the-call room is look-only). */
+export const shareTargets = (rooms, exceptId) => rooms.filter((x) => x.id !== exceptId && x.state === "joined" && x.inCall);
+
+/** The call state of a room after its connection reports "connected": a fresh connect starts out of the call, a reconnect keeps what it had. */
+export const inCallAfterConnect = ({ was, reconnected }) => (reconnected ? !!was : false);
 
 /** Whether the own live preview may run (native `ui::live_preview_allowed`). A hidden tab always detaches (the browser throttles it, nobody sees it);
  *  focus loss detaches only a screen preview and only while "Hide when unfocused" is on: the own webcam never hides on blur. */

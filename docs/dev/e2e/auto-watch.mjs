@@ -1,10 +1,10 @@
 // Row 176 through the REAL site UI: Settings > Playback > "Automatically watch new streams" (on by default).
-// Alice shares (synthetic capture, video only). Bob (default settings) is in the room BEFORE she goes live and must start watching by himself;
-// Zoe has the option off (stored setting) and must only list the stream; Dora joins AFTER the stream runs and must not watch (snapshot is a baseline).
+// Alice shares (synthetic capture, video only). Bob (default settings) is in the call BEFORE she goes live and must start watching by himself;
+// Zoe has the option off (stored setting) and must only list the stream; Dora joins AFTER the stream runs and, at pick-up (waitJoined presses it), watches it (D7).
 // Then Zoe flips the option on through the Settings UI (persisted) and Alice restarts the share: Zoe now auto-watches. A stopped watch is not
 // re-watched (stableKey resume is covered by ui-reconnect.mjs).
-// Row 181: Alice also turns on her (fake, video only) webcam; Eve joins late with default settings and watches the webcam by herself but only lists
-// the running screen share; Fay joins late with the option off and watches nothing.
+// Task 197 (replaces row 181): Alice also turns on her (fake, video only) webcam; Eve joins late with default settings and at pick-up watches BOTH the screen
+// and the webcam; Fay joins late with the option off and watches nothing (both listed). Not in the call (before pick-up) nothing is watched at all: pickup.mjs.
 //
 //   usage: node docs/dev/e2e/auto-watch.mjs <relay host:port> <certhash>   (relay: docs/dev/relay.sh start ...)
 //   env:   E2E_OUT = where the screenshots go (default ~/tmp/sss-e2e)
@@ -54,9 +54,12 @@ try {
 
   D = await L.openApp(site.url, { name: "Dora" });
   await L.addRoomByLink(D.page, link, "autowatch");
-  await L.waitJoined(D.page);
-  await L.sleep(3000);
-  check((await watching(D)) === 0 && (await listed(D)) === 1, "joining a room with a running stream: listed, not watched (snapshot = baseline)");
+  await L.waitJoined(D.page, 0, 20000, { pickUp: false });
+  await L.sleep(2000);
+  check((await watching(D)) === 0 && (await listed(D)) === 1, "joined but not in the call: the running stream is listed, not watched");
+  await L.pickUpRoom(D.page);
+  await D.page.waitFor(`__sss.S.rooms[0].watches.size === 1`, { timeout: 20000, what: "Dora watches at pick-up" });
+  check(true, "option on: picking up watches the stream already running (D7)");
 
   // Zoe flips the option on in Settings > Playback (real clicks) and it persists
   await Z.page.click("#btn-settings");
@@ -84,7 +87,7 @@ try {
     check(true, n + " auto-watches the restarted share");
   }
 
-  // Row 181: late joiners with a screen share AND a webcam already running
+  // Task 197: late joiners with a screen share AND a webcam already running
   await A.page.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "Alice's webcam button" });
   await A.page.click("#btn-webcam");
   await A.page.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "Alice's webcam live" });
@@ -95,10 +98,10 @@ try {
     await L.addRoomByLink(P.page, link, "autowatch");
     await L.waitJoined(P.page);
   }
-  await E.page.waitFor(`__sss.S.rooms[0].watches.size === 1`, { timeout: 25000, what: "Eve auto-watches the webcam" });
-  await L.sleep(3000);
-  check((await E.page.eval(`[...__sss.S.rooms[0].watches.values()].map((w) => w.label).join()`)) === "Webcam" && (await listed(E)) === 2, "joining with a screen share and a webcam running: Eve watches the webcam, only lists the screen");
-  check((await watching(F)) === 0 && (await listed(F)) === 2, "option off: Fay joining late watches nothing");
+  await E.page.waitFor(`__sss.S.rooms[0].watches.size === 2`, { timeout: 25000, what: "Eve watches both at pick-up" });
+  await L.sleep(2000);
+  check((await watching(E)) === 2 && (await listed(E)) === 2, "picking up with a screen share and a webcam running: Eve watches both");
+  check((await watching(F)) === 0 && (await listed(F)) === 2, "option off: Fay picking up late lists both, watches nothing");
   await E.page.screenshot(OUT + "autowatch_join_webcam.png");
 } catch (e) {
   failed++;

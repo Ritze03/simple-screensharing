@@ -714,7 +714,7 @@ try {
   await P.click("#btn-room");
   await P.waitFor("document.querySelector('.menu.m-room')", { what: "room menu" });
   const rm = await P.eval(`[...document.querySelectorAll('.menu.m-room .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
-  check(["Auto-connect", "Rename", "Copy invite link", "Leave room", "Forget room"].every((x) => rm.some((m) => m.includes(x))), "the Room settings menu: Auto-connect, Rename, Copy invite link, Leave room, Forget room", JSON.stringify(rm));
+  check(["Auto-connect", "Rename", "Copy invite link", "Leave call", "Disconnect", "Forget room"].every((x) => rm.some((m) => m.includes(x))), "the Room settings menu: Auto-connect, Rename, Copy invite link, Leave call, Disconnect, Forget room", JSON.stringify(rm));
   // a second click on the opener closes it again
   await P.click("#btn-room");
   await sleep(150);
@@ -732,7 +732,7 @@ try {
   const gr = await rowRect(/ghost/);
   await rightClick(P, gr.cx, gr.cy);
   const rc = await P.eval(`({ menu: !!document.querySelector('.menu.m-room'), head: document.querySelector('.menu.m-room .mh')?.innerText.replace(/\\s+/g, ' '), items: [...document.querySelectorAll('.menu.m-room .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim()), sel: __sss.S.selected, x: Math.round(document.querySelector('.menu.m-room')?.getBoundingClientRect().x || 0) })`);
-  check(rc.menu && /ghost/.test(rc.head) && rc.sel === openBefore && rc.items.some((m) => m.includes("Connect")) && !rc.items.some((m) => m.includes("Leave room")) && Math.abs(rc.x - gr.cx) < 4, "right click on a room row opens that room's menu at the pointer (Connect for a disconnected room); the open room stays", JSON.stringify({ ...rc, gr }));
+  check(rc.menu && /ghost/.test(rc.head) && rc.sel === openBefore && rc.items.some((m) => m.includes("Connect")) && !rc.items.some((m) => m.includes("Disconnect")) && Math.abs(rc.x - gr.cx) < 4, "right click on a room row opens that room's menu at the pointer (Connect for a disconnected room); the open room stays", JSON.stringify({ ...rc, gr }));
   await shot(P, "14b_room_row_menu");
   const fr = await rowRect(/stage/);
   await rightClick(P, fr.cx, fr.cy);

@@ -58,7 +58,9 @@ export function renderStage(view, host, { fullscreen = false } = {}) {
     arenas.add(arena);
   }
   const people = peopleOf(view, items);
-  const strip = S.stage.stripHidden || !people.length ? null : stripEl(view, items, people, host);
+  // Not in the call the people strip is always shown, even if hidden by the user (the setting is kept): it is the one thing the room offers then.
+  const idleRoom = view.kind === "room" && !view.r.inCall;
+  const strip = (S.stage.stripHidden && !idleRoom) || !people.length ? null : stripEl(view, items, people, host);
   const sec = h("section", { class: "vb g0 eq stg minh0", "data-view": key }, arena, strip, renderBar(view, host.id, { fullscreen }));
   if (!fullscreen) return sec;
   const wrap = h("div", { class: "stagefs" + (chromeShown ? "" : " chrome-off") }, sec);
@@ -108,7 +110,7 @@ function tileEl(it, view, key, arena) {
       h("span", { text: t("ui.room.audio_only") }),
       h("div", { class: "hb g2" }, w
         ? h("button", { type: "button", class: "btn btn-secondary", "data-listen": it.s.key, onclick: () => unwatchStream(r, it.s.key) }, ic("volume_off"), t("ui.room.stop_listening"))
-        : h("button", { type: "button", class: "btn btn-primary", "data-listen": it.s.key, disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => watchStream(r, it.s.key) }, ic("volume_up"), t("ui.room.listen")))));
+        : !r.inCall ? null : h("button", { type: "button", class: "btn btn-primary", "data-listen": it.s.key, disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => watchStream(r, it.s.key) }, ic("volume_up"), t("ui.room.listen")))));
   } else {
     const prev = r.previews.get(it.s.key);
     if (prev) vid.appendChild(h("img", { src: prev, alt: "" }));
@@ -116,7 +118,7 @@ function tileEl(it, view, key, arena) {
       avatarEl(it.owner, r.emojiOf(it.conn)),
       h("b", { text: t("ui.stage.sharing", { name: it.owner, label: it.label }) }),
       it.s.width ? h("span", { text: `${it.s.width}×${it.s.height}` }) : null,
-      h("div", { class: "hb g2" },
+      !r.inCall ? null : h("div", { class: "hb g2" },
         h("button", { type: "button", class: "btn btn-primary", "data-watch": it.s.key, disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => watchStream(r, it.s.key) }, ic("play_arrow"), t("ui.stage.watch_stream")),
         popOutBtn() ? h("button", { type: "button", class: "btn btn-secondary", title: t("ui.room.pop_out_card_tip"), disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => A.watchAndPop(r, it.s.key) }, ic("open_in_new"), t("ui.room.pop_out")) : null)));
   }
@@ -169,6 +171,7 @@ function tileEl(it, view, key, arena) {
   if (kind === "video") tile.addEventListener("dblclick", (e) => { if (!e.target.closest("button, input")) A.doFullscreen(r, w); });
   tile.addEventListener("contextmenu", (e) => {
     e.preventDefault();
+    if (!r.inCall) return; // not in the call: a tile has no menu (nothing to watch, pop out or change)
     openTileMenu(key, it.id, tile, { x: e.clientX, y: e.clientY });
   });
   return tile;

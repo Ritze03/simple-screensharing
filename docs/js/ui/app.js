@@ -13,7 +13,7 @@ import {
   banner, meter, modalShell, avatarEl, LABEL_W, longPress,
 } from "./dom.js";
 import {
-  RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, allWatches, addRoom, forgetRoom, applyJitterSettings,
+  RoomEntry, roomById, connectRoom, disconnectRoom, pickUp, hangUp, retryNow, watchStream, allWatches, addRoom, forgetRoom, applyJitterSettings,
 } from "./rooms.js";
 import {
   capById, capInRoom, capsInRoom, webcamInRoom, webcamCap, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive,
@@ -221,7 +221,7 @@ function liveMeter(fn) {
 const drawerBtn = () => h("button", { class: "icon-btn drawer-btn", type: "button", id: "btn-drawer", title: t("ui.sidebar.open_rooms"), "aria-label": t("ui.sidebar.open_rooms"), onclick: () => { S.drawer = !S.drawer; render(); } }, ic("menu"));
 
 function roomStatusTitle(r) {
-  return { joined: t("ui.sidebar.status_connected"), reconnecting: t("ui.sidebar.status_reconnecting"), connecting: t("ui.room.connecting"), disconnected: t("ui.sidebar.status_disconnected") }[r.state];
+  return { joined: r.inCall ? t("ui.room.in_call") : t("ui.sidebar.status_connected"), reconnecting: t("ui.sidebar.status_reconnecting"), connecting: t("ui.room.connecting"), disconnected: t("ui.sidebar.status_disconnected") }[r.state];
 }
 
 /* ============================== sidebar ============================== */
@@ -352,7 +352,7 @@ function renderMain(sv) {
 
 /** The room's header band: title, status pill, meta. Since the stage the controls live in its bar; a room with no stage keeps a `⋯` for the Room settings menu. */
 function renderHead(r) {
-  const status = r.state === "joined" ? h("span", { class: "badge badge-live" }, h("span", { class: "dot" }), t("ui.sidebar.status_connected"))
+  const status = r.state === "joined" ? h("span", { class: "badge badge-live" }, h("span", { class: "dot" }), r.inCall ? t("ui.room.in_call") : t("ui.sidebar.status_connected"))
     : r.state === "reconnecting" ? h("span", { class: "badge badge-degraded" }, ic("sync"), t("ui.sidebar.status_reconnecting"))
       : r.state === "connecting" ? h("span", { class: "badge badge-progress" }, h("span", { class: "bar" }), t("ui.room.connecting"))
         : h("span", { class: "badge badge-muted" }, t("ui.sidebar.status_disconnected"));
@@ -417,7 +417,23 @@ async function popStage(key, back) {
   }
   render();
 }
-/** Leave a room: the confirm modal when something would be lost (an outgoing share or a live watch, native rule), else at once. */
+/** Pick up: the room joins the call (rooms.js `pickUp`). */
+function pickUpRoom(r) {
+  S.menu = null;
+  pickUp(r);
+  render();
+}
+/** Hang up: leave the call, stay connected. The confirm modal when something would be lost (an outgoing share or a live watch, same rule as Disconnect), else at once. */
+function hangUpRoom(r) {
+  S.menu = null;
+  if (capsInRoom(r.id).length || r.watches.size) {
+    S.modal = { kind: "hangup", room: r.id };
+    return render();
+  }
+  hangUp(r);
+  render();
+}
+/** Disconnect a room: the confirm modal when something would be lost (an outgoing share or a live watch, native rule), else at once. */
 async function leaveRoom(r) {
   if (capsInRoom(r.id).length || r.watches.size) {
     S.menu = null;
@@ -570,6 +586,21 @@ function renderModal() {
   else if (M.kind === "settings") modal = renderSettings(close, lgBtn, spacer);
   else if (M.kind === "webcam") modal = renderWebcamModal(M, close, lgBtn, spacer);
   else if (M.kind === "add") modal = renderAdd(M, close, lgBtn, spacer);
+  else if (M.kind === "hangup") {
+    const r = roomById(M.room);
+    if (!r) { S.modal = null; return h("div"); }
+    const cs = capsInRoom(r.id);
+    const w = r.watches.size;
+    modal = modalShell("", t("ui.modal.hang_up_title", { room: r.name }), null, close, [
+      h("p", { text: t("ui.modal.hang_up_body") }),
+      ...cs.map((c) => banner("warning", (c.kind === "audio" ? t("ui.modal.warn_audio_stops", { room: r.name }) : t("ui.modal.stream_stops", { room: r.name })) + (c.dests.size > 1 ? " " + t("ui.modal.keeps_going") : ""))),
+      w ? banner("warning", w === 1 ? t("ui.modal.stop_watching_one") : t("ui.modal.stop_watching_n", { count: w })) : null,
+    ], [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-danger-solid", t("ui.modal.hang_up_ok"), () => {
+      S.modal = null;
+      hangUp(r);
+      render();
+    }, null, false, "btn-confirm")], null, t("ui.close"));
+  }
   else if (M.kind === "leave" || M.kind === "forget") {
     const r = roomById(M.room);
     if (!r) { S.modal = null; return h("div"); }
@@ -941,7 +972,7 @@ function joinFromHash() {
 }
 window.addEventListener("hashchange", joinFromHash);
 Object.assign(A, {
-  render, liveText, liveMeter, openStreamModal, startStage, copyLink, copyDirectLink, leaveRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
+  render, liveText, liveMeter, openStreamModal, startStage, copyLink, copyDirectLink, leaveRoom, pickUpRoom, hangUpRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
   toggleStageFullscreen,
   startAudio: (r) => startAudio(r),
   openModal: (m) => { S.menu = null; S.modal = m; render(); },

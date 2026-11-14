@@ -23,8 +23,8 @@ const check = (cond, what, extra = "") => {
 
 const site = await L.serveSite(0);
 const A = await L.openApp(site.url, { name: "Alice" });
-const B = await L.openApp(site.url, { name: "Bob" });
-const C = await L.openApp(site.url, { name: "Zoë Bauer" });
+const B = await L.openApp(site.url, { name: "Bob", settings: { autoWatch: false } });
+const C = await L.openApp(site.url, { name: "Zoë Bauer", settings: { autoWatch: false } });
 const chip = () => A.page.eval(`(() => { const c = document.querySelector(".chip-dark.viewers"); return c ? { text: c.innerText.trim(), title: c.title } : null; })()`);
 const pop = () => A.page.eval(`(() => { const p = document.querySelector(".vpop"); return p ? { rows: [...p.querySelectorAll(".vrow")].map((r) => r.innerText.trim().replace(/\\s+/g, " ")), head: p.querySelector(".ph").innerText.trim(), avatars: p.querySelectorAll(".avatar").length } : null; })()`);
 const hover = async (x, y) => A.page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });

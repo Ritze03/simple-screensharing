@@ -16,7 +16,7 @@ import {
   screens, audioInRoom, startAudio, stopWebcam, cameras, camChoice, camsListing, useCamera,
 } from "./capture.js";
 import { A } from "./actions.js";
-import { viewOf, viewKey, itemById, layoutOf, setLayout, resetView, pipOn, LAYOUTS, codecName } from "./stage-state.js";
+import { viewOf, viewKey, itemById, layoutOf, setLayout, resetView, pipOn, shareTargets, LAYOUTS, codecName } from "./stage-state.js";
 import { popoutMode } from "./popout.js";
 
 export const FPS_LIST = [15, 30, 60, 90, 120, 144, 165, 240];
@@ -214,11 +214,15 @@ function roomMenu() {
   if (!r) return [];
   const joined = r.state === "joined";
   return [
-    head(h("span", { class: "sdot " + r.state }), r.name, joined ? t("ui.bar.room_status", { count: r.members.length }) : r.state === "reconnecting" ? t("ui.sidebar.status_reconnecting") : t("ui.sidebar.status_disconnected")),
+    head(h("span", { class: "sdot " + r.state }), r.name, joined ? (r.inCall ? t("ui.room.in_call") + " · " : "") + t("ui.bar.room_status", { count: r.members.length }) : r.state === "reconnecting" ? t("ui.sidebar.status_reconnecting") : t("ui.sidebar.status_disconnected")),
     switchRow("bolt", t("ui.room.auto_connect"), r.auto, stay(() => { r.auto = !r.auto; persistRooms(); }), { title: t("ui.room.auto_connect_tip") }),
     menuItem({ icon: "edit", label: t("ui.room.rename"), onclick: done(() => A.openModal({ kind: "rename", room: r.id, value: r.name })) }),
     menuItem({ icon: "link", label: t("ui.room.copy_invite"), disabled: !joined, title: joined ? null : t("ui.room.copy_invite_offline_tip"), onclick: done(() => A.copyLink(r)) }),
     menuItem({ icon: "open_in_browser", label: t("ui.room.copy_direct"), disabled: !joined, title: joined ? null : t("ui.room.copy_invite_offline_tip"), onclick: done(() => A.copyDirectLink(r)) }),
+    // A connected room: "Pick up" or "Leave call" (the bar's green / red button), and Disconnect (native `room_menu`).
+    ...(joined ? [r.inCall
+      ? menuItem({ icon: "call_end", label: t("ui.bar.hang_up_item"), onclick: done(() => A.hangUpRoom(r)) })
+      : menuItem({ icon: "call", label: t("ui.bar.pick_up_item"), cls: "primary", onclick: done(() => A.pickUpRoom(r)) })] : []),
     r.state === "disconnected"
       ? menuItem({ icon: "login", label: t("ui.room.connect"), onclick: done(() => connectRoom(r)) })
       : menuItem({ icon: "logout", label: t("ui.bar.leave_room_item"), onclick: done(() => A.leaveRoom(r)) }),
@@ -325,7 +329,7 @@ function targetsMenu(kind) {
   const r = roomById(S.menu.roomId);
   const c = capById(S.menu.cap);
   if (!r || !c) return [];
-  const targets = S.rooms.filter((x) => x.id !== r.id && x.state === "joined");
+  const targets = shareTargets(S.rooms, r.id);
   const out = [label(kind === "alsosend" ? t("ui.popup.also_send_heading") : t("ui.popup.move_heading"))];
   if (!targets.length) out.push(h("div", { class: "mrow cap", text: t("ui.popup.no_other_rooms") }));
   for (const x of targets) {

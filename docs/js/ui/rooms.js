@@ -8,7 +8,7 @@ import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent, mediaLogLine } from "./media-event.js";
 import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
-import { autoWatchKeys, joinWatchKeys } from "./stage-state.js";
+import { autoWatchKeys, pickUpWatchKeys, inCallAfterConnect } from "./stage-state.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
 // volume row, the card's "Audio"), so the audio UI can be tested without creating an audio stream on the host.
@@ -39,7 +39,9 @@ export class RoomEntry {
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
     this.knownStreams = new Set(); // stream keys of the last list, so a new one can be told from one already there (auto-watch)
-    this.joinedOnce = false; // set at the first join in this page: only that one watches the webcams already on (auto-watch)
+    // "In the call" (native `AppState::in_call`): false after every connect (auto or manual), true after "Pick up", false again after "Leave call". A room that is
+    // not in the call is connected (people, previews) but watches nothing, shares nothing, plays no sounds. Kept over a reconnect (`state` event, `d.reconnected`).
+    this.inCall = false;
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
     this.sounds = new RoomSounds(); // notification-sound edges of this room (sounds.js)
   }
@@ -102,6 +104,7 @@ export async function connectRoom(r, { quiet = false } = {}) {
   client.setAvatar(st.emoji); // announced once the relay acks (and again after every reconnect)
   r.client = client;
   r.state = "connecting";
+  r.inCall = false; // a connect (manual or auto) always starts out of the call
   r.error = null;
   r.issue = null;
   wire(r, client);
@@ -126,12 +129,36 @@ export async function disconnectRoom(r) {
   for (const key of [...r.watches.keys()]) unwatchStream(r, key);
   r.client = null;
   r.state = "disconnected";
+  r.inCall = false;
   r.resume = [];
   r.members = [];
   r.streams = [];
   clearPreviews(r);
   invalidate();
   if (client) await client.disconnect().catch(() => {});
+}
+
+/** Pick up (the green bar button): the connected room joins the call. Same moment, same click as the user's consent: with "Automatically watch new streams" on, every video
+ *  stream of others already running is watched (screens and webcams, never your own, never audio-only: `pickUpWatchKeys`); off, they stay listed with Watch buttons.
+ *  Sound baseline and auto-watch baseline are what is there now, so nothing sounds or auto-watches for it. Native twin: `App::pick_up_room`. */
+export function pickUp(r) {
+  if (!r.client || r.state !== "joined" || r.inCall) return;
+  r.inCall = true;
+  r.sounds.streams(r.streams.filter((s) => !s.self).map((s) => s.key), false);
+  r.knownStreams = new Set(r.streams.map((s) => s.key));
+  for (const key of pickUpWatchKeys({ enabled: S.settings.autoWatch, streams: r.streams, watching: r.watches })) watchStream(r, key);
+  invalidate();
+}
+
+/** Hang up (the red button in the call): every watch and listen and every share into THIS room stops (a capture that also feeds another room keeps running; a staged,
+ *  not yet live share here is dropped and its setup modal closes), the room stays connected and goes back to "not in the call". Native twin: `AppState::hang_up`. */
+export function hangUp(r) {
+  if (!r.inCall) return;
+  r.inCall = false;
+  r.resume = [];
+  stopDestsInRoom(r.id);
+  for (const key of [...r.watches.keys()]) unwatchStream(r, key, { silent: true });
+  invalidate();
 }
 
 /** "Retry now" during a reconnect: the core skips its backoff wait; shares and watches stay registered and come back with it. */
@@ -166,10 +193,7 @@ function wire(r, client) {
     if (d.state === "connected") {
       r.issue = null;
       resumeWatches(r);
-      // Settings > Playback > "Automatically watch new streams": the webcams already on at the first join of this room (row 181).
-      const first = !r.joinedOnce && !d.reconnected;
-      r.joinedOnce = true;
-      for (const key of joinWatchKeys({ enabled: S.settings.autoWatch, first, streams: r.streams, watching: r.watches })) watchStream(r, key);
+      r.inCall = inCallAfterConnect({ was: r.inCall, reconnected: d.reconnected }); // a reconnect is not a new connect: the call state survives it
     }
     if (d.state === "connected" && d.reconnected) r.sounds.quiet(Date.now() + RESUME_QUIET_MS); // the room replays what it had: no sounds for it
     if (d.state === "connected" && d.reconnected) toast(t("ui.toast.reconnected", { room: r.name }), "check_circle");
@@ -182,7 +206,7 @@ function wire(r, client) {
   on("streams", (d) => {
     r.streams = d.streams;
     // Notification sounds: the snapshot a (re)connect delivers arrives while the room is not "joined" yet, so it only sets the baseline.
-    r.sounds.streams(d.streams.filter((s) => !s.self).map((s) => s.key), r.state === "joined");
+    r.sounds.streams(d.streams.filter((s) => !s.self).map((s) => s.key), r.state === "joined" && r.inCall);
     syncViewerSounds(r);
     for (const key of [...r.previews.keys()]) {
       if (!d.streams.some((s) => s.key === key)) {
@@ -192,8 +216,11 @@ function wire(r, client) {
     }
     resumeWatches(r);
     // Settings > Playback > "Automatically watch new streams": a stream that was not in the previous list (after the resume above took its own).
-    for (const key of autoWatchKeys({ enabled: S.settings.autoWatch, joined: r.state === "joined", streams: d.streams, known: r.knownStreams, watching: r.watches })) watchStream(r, key);
-    r.knownStreams = new Set(d.streams.map((s) => s.key));
+    // Not in the call: nothing is auto-watched and nothing marked as seen (pick-up watches what runs then, and re-bases `knownStreams`).
+    if (r.inCall) {
+      for (const key of autoWatchKeys({ enabled: S.settings.autoWatch, joined: r.state === "joined", streams: d.streams, known: r.knownStreams, watching: r.watches })) watchStream(r, key);
+      r.knownStreams = new Set(d.streams.map((s) => s.key));
+    }
     invalidate();
   });
   on("stream-gone", (d) => {
@@ -286,7 +313,7 @@ const RESUME_MS = 60_000;
 function resumeWatches(r) {
   const now = Date.now();
   r.resume = r.resume.filter((e) => e.until > now);
-  if (!r.resume.length || r.state !== "joined") return;
+  if (!r.resume.length || r.state !== "joined" || !r.inCall) return;
   for (const e of [...r.resume]) {
     const s = r.streams.find((x) => x.kind === (e.kind || "video") && !x.self && !r.watches.has(x.key) && (e.stableKey ? x.stableKey === e.stableKey : (x.ownerName || r.memberName(x.owner)) === e.ownerName && x.label === e.label));
     if (!s) continue;
@@ -301,7 +328,7 @@ function resumeWatches(r) {
 }
 
 export function watchStream(r, key) {
-  if (!r.client || r.watches.has(key)) return r.watches.get(key);
+  if (!r.client || !r.inCall || r.watches.has(key)) return r.watches.get(key) || null; // not in the call: nothing is watched (native `apply.rs` guard)
   const info = r.streams.find((s) => s.key === key);
   if (!info) return null;
   // An audio-only sender is "listened to": the same watch, with no picture (`audioOnly`, no canvas).

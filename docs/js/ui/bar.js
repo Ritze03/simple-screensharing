@@ -49,7 +49,7 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const state = live ? "on" : staged && staged.state === "ready" ? "ready" : "";
   const roomName = shareRoom ? shareRoom.name : "";
 
-  const canShare = caps.canShare && !!shareRoom && shareRoom.state === "joined";
+  const canShare = caps.canShare && !!shareRoom && shareRoom.state === "joined" && shareRoom.inCall;
   const shareTitle = (cap ? (live ? t("ui.bar.stream_settings") : t("ui.stream.title_staged")) : t("ui.bar.share_screen_tip")) + (!r && shareRoom ? ` (${roomName})` : "");
   const othersLive = screens().some((c) => c.state === "live" && !(shareRoom && c.dests.has(shareRoom.id)));
   const shareBtn = !r && !cap ? null : split({
@@ -64,7 +64,7 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   // of its own: a click picks a tab or the system audio, the next click stops it (native: Desktop audio on / off). Its arrow is the audio menu.
   const aud = shareRoom ? audioInRoom(shareRoom.id) : null;
   const hasAudio = !!cap && !!cap.audio;
-  const joined = !!shareRoom && shareRoom.state === "joined";
+  const joined = !!shareRoom && shareRoom.state === "joined" && shareRoom.inCall;
   const audioOnClick = () => {
     if (hasAudio) return setAudioMuted(cap, !cap.audioMuted);
     if (aud) {
@@ -118,7 +118,11 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
     // Right click (or a long press): "Copy join link" / "Copy browser direct link" (direct-link.js).
     oncontextmenu: (e) => { e.preventDefault(); openMenu("invite", e.currentTarget, { roomId: r.id, pos: { x: e.clientX, y: e.clientY } }); },
     onpointerdown: (e) => { const el = e.currentTarget; longPress(e, (pos) => openMenu("invite", el, { roomId: r.id, pos })); } }, ic("person_add"), h("span", { class: "lbl2", text: t("ui.room.copy_invite") }));
-  const leave = !r ? null : h("button", { type: "button", class: "cb leave", id: "btn-leave", title: t("ui.bar.leave_room", { room: r.name }), "aria-label": t("ui.bar.leave_room", { room: r.name }), onclick: () => A.leaveRoom(r) }, ic("call_end"));
+  // The green Pick up (not in the call) and the red button beside it: Leave call in the call (the room stays connected), Disconnect outside it (no confirm, nothing to lose).
+  const inCall = !!r && r.inCall;
+  const redTitle = !r ? "" : inCall ? t("ui.bar.hang_up", { room: r.name }) : t("ui.bar.disconnect_room", { room: r.name });
+  const leave = !r ? null : h("button", { type: "button", class: "cb leave", id: "btn-leave", title: redTitle, "aria-label": redTitle, onclick: () => (inCall ? A.hangUpRoom(r) : A.leaveRoom(r)) }, ic(inCall ? "call_end" : "logout"));
+  const pickUpBtn = !r || inCall ? null : h("button", { type: "button", class: "cb pickup", id: "btn-pickup", title: t("ui.bar.pick_up", { room: r.name }), "aria-label": t("ui.bar.pick_up", { room: r.name }), onclick: () => A.pickUpRoom(r) }, ic("call"));
   const popped = host === "pop";
   const pop = popped || pipSupported()
     ? h("button", { type: "button", class: "cb dim", id: "btn-popstage", title: popped ? t("ui.bar.unpop_stage") : t("ui.bar.pop_stage"), "aria-label": popped ? t("ui.bar.unpop_stage") : t("ui.bar.pop_stage"), onclick: () => A.popStage(key, popped) }, ic(popped ? "close_fullscreen" : "open_in_new"))
@@ -130,6 +134,13 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const noScreen = caps.canWatch && !caps.getDisplayMedia && !!shareRoom;
   const noScreenBtn = !noScreen ? null : h("button", { type: "button", class: "cb dim", id: "btn-noscreen", title: t("ui.err.no_screen_share"), "aria-label": t("ui.err.no_screen_share"), onclick: () => toast(t("ui.err.no_screen_share"), "screen_share", { err: true }) }, ic("screen_share"));
   const g1 = [noScreen ? noScreenBtn : shareBtn, noScreen ? null : audioBtn, camBtn].filter(Boolean);
+  // Not in the call: only Pick up, Disconnect and the Room menu (look-only room); no share, layout, level or people buttons (the strip is always shown).
+  if (r && !inCall) {
+    return h("div", { class: "ctlrow" },
+      h("div", { class: "side" }, side, invite),
+      h("div", { class: "mid" }, pickUpBtn, leave, h("div", { class: "cgroup" }, roomBtn)),
+      h("div", { class: "side r" }, pop, fs));
+  }
   return h("div", { class: "ctlrow" },
     h("div", { class: "side" }, side, invite),
     h("div", { class: "mid" }, g1.length ? h("div", { class: "cgroup" }, g1) : null, h("div", { class: "cgroup" }, layoutBtn, roomBtn, levelBtn, peopleBtn), leave),

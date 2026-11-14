@@ -48,8 +48,19 @@ export async function createRoom(page, { name, server, hash }) {
   return link;
 }
 
-export async function waitJoined(page, i = 0, timeout = 20000) {
+/** Wait until room `i` is connected, then (unless `pickUp: false`) press the green Pick up button: every connect starts out of the call, and nearly every script
+ *  wants the call (watch, share). `pickup.mjs` passes `pickUp: false` and drives the button itself. */
+export async function waitJoined(page, i = 0, timeout = 20000, { pickUp = true } = {}) {
   await page.waitFor(`${roomState(i)} === "joined"`, { timeout, what: `room ${i} joined` });
+  if (pickUp) await pickUpRoom(page, i);
+}
+
+/** Pick up room `i`: the real button when the room's stage is showing, else the module call. Resolves once the room is in the call. */
+export async function pickUpRoom(page, i = 0) {
+  if (await page.eval(`__sss.S.rooms[${i}].inCall`)) return;
+  if (await page.eval(`!!document.querySelector("#btn-pickup")`)) await page.click("#btn-pickup");
+  else await page.eval(`import("${BASE}js/ui/rooms.js").then((m) => m.pickUp(__sss.S.rooms[${i}]))`);
+  await page.waitFor(`__sss.S.rooms[${i}].inCall === true`, { what: `room ${i} picked up` });
 }
 
 /** The invite link the UI would copy (the stored link with the cert hash, plus the room name as 5th field when it has one). */
@@ -109,8 +120,10 @@ export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {
   await page.waitFor("__sss.S.captures.some((c) => c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "live" });
 }
 
-/** Click Watch (the play_arrow icon button, any language) on the first idle stream tile of the selected room's stage. */
+/** Click Watch (the play_arrow icon button, any language) on the first idle stream tile of the selected room's stage (a no-op when a watch already runs). */
 export async function watchFirst(page) {
+  // Pick-up with "Automatically watch new streams" on (the default) may have started the watch already: then there is no Watch button to click.
+  if (await page.eval("__sss.S.rooms.some((r) => r.watches.size)")) return;
   await page.waitFor("[...document.querySelectorAll('button')].some((b) => /^play_arrow/.test(b.innerText.trim()))", { timeout: 30000, what: "a Watch button" });
   await page.click({ js: "[...document.querySelectorAll('button')].find((b) => /^play_arrow/.test(b.innerText.trim()))" });
   await page.waitFor("__sss.S.rooms.some((r) => r.watches.size)", { what: "watch started" });

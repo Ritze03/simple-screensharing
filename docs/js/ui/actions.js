@@ -14,6 +14,8 @@ export const A = {
   copyDirectLink() {},
   /** Leave a room: confirm modal when something would be lost, else at once. */
   leaveRoom() {},
+  pickUpRoom() {},
+  hangUpRoom() {},
   openModal() {},
   doPopOut() {},
   doFullscreen() {},

@@ -425,6 +425,8 @@ select.field { cursor: pointer; padding-right: 6px; }
 .cb.sel { color: var(--accent-lighter); background: var(--accent-chip-bg); }
 .cb.leave { background: var(--danger); color: var(--primary-text); min-width: 64px; height: calc(var(--stage-btn-h) + 10px); border-radius: 12px; } /* = a .cgroup: button + 2x4px padding + 2x1px border */
 .cb.leave:hover { filter: brightness(1.1); background: var(--danger); }
+.cb.pickup { background: var(--success); color: var(--primary-text); min-width: 64px; height: calc(var(--stage-btn-h) + 10px); border-radius: 12px; } /* the green twin of .leave, left of it */
+.cb.pickup:hover:not(:disabled) { filter: brightness(1.1); background: var(--success); }
 .cb .lbl2 { font-size: 12px; font-weight: 700; }
 .splitb { display: flex; border-radius: 9px; }
 .splitb > .cb:first-child:not(:last-child) { border-radius: 9px 0 0 9px; padding-right: 6px; }

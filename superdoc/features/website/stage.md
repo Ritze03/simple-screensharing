@@ -28,7 +28,7 @@ reconnecting, not connected) keeps the scrolling body with its banner and a `⋯
 | `stage-state.js` | what a view shows (`collect`) and the per-view layout (`vg`: order, z, floating rects, grid; UI-private, per session, not persisted), keyed by `stableKey`. The Layout switches (layout Split / Crop / Float per view, Webcam in picture per view, Hide own, Always show names, Show stats) are different: they live in `S.stage` and are saved (`store.js` `persistStage` into `settings.stage`, keyed by saved room) |
 | `stage-geom.js` | the pure maths, a line-for-line port of native `stage/geom.rs` (`gridCounts`, `place`, `dragBar`, `fitFloat`, `resizeFloat`, `cardKeeps`), same tests |
 | `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs`, same tests |
-| `bar.js` | the control bar (split buttons, groups, Leave, pop out, fullscreen) |
+| `bar.js` | the control bar (split buttons, groups, Pick up / Leave call / Disconnect, pop out, fullscreen; out of the call only Pick up, Disconnect and the Room menu, see `pick-up.md`) |
 | `menus.js` | every dropdown and context menu: Share, Audio, Layout, Room, the stream menu, the avatar picker, "Also send to / Move to", and the dropdown *field* (`selectField`) |
 | `actions.js` | the hooks app.js hands the stage modules (they cannot import it: app.js imports them) |
 
@@ -116,7 +116,7 @@ button (a PiP window cannot go fullscreen) and its pop-out button brings the sta
 **Right click on a sidebar room row** (2026-11-05): `app.js` `oncontextmenu` on the `roomRow` (`dom.js`) calls `openMenu("room", row, { roomId, pos })` after `preventDefault()`: the Room settings menu (`menus.js` `roomMenu`, reads `S.menu.roomId`) opens at the pointer for that room, whichever is open, also while disconnected; `stage.mjs` covers it. *Why:* user, "on desktop, make sure that right clicking a room in the left view opens the same context menu, as the bottom button bar has".
 
 **Control bar.** Share screen, Share audio, Webcam, Layout and Room settings are split buttons (the Level loudness button, `#btn-level`, sits left of the people button in the second group) with an always-visible arrow cut off by a separator line (inset 1 px
-`box-shadow`); grouped buttons sit on a backdrop (`--stage-btn`), the freestanding ones (hide sidebar, Copy invite link, pop out, fullscreen) have none; Leave is 64x50,
+`box-shadow`); grouped buttons sit on a backdrop (`--stage-btn`), the freestanding ones (hide sidebar, Copy invite link, pop out, fullscreen) have none; Leave (the red button; "Leave call" in the call, "Disconnect" outside it, with the green Pick up left of it, `features/website/pick-up.md`) is 64x50,
 as tall as a group (4 px padding + 40 px button + 1 px border each side); the people button shows and hides the strip. Narrow stages degrade by container queries on `.stg`
 (label first, then two rows). **Share audio**: while a screen share has audio riding along with the picked screen, the button is the mute switch (enabled only when the
 source has audio) and the arrow opens the same one-source menu with its meter; otherwise a click starts an audio-only share (see "Webcam, audio-only shares and webcam in picture", `docs/js/ui/bar.js`). *Where I9 and I10 plug in:* `bar.js` builds the three split buttons of the first group

@@ -13,6 +13,7 @@ sound, like native. The four sounds (someone joins / leaves one of my streams, s
   harness replaces `SoundOut.play` and only looks at what would play). Volume 0 plays nothing and creates nothing.
 - **An event sound before the page has had a click or key press is dropped** (`navigator.userActivation.hasBeenActive`): browsers block audio until then, and a sound
   that arrives late would be wrong. A Test button is a gesture, so it may resume a blocked context.
+- A room that is **not in the call** (`RoomEntry.inCall`, `pick-up.md`) plays no sounds, and pick-up takes what is listed then as the baseline, so there is no burst at pick-up.
 - A room that just resumed from a dropped connection is quiet for 15 s (`RESUME_QUIET_MS`: a restarted relay has everybody re-announce); the same sound is not
   started twice within a second (`MIN_GAP_MS`).
 

@@ -139,6 +139,7 @@ const encCfg = (d) => ({ fps: d.fps, codec: d.codec, preset: d.preset, ...encode
  * Resolves the staged capture, or null when the user cancelled the picker.
  */
 export async function stage(room) {
+  if (!room.inCall) return null;
   const def = S.settings.stream;
   const c = {
     id: seq++, kind: "screen", state: "picking", stagedRoom: room.id, stream: null, video: null, audio: null, label: "", audioMuted: false,
@@ -253,7 +254,7 @@ function endCapture(c) {
 }
 
 async function startDest(c, room, cfg, { state = "starting" } = {}) {
-  if (!room.client || room.state !== "joined") throw new Error(t("ui.err.not_connected"));
+  if (!room.client || room.state !== "joined" || !room.inCall) throw new Error(t("ui.err.not_connected")); // not in the call: look-only, no share (native `apply.rs` guard)
   const audioOnly = c.kind === "audio";
   const clones = audioOnly ? [] : [c.video.clone()];
   if (c.audio) clones.push(c.audio.clone());
@@ -571,6 +572,7 @@ const webcamCfg = (cam) => {
 
 /** Start the webcam in `room` (the saved camera in its saved mode); live in another room it MOVES here. Resolves the capture, or null (refused, failed). */
 export async function startWebcam(room) {
+  if (!room.inCall) return null;
   const live = webcamCap();
   if (live && live.dests.has(room.id)) return live;
   if (live && live.state === "live") {
@@ -657,6 +659,7 @@ export async function applyWebcamSettings() {
 
 /** Pick a tab or system audio for `room` (needs the click's user gesture) and share just the audio. Resolves the capture, or null (cancelled, no audio, failed). */
 export async function startAudio(room) {
+  if (!room.inCall) return null;
   if (audioInRoom(room.id)) return null;
   const c = {
     id: seq++, kind: "audio", state: "picking", stagedRoom: room.id, stream: null, video: null, audio: null, label: "", audioMuted: false, surface: "",

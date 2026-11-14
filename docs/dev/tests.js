@@ -17,7 +17,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { panPos, previewAllowed, autoWatchKeys, joinWatchKeys, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
+import { panPos, previewAllowed, autoWatchKeys, pickUpWatchKeys, shareTargets, inCallAfterConnect, pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { noteInput, originHost, shownIn, ORIGIN_WINDOW_MS } from "../js/ui/origin.js";
@@ -2628,16 +2628,36 @@ test("autoWatchKeys: only a new video stream of someone else, once joined (the f
   eq(autoWatchKeys({ ...base, known: new Set([screen.key]) }), [cam.key], "already in the last list");
 });
 
-test("joinWatchKeys: the first join watches the webcams already on, not screens, not your own; a reconnect or option off nothing", () => {
+test("pickUpWatchKeys: pick-up watches every video stream of others (screens and webcams), not your own, no audio-only; option off nothing", () => {
   const screen = { key: "a|video|", kind: "video", self: false, label: "" };
   const cam = { key: "a|video|Webcam", kind: "video", self: false, label: "Webcam" };
   const mine = { key: "me|video|Webcam", kind: "video", self: true, label: "Webcam" };
   const audio = { key: "a|audio|", kind: "audio", self: false, label: "" };
-  const base = { enabled: true, first: true, streams: [screen, cam, mine, audio], watching: new Map() };
-  eq(joinWatchKeys(base), [cam.key], "join list with a webcam and a screen: only the webcam");
-  eq(joinWatchKeys({ ...base, first: false }), [], "reconnect: nothing");
-  eq(joinWatchKeys({ ...base, enabled: false }), [], "option off");
-  eq(joinWatchKeys({ ...base, watching: new Map([[cam.key, {}]]) }), [], "already watched");
+  const base = { enabled: true, streams: [screen, cam, mine, audio], watching: new Map() };
+  eq(pickUpWatchKeys(base), [screen.key, cam.key], "screen and webcam, not mine, not audio-only");
+  eq(pickUpWatchKeys({ ...base, enabled: false }), [], "option off: listed with Watch buttons, nothing watched");
+  eq(pickUpWatchKeys({ ...base, watching: new Map([[cam.key, {}]]) }), [screen.key], "already watched is skipped");
+});
+
+test("shareTargets: only connected rooms that are in the call, never the room itself", () => {
+  const room = (id, state, inCall) => ({ id, state, inCall });
+  const rooms = [room("a", "joined", true), room("b", "joined", false), room("c", "joined", true), room("d", "reconnecting", true), room("e", "disconnected", false)];
+  eq(shareTargets(rooms, "a").map((r) => r.id), ["c"], "b is look-only, d and e are not connected");
+});
+
+test("inCallAfterConnect: a fresh connect starts out of the call, a reconnect keeps the state it had", () => {
+  eq(inCallAfterConnect({ was: true, reconnected: false }), false, "fresh connect (auto or manual)");
+  eq(inCallAfterConnect({ was: false, reconnected: false }), false);
+  eq(inCallAfterConnect({ was: true, reconnected: true }), true, "reconnect in the call stays in it");
+  eq(inCallAfterConnect({ was: false, reconnected: true }), false, "reconnect out of the call stays out");
+});
+
+test("RoomSounds: pick-up baseline makes the streams already there silent, a later new one sounds", () => {
+  const r = new RoomSounds();
+  r.streams(["x", "y"], false); // not in the call / pick-up baseline: no start sound, whatever arrives
+  eq(r.drain(Date.now()), [], "nothing at pick-up");
+  r.streams(["x", "y", "z"], true);
+  eq(r.drain(Date.now()), ["start"], "a stream that appears in the call");
 });
 
 test("previewAllowed: focus gates a screen preview only while Hide when unfocused is on; a webcam and a visible page stay", () => {
