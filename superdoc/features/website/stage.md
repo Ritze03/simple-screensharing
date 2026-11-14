@@ -78,7 +78,9 @@ blank a preview you want to keep watching, and a webcam should never vanish. Det
   audio, numbers and state. **The card is kept open by pointer geometry** (`cardKeeps`: the card, the avatar and the gap straight above it, 3 px grown), not by the
   replica's `::after` bridge under the card: a card is wider than a person's cell, so a bridge or the union of card and avatar covered the neighbours' avatars
   and cards stacked (the native bug of D1). A popped-out stream is off the stage, shows only on its owner's avatar (dashed outline + badge) and comes back from the
-  avatar or the card's "Bring back".
+  avatar or the card's "Bring back". `Why` the window's `mouseleave` closes the card only when the last pointer event was not a finger (`lastTouch` in `bindWindow`;
+  2026-11-14): a touch-opened card has no hover to lose, but the browser's compat mouse events (a mouse position left outside the viewport after a rotation)
+  fired a `mouseleave` on `<html>` right after the tap and closed the card at once on a landscape phone.
 - *Dropdowns:* every dropdown is the app's `.menu` (icons, sub-lines, a lit current row), no native `<select>` anywhere; a dropdown field opens under itself, as wide as it.
   Escape with a menu open closes the menu alone (stage.js handles the key in the capture phase and stops it, so the modal under a dropdown stays). A menu closes on any
   click outside it, and a second click on the control that opened it closes it too (`data-mk` pairs menu and opener). *Why click and not mousedown:* closing on mousedown

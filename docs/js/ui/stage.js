@@ -648,6 +648,9 @@ function onFullscreenChange() {
 /* ============================== window listeners ============================== */
 
 const bound = new WeakSet();
+/** Whether the last pointer event was a finger. Why: a touch-opened card has no hover to lose, but the browser's compat mouse events (a mouse position left outside the
+ *  viewport after a resize or rotation) can fire a `mouseleave` on the root right after the tap, which closed the card at once on a landscape phone. */
+let lastTouch = false;
 /** Attach the stage's document-level listeners to a window (the main one at boot, the pop-out window when it opens). */
 export function bindWindow(win, hostId) {
   if (bound.has(win)) return;
@@ -658,6 +661,7 @@ export function bindWindow(win, hostId) {
   win.addEventListener("keydown", note, true);
   const mv = (e) => {
     pointerInside = true;
+    lastTouch = e.pointerType === "touch";
     if (!pipPointerMove(e)) dragMove(e);
     cardPointer(e, host);
     vpopPointer(e, host);
@@ -670,6 +674,7 @@ export function bindWindow(win, hostId) {
   win.addEventListener("pointerup", up);
   // Touch has no hover: a tap on a person opens their card (and a tap elsewhere closes it), a tap on the viewers chip opens its list.
   win.addEventListener("pointerdown", (e) => {
+    lastTouch = e.pointerType !== "mouse";
     if (e.pointerType === "mouse") return;
     cardPointer(e, host);
     vpopPointer(e, host);
@@ -679,7 +684,7 @@ export function bindWindow(win, hostId) {
   win.addEventListener("wheel", () => S.stage.fullscreen && hostId === "main" && chromeSync(true), { passive: true, capture: true });
   win.document.documentElement.addEventListener("mouseleave", () => {
     pointerInside = false;
-    if (S.card) {
+    if (S.card && !lastTouch) {
       S.card = null;
       A.render();
     }
