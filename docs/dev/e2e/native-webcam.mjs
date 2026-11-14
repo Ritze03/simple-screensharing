@@ -47,7 +47,9 @@ try {
   await P.screenshot(OUT + "native_cam_tiles.png");
   await P.click("#btn-layout");
   await P.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
-  await P.click({ js: "[...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText))" });
+  // Webcam in picture is on by default (#131): click it only when the menu shows it off, so the checkbox ends up on either way.
+  const pipRow = "[...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText))";
+  if (!(await P.eval(`${pipRow}.getAttribute('aria-checked') === 'true'`))) await P.click({ js: pipRow });
   await P.key("Escape");
   await sleep(500);
   const pip = await P.eval("(() => { const e = document.querySelector('.arena > .st-tile > .pip'); if (!e) return null; const r = e.getBoundingClientRect(), t = e.parentElement.getBoundingClientRect(); return { parent: e.parentElement.dataset.id, id: e.dataset.id, inside: r.x >= t.x - 1 && r.y >= t.y - 1 && r.right <= t.right + 1 && r.bottom <= t.bottom + 1 }; })()");
