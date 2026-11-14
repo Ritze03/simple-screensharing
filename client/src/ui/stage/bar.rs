@@ -404,7 +404,7 @@ impl Bar {
         let (tone, icon, tip, enabled) = match webcam::unavailable() {
             Some(webcam::Unavailable::Platform) => (Tone::Off, "videocam_off", tr("ui.bar.webcam_platform", "Webcam sharing is not available on this system yet"), false),
             Some(webcam::Unavailable::NoPlugin) => (Tone::Off, "videocam_off", tr("ui.bar.webcam_no_plugin", "Webcam sharing needs GStreamer's video4linux2 plugin (v4l2src), which is not installed"), false),
-            None if live_here => (Tone::On, "videocam", with_camera("ui.bar.stop_webcam_tip", "Stop sharing your webcam (%{camera})"), true),
+            None if live_here => (Tone::On, "videocam", with_camera("ui.bar.stop_webcam_tip", "Stop sharing your webcam in this room (%{camera})"), true),
             None if cx.state.webcams.is_empty() => {
                 let looking = !cx.state.webcams_requested || cx.state.webcams_listing();
                 (Tone::Off, "videocam_off", if looking { tr("ui.bar.webcam_looking", "Looking for cameras…") } else { tr("ui.bar.webcam_none", "No camera found") }, false)

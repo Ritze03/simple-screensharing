@@ -4110,7 +4110,15 @@ impl AppState {
     pub fn stop_webcam_in(&mut self, room: RoomHandle) {
         self.webcam_start_after_stop.retain(|r| *r != room);
         self.webcam_join_when_active.retain(|r| *r != room);
-        if let Some((_, destination_id)) = self.webcam_in(room) {
+        if let Some((capture_id, destination_id)) = self.webcam_in(room) {
+            // The capture goes with its last destination: rooms still waiting to join it start a fresh one.
+            if self.captures.get(&capture_id).is_some_and(|c| c.destinations.len() <= 1) {
+                for r in std::mem::take(&mut self.webcam_join_when_active) {
+                    if !self.webcam_start_after_stop.contains(&r) {
+                        self.webcam_start_after_stop.push(r);
+                    }
+                }
+            }
             self.stop_destination(destination_id);
         }
     }
@@ -4129,10 +4137,14 @@ impl AppState {
     /// while the capture was `Starting` get their destination once it is running. Rooms that left the call
     /// meanwhile are dropped. Called from `poll_capture_states`.
     fn poll_webcam_start(&mut self) {
-        let rooms = &self.rooms;
-        let valid = |r: &RoomHandle| rooms.get(r).is_some_and(|r| r.in_call);
-        self.webcam_start_after_stop.retain(valid);
-        self.webcam_join_when_active.retain(valid);
+        let in_call: std::collections::HashSet<RoomHandle> = self.rooms.iter().filter(|(_, r)| r.in_call).map(|(h, _)| *h).collect();
+        self.poll_webcam_queue(&in_call);
+    }
+
+    /// [`Self::poll_webcam_start`] with the set of in-call rooms given (so the queue logic is testable without rooms).
+    fn poll_webcam_queue(&mut self, in_call: &std::collections::HashSet<RoomHandle>) {
+        self.webcam_start_after_stop.retain(|r| in_call.contains(r));
+        self.webcam_join_when_active.retain(|r| in_call.contains(r));
         match self.webcam_capture() {
             Some(id) => {
                 let active = self.captures.get(&id).is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))));
@@ -4227,7 +4239,13 @@ impl AppState {
         let Some(capture_id) = self.webcam_capture() else { return };
         if old.camera != new.camera || old.mode != new.mode {
             // A different capture: restart it in every room it was on in.
-            let rooms = self.webcam_rooms();
+            // Rooms still waiting to join or to start restart too, in order, without duplicates.
+            let mut rooms = self.webcam_rooms();
+            for r in self.webcam_join_when_active.iter().chain(&self.webcam_start_after_stop) {
+                if !rooms.contains(r) {
+                    rooms.push(*r);
+                }
+            }
             self.stop_webcam();
             for room in rooms {
                 if let Err(e) = self.start_webcam(room) {
@@ -8179,6 +8197,64 @@ mod webcam_fan_out_tests {
         state.stop_webcam();
         assert!(state.webcam_rooms().is_empty());
         state.stop_all_captures_fire_and_forget();
+    }
+
+    /// The queue logic needs no rooms: `poll_webcam_queue` takes the in-call set.
+    #[tokio::test]
+    async fn webcam_queues_wait_prune_cancel_and_survive_a_per_room_stop() {
+        use std::collections::HashSet;
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (a, b, c) = (RoomHandle(0), RoomHandle(1), RoomHandle(2));
+        let all: HashSet<RoomHandle> = [a, b, c].into();
+        let webcam = |state: &mut AppState, status, rooms: &[RoomHandle]| {
+            let id = state.alloc_capture_id();
+            let params = video_params();
+            let destinations = rooms
+                .iter()
+                .map(|r| {
+                    let d = state.alloc_destination_id();
+                    (d, Destination { room: *r, stream_id: 0, params, runtime: None, pending: None, edit: Destination::edit_from(params), apply_rx: None })
+                })
+                .collect();
+            state.captures.insert(id, LocalCapture { kind: StreamKind::Video, label: capture::webcam::LABEL.to_string(), status, audio_for_capture: None, destinations });
+            id
+        };
+
+        // Queued rooms wait while the old capture is Stopping; a room that left the call is pruned.
+        let (_tx, rx) = oneshot::channel();
+        let old = webcam(&mut state, ShareStatus::Stopping(rx), &[]);
+        state.webcam_start_after_stop = vec![a, b, c];
+        state.poll_webcam_queue(&all);
+        assert_eq!(state.webcam_start_after_stop, vec![a, b, c], "still queued while Stopping");
+        state.poll_webcam_queue(&[a, c].into());
+        assert_eq!(state.webcam_start_after_stop, vec![a, c], "a room that left the call is pruned");
+
+        // A per-room stop cancels one queued room; stop_webcam clears everything.
+        state.stop_webcam_in(a);
+        assert_eq!(state.webcam_start_after_stop, vec![c]);
+        state.webcam_join_when_active = vec![b];
+        state.stop_webcam();
+        assert!(state.webcam_start_after_stop.is_empty() && state.webcam_join_when_active.is_empty());
+        state.captures.shift_remove(&old);
+
+        // 1b: the only destination stopped while B and C wait to join: they start a fresh capture afterwards.
+        let (_tx, rx) = oneshot::channel();
+        webcam(&mut state, ShareStatus::Starting(rx), &[a]);
+        state.webcam_join_when_active = vec![b, c];
+        state.stop_webcam_in(a);
+        assert!(state.webcam_join_when_active.is_empty());
+        assert_eq!(state.webcam_start_after_stop, vec![b, c], "joiners wait for a fresh start");
+
+        // A capture that is not the last destination's keeps its joiners.
+        state.webcam_start_after_stop.clear();
+        state.captures.clear();
+        let (_tx, rx) = oneshot::channel();
+        webcam(&mut state, ShareStatus::Starting(rx), &[a, b]);
+        state.webcam_join_when_active = vec![c];
+        state.stop_webcam_in(a);
+        assert_eq!(state.webcam_join_when_active, vec![c]);
+        assert!(state.webcam_start_after_stop.is_empty());
     }
 
     async fn wait_until(state: &mut AppState, done: impl Fn(&AppState) -> bool) {
