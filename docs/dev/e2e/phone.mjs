@@ -24,7 +24,7 @@ const section = (s) => console.log(`\n== ${s}`);
 
 const site = await L.serveSite(0);
 const A = await L.openApp(site.url, { name: "Alice" });
-const PH = await L.openApp(site.url, { name: "Pia", flags: ["--use-fake-device-for-media-stream"], viewport: [390, 844] });
+const PH = await L.openApp(site.url, { name: "Pia", settings: { autoWatch: false }, flags: ["--use-fake-device-for-media-stream"], viewport: [390, 844] });
 const P = PH.page;
 let sizeName = "";
 const shot = (n) => P.screenshot(`${OUT}${PFX}${n}_${sizeName}.png`);

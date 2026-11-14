@@ -40,11 +40,16 @@ whole stage code already reads `state`.
 
 The CSS is `.cb.pickup` (green, 64x50, the twin of `.cb.leave`) in `docs/css/app.css`. Icons `call` and `logout` are ligatures of the bundled Material Symbols font, like `call_end`.
 New i18n keys (en + de, wording copied from native): `ui.bar.hang_up`, `ui.bar.hang_up_item`, `ui.bar.pick_up`, `ui.bar.pick_up_item`, `ui.bar.disconnect_room`, `ui.room.in_call`,
-`ui.modal.hang_up_title|_body|_ok`; changed: `ui.modal.leave_title|leave_room` and `ui.bar.leave_room_item` now say "Disconnect"; `ui.bar.leave_room` is gone.
+`ui.modal.hang_up_title|_body|_ok`; changed: `ui.modal.leave_title|leave_room` and `ui.bar.leave_room_item` is renamed `ui.bar.disconnect_item` (en "Disconnect", de "Verbindung trennen", as native); `ui.bar.leave_room` is gone.
 
 ## Differences from native
 
-None in behaviour. The browser has no reconnect state object: the flag lives on the `RoomEntry`, which survives a reconnect anyway.
+- **Sound edges at pick-up**: native `session.rs:pick_up` discards pending sound edges (`RoomSounds::drain_for`); the browser only re-bases the stream key set (`RoomSounds.streams(.., false)`).
+  Equivalent today: a room out of the call has none of my shares, so no viewer edges exist, and the stream edges are not recorded while out of the call.
+- **Red button while Connecting / Reconnecting**: native shows the stage there and the red button is Cancel; the browser has no stage in those states, so the Room menu / sidebar act instead.
+  The side buttons stay in both.
+- **Reconnect state**: the browser has no reconnect state object; the flag lives on the `RoomEntry`, which survives a reconnect. A fresh `connectRoom` clears `resume` (native drops it
+  with the session), so a stale resume cannot re-watch without a click after pick-up with the option off (2026-11-14, QC).
 
 ## Tests
 
@@ -52,4 +57,5 @@ None in behaviour. The browser has no reconnect state object: the flag lives on 
 drives the real UI (video only, a spy where a sound would play): not in the call (people strip, idle tile without Watch, no share button, green and red buttons, nothing watched, hidden strip
 shown), pick-up watches and decodes with no sound, hang-up with confirm keeps the room and the person in the sharer's strip, red outside the call disconnects without confirm, manual
 Connect starts out of the call, option off lists with a Watch button, with the restart option a reconnect keeps both states, the sharer's hang-up stops her share. `dev/e2e-lib.mjs:waitJoined`
-presses pick-up by default (`pickUp: false` opts out), so the other e2e scripts keep their "joined and watching" meaning.
+presses pick-up by default (`pickUp: false` opts out). With auto-watch on that watches everything at once, so scripts that click Watch on idle tiles (`stage.mjs`, `native-webcam.mjs`, `phone.mjs`) open
+their viewer with `settings: { autoWatch: false }`. `pickup.mjs` also covers sounds: out of the call a stop and restart of the share records nothing in the `SoundOut.play` spy, in the call it records `stop` and `start`.

@@ -72,6 +72,18 @@ try {
   await q(B, `(() => { __sss.S.stage.stripHidden = false; })()`);
   await B.page.screenshot(OUT + PFX + "not-in-call.png");
 
+  // ---- sounds while not in the call: Alice stops and restarts her share, Bob hears nothing ----
+  const restartShare = async () => {
+    await A.page.eval(`import(new URL("js/ui/capture.js", location.href).href).then((m) => m.stopAll())`);
+    await A.page.waitFor(`!__sss.S.captures.some((c) => c.state === 'live')`, { timeout: 15000, what: "Alice stopped" });
+    await L.sleep(3000);
+    await L.stubCapture(A.page, { audio: false, fps: 30 });
+    await L.goLive(A.page, { codec: "h264", fps: 30 });
+    await L.sleep(2500);
+  };
+  await restartShare();
+  check((await room(B, `r.streams.some((s) => !s.self && s.kind === "video")`)) && (await played(B)) === "", "not in the call: Alice stops and restarts her share, Bob's sound spy records nothing", await played(B));
+
   // ---- pick up: watches the running stream, no sound burst ----
   await B.page.click("#btn-pickup");
   await B.page.waitFor(`__sss.S.rooms[0].inCall && __sss.S.rooms[0].watches.size === 1 && [...__sss.S.rooms[0].watches.values()].every((w) => w.firstFrame)`, { timeout: 25000, what: "Bob watches after pick-up" });
@@ -79,6 +91,9 @@ try {
   const st = (await L.watchStats(B.page))[0];
   check(st && st.st && st.st.decoded > 0, "frames decode", JSON.stringify(st && st.st && { decoded: st.st.decoded }));
   check((await played(B)) === "", "no notification sound at pick-up", await played(B));
+  // in the call: the same stop / start now sounds (the stop sound and the start sound)
+  await restartShare();
+  check((await played(B)).split(",").includes("stop") && (await played(B)).split(",").includes("start"), "in the call: Alice stops and restarts her share, Bob's spy records the stop and start sounds", await played(B));
   check(!(await has(B, "#btn-pickup")) && (await icon(B, "#btn-leave")) === "call_end" && (await has(B, "#btn-share")), "in the call: red hang-up button, share button back, no pick-up");
   check((await strip(A)).includes("Bob"), "Alice still sees Bob");
   await B.page.screenshot(OUT + PFX + "in-call.png");

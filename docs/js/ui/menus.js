@@ -225,7 +225,7 @@ function roomMenu() {
       : menuItem({ icon: "call", label: t("ui.bar.pick_up_item"), cls: "primary", onclick: done(() => A.pickUpRoom(r)) })] : []),
     r.state === "disconnected"
       ? menuItem({ icon: "login", label: t("ui.room.connect"), onclick: done(() => connectRoom(r)) })
-      : menuItem({ icon: "logout", label: t("ui.bar.leave_room_item"), onclick: done(() => A.leaveRoom(r)) }),
+      : menuItem({ icon: "logout", label: t("ui.bar.disconnect_item"), onclick: done(() => A.leaveRoom(r)) }),
     sep(),
     menuItem({ icon: "delete", label: t("ui.room.forget"), sub: t("ui.popup.forget_sub"), cls: "danger", onclick: done(() => A.openModal({ kind: "forget", room: r.id })) }),
   ];

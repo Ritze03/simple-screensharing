@@ -1,7 +1,7 @@
 // Row 184: modals, menus and toasts raised from the popped-out stage window open IN that window, not in the main page.
 // usage: node popout-modals.mjs <relay cert hash> [port=14433]   (a relay must run: dev/relay.sh; E2E_OUT = screenshot dir)
 // One sharing page (stubbed screen, video only, no audio). The stage pops out (Document PiP; its target gets its own CDP session and real
-// mouse/key input), then End call, the Layout / Room settings / invite menus, the Share modal and a "copied" toast are driven INSIDE the pop-out.
+// mouse/key input), then Hang up, the Layout / Room settings / invite menus, the Share modal and a "copied" toast are driven INSIDE the pop-out.
 import { createRoom, openApp, serveSite, waitJoined, stubCapture, goLiveAuto, sleep } from "../e2e-lib.mjs";
 import { Page } from "../cdp.mjs";
 const [HASH, PORT = "14433"] = process.argv.slice(2);
@@ -35,12 +35,12 @@ try {
   const where = (sel) => P.eval(`({ main: document.querySelectorAll(${JSON.stringify(sel)}).length, pop: __sss.stageWindow() ? __sss.stageWindow().win.document.querySelectorAll(${JSON.stringify(sel)}).length : -1 })`);
   const shot = async (n) => { await P.screenshot(OUT + "popmodal-" + n + "-main.png"); await Q.screenshot(OUT + "popmodal-" + n + "-pop.png"); };
 
-  // 1) End call in the pop-out
+  // 1) Hang up (the red button in the call) in the pop-out
   await Q.click("#btn-leave");
-  await P.waitFor("__sss.S.modal && __sss.S.modal.kind === 'leave'", { what: "leave modal" });
+  await P.waitFor("__sss.S.modal && __sss.S.modal.kind === 'hangup'", { what: "hang-up modal" });
   await sleep(300);
   let w = await where(".scrim .modal");
-  check(w.pop === 1 && w.main === 0, "End call pressed in the pop-out: the confirmation is in the pop-out, not in the main page", JSON.stringify(w));
+  check(w.pop === 1 && w.main === 0, "Hang up pressed in the pop-out: the confirmation is in the pop-out, not in the main page", JSON.stringify(w));
   await shot("1-leave");
   await Q.key("Escape");
   await sleep(300);
@@ -98,10 +98,10 @@ try {
   await P.screenshot(OUT + "popmodal-7-moved-main.png");
   await P.key("Escape");
   await sleep(200);
-  // 7) End call on the main page
+  // 7) Hang up on the main page
   await P.click("#btn-leave");
   await sleep(300);
-  check((await P.eval("document.querySelectorAll('.scrim .modal').length")) === 1 && (await P.eval("__sss.S.modal.hostId")) === "main", "End call on the main page: modal on main");
+  check((await P.eval("document.querySelectorAll('.scrim .modal').length")) === 1 && (await P.eval("__sss.S.modal.hostId")) === "main", "Hang up on the main page: modal on main");
   await P.screenshot(OUT + "popmodal-8-main-leave.png");
   await P.eval("__sss.S.modal = null; __sss.render(); true");
 } catch (e) {

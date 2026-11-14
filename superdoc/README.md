@@ -46,7 +46,7 @@ A page that was split keeps its old name as a hub: the hub lists its pages, and 
   - [Website on a phone](features/website/phone.md): dropouts, decoder failures, supported phones, wake lock.
   - [Webcam, audio-only and picture-in-picture](features/website/webcam-and-audio.md): the browser's webcam and audio-only shares.
   - [Pick up](features/website/pick-up.md): "in the call" vs not (every connect starts out of it), the green Pick up, red Leave call / Disconnect, what is gated, tests.
-  - [Automatically watch new streams](features/website/auto-watch.md): the Playback option (on by default), the rule, why the join snapshot stays unwatched.
+  - [Automatically watch new streams](features/website/auto-watch.md): the Playback option (on by default), the rule, what pick-up watches, why only new streams are watched afterwards.
   - [Viewer features](features/website/viewer-features.md): sounds, emoji avatars, fullscreen, own-tile preview, who watches, above 60 fps.
   - [Join links](features/website/join-links.md): display name and room name in join links.
   - [Browser direct link](features/website/direct-link.md): `site#join=<link>` opens and saves a room; the Copy invite link context menu.

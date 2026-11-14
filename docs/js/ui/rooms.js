@@ -105,6 +105,7 @@ export async function connectRoom(r, { quiet = false } = {}) {
   r.client = client;
   r.state = "connecting";
   r.inCall = false; // a connect (manual or auto) always starts out of the call
+  r.resume = []; // a fresh connect starts clean: a stale resume from a given-up session must not re-watch without a click (native drops it with the session)
   r.error = null;
   r.issue = null;
   wire(r, client);

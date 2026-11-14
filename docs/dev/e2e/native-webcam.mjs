@@ -26,7 +26,7 @@ const check = (c, what, extra = "") => {
 };
 
 const site = await L.serveSite(0);
-const b = await L.openApp(site.url, { name: "browser", flags: ["--use-fake-device-for-media-stream"] });
+const b = await L.openApp(site.url, { name: "browser", settings: { autoWatch: false }, flags: ["--use-fake-device-for-media-stream"] });
 await b.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
 const P = b.page;
 try {
