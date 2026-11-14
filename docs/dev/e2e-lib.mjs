@@ -58,9 +58,12 @@ export async function waitJoined(page, i = 0, timeout = 20000, { pickUp = true }
 /** Pick up room `i`: the real button when the room's stage is showing, else the module call. Resolves once the room is in the call. */
 export async function pickUpRoom(page, i = 0) {
   if (await page.eval(`__sss.S.rooms[${i}].inCall`)) return;
-  if (await page.eval(`!!document.querySelector("#btn-pickup")`)) await page.click("#btn-pickup");
+  const clicked = await page.eval(`!!document.querySelector("#btn-pickup") && __sss.S.selected === __sss.S.rooms[${i}].id`);
+  if (clicked) await page.click("#btn-pickup");
   else await page.eval(`import("${BASE}js/ui/rooms.js").then((m) => m.pickUp(__sss.S.rooms[${i}]))`);
   await page.waitFor(`__sss.S.rooms[${i}].inCall === true`, { what: `room ${i} picked up` });
+  // The bar is redrawn a moment later: wait for it, or a click on the (still disabled) Share button right after would miss.
+  if (clicked) await page.waitFor(`!document.querySelector("#btn-pickup")`, { what: "bar redrawn after pick-up" });
 }
 
 /** The invite link the UI would copy (the stored link with the cert hash, plus the room name as 5th field when it has one). */
