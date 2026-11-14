@@ -355,7 +355,7 @@ fn tile_menu_body(
             }
             let _ = (capture, destination);
             if widgets::pop_item(ui, &PopItem::new("videocam_off", &tr("ui.webcam.stop_item", "Stop webcam")).danger()).clicked() {
-                out.push(UiAction::StopWebcam);
+                out.push(UiAction::StopWebcam(it.id.room));
                 *close = true;
             }
         }

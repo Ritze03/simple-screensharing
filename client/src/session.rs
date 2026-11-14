@@ -1749,7 +1749,9 @@ pub struct AppState {
     pub webcams_requested: bool,
     /// A webcam start that waits for the running or stopping webcam to be gone first (a camera can be opened
     /// once): the room it goes to. Started by [`AppState::poll_capture_states`].
-    webcam_start_after_stop: Option<RoomHandle>,
+    webcam_start_after_stop: Vec<RoomHandle>,
+    /// Rooms to add to the running webcam once its capture is `Active` (it was still `Starting`).
+    webcam_join_when_active: Vec<RoomHandle>,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1990,7 +1992,8 @@ impl Default for AppState {
             webcams: Vec::new(),
             webcams_rx: None,
             webcams_requested: false,
-            webcam_start_after_stop: None,
+            webcam_start_after_stop: Vec::new(),
+            webcam_join_when_active: Vec::new(),
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             recoveries: IndexMap::new(),
@@ -4053,19 +4056,31 @@ impl AppState {
         Some(capture::webcam::Spec { device: cam.device.clone(), mode: cam.modes[m].clone() })
     }
 
-    /// Our running webcam (not one that is stopping) and the room it goes to. At most one: a camera can be
-    /// opened once.
-    pub fn webcam_share(&self) -> Option<(CaptureSourceId, RoomHandle)> {
-        self.captures
-            .iter()
-            .filter(|(_, c)| c.is_webcam() && !matches!(c.status, ShareStatus::Stopping(_)))
-            .find_map(|(id, c)| c.destinations.values().next().map(|d| (*id, d.room)))
+    /// Our running webcam capture (not one that is stopping). At most one: a camera can be opened once, and
+    /// it is sent to every room through that one capture, like a screen share's fan-out.
+    pub fn webcam_capture(&self) -> Option<CaptureSourceId> {
+        self.captures.iter().find(|(_, c)| c.is_webcam() && !matches!(c.status, ShareStatus::Stopping(_))).map(|(id, _)| *id)
     }
 
-    /// Start (or move) the webcam share into `room_handle`: its own capture, no screen share needed (the plan's
-    /// "own room"). Moving it from another room stops the running one first, and any start waits until no
-    /// webcam capture is left, because a camera can only be opened once ([`Self::poll_webcam_start`]).
-    /// `Err` is a message for the user: no `v4l2src`, not Linux, no camera.
+    /// Every room our webcam is on in (a destination exists, even if still `Starting`), in the order they were
+    /// added. Empty when the webcam is off. Rooms still queued behind a stopping capture are not listed yet.
+    pub fn webcam_rooms(&self) -> Vec<RoomHandle> {
+        self.webcam_capture().and_then(|id| self.captures.get(&id)).map(|c| c.destinations.values().map(|d| d.room).collect()).unwrap_or_default()
+    }
+
+    /// The webcam's capture and destination in `room`, if it is on there.
+    pub fn webcam_in(&self, room: RoomHandle) -> Option<(CaptureSourceId, DestinationId)> {
+        let id = self.webcam_capture()?;
+        let dest = self.captures.get(&id)?.destinations.iter().find(|(_, d)| d.room == room).map(|(d, _)| *d)?;
+        Some((id, dest))
+    }
+
+    /// Turn the webcam on in `room_handle` (the room's button, later the ctl's `webcam start`). One camera
+    /// capture feeds every room: a running webcam gets one more destination (no-op when it is already there),
+    /// otherwise a capture is started, and no other room is touched. A start waits until no webcam capture is
+    /// left, because the old pipeline still holds the device while it is `Stopping`
+    /// ([`Self::poll_webcam_start`]), and a room added while the capture is still `Starting` joins once it is
+    /// running. The room must be in the call. `Err` is a message for the user: no `v4l2src`, not Linux, no camera.
     pub fn start_webcam(&mut self, room_handle: RoomHandle) -> Result<(), String> {
         match capture::webcam::unavailable() {
             Some(capture::webcam::Unavailable::Platform) => return Err(t!("errors.webcam_platform").to_string()),
@@ -4075,34 +4090,77 @@ impl AppState {
         if self.webcam_spec().is_none() {
             return Err(t!("errors.webcam_none_found").to_string());
         }
-        if !self.rooms.contains_key(&room_handle) {
+        if !self.rooms.get(&room_handle).is_some_and(|r| r.in_call) {
             return Ok(());
         }
-        if let Some((running, _)) = self.webcam_share() {
-            self.stop_share(running);
+        if self.webcam_in(room_handle).is_some() || self.webcam_join_when_active.contains(&room_handle) || self.webcam_start_after_stop.contains(&room_handle) {
+            return Ok(());
         }
-        self.webcam_start_after_stop = Some(room_handle);
+        if self.webcam_capture().is_some() {
+            self.webcam_join_when_active.push(room_handle);
+        } else {
+            self.webcam_start_after_stop.push(room_handle);
+        }
         self.poll_webcam_start();
         Ok(())
     }
 
-    /// Stop the webcam share, and a start that was waiting.
+    /// Turn the webcam off in `room` only. The last room gone stops the capture (the camera is released). Also
+    /// cancels a start of `room` that was still queued.
+    pub fn stop_webcam_in(&mut self, room: RoomHandle) {
+        self.webcam_start_after_stop.retain(|r| *r != room);
+        self.webcam_join_when_active.retain(|r| *r != room);
+        if let Some((_, destination_id)) = self.webcam_in(room) {
+            self.stop_destination(destination_id);
+        }
+    }
+
+    /// Stop the webcam in every room, and any start that was waiting.
     pub fn stop_webcam(&mut self) {
-        self.webcam_start_after_stop = None;
-        if let Some((running, _)) = self.webcam_share() {
+        self.webcam_start_after_stop.clear();
+        self.webcam_join_when_active.clear();
+        if let Some(running) = self.webcam_capture() {
             self.stop_share(running);
         }
     }
 
-    /// A webcam start that was waiting for the old webcam capture to finish stopping goes ahead once none is left.
+    /// Drive queued webcam starts. Once no webcam capture is left (the old one finished stopping), the queued
+    /// rooms start one capture, the first room as its destination and the rest joining it; rooms that joined
+    /// while the capture was `Starting` get their destination once it is running. Rooms that left the call
+    /// meanwhile are dropped. Called from `poll_capture_states`.
     fn poll_webcam_start(&mut self) {
-        let Some(room) = self.webcam_start_after_stop else { return };
-        if self.captures.values().any(LocalCapture::is_webcam) {
-            return;
-        }
-        self.webcam_start_after_stop = None;
-        if let Some(spec) = self.webcam_spec() {
-            self.start_webcam_now(room, spec);
+        let rooms = &self.rooms;
+        let valid = |r: &RoomHandle| rooms.get(r).is_some_and(|r| r.in_call);
+        self.webcam_start_after_stop.retain(valid);
+        self.webcam_join_when_active.retain(valid);
+        match self.webcam_capture() {
+            Some(id) => {
+                let active = self.captures.get(&id).is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))));
+                let mut queued = std::mem::take(&mut self.webcam_start_after_stop);
+                if !active {
+                    self.webcam_join_when_active.append(&mut queued);
+                    return;
+                }
+                queued.append(&mut self.webcam_join_when_active);
+                for room in queued {
+                    if self.webcam_in(room).is_none() {
+                        self.add_destination(id, room, PendingRole::FanOut);
+                    }
+                }
+            }
+            None => {
+                // Rooms that waited for a capture that then failed to start are dropped.
+                self.webcam_join_when_active.clear();
+                if self.captures.values().any(LocalCapture::is_webcam) || self.webcam_start_after_stop.is_empty() {
+                    return;
+                }
+                let first = self.webcam_start_after_stop.remove(0);
+                self.webcam_join_when_active = std::mem::take(&mut self.webcam_start_after_stop);
+                match self.webcam_spec() {
+                    Some(spec) => self.start_webcam_now(first, spec),
+                    None => self.webcam_join_when_active.clear(),
+                }
+            }
         }
     }
 
@@ -4166,10 +4224,16 @@ impl AppState {
     pub fn set_webcam_settings(&mut self, new: WebcamSettings) {
         let old = std::mem::replace(&mut self.webcam, new.clone());
         save_webcam_settings(&new);
-        let Some((capture_id, room)) = self.webcam_share() else { return };
+        let Some(capture_id) = self.webcam_capture() else { return };
         if old.camera != new.camera || old.mode != new.mode {
-            if let Err(e) = self.start_webcam(room) {
-                note_share_error(&mut self.share_error, e);
+            // A different capture: restart it in every room it was on in.
+            let rooms = self.webcam_rooms();
+            self.stop_webcam();
+            for room in rooms {
+                if let Err(e) = self.start_webcam(room) {
+                    note_share_error(&mut self.share_error, e);
+                    break;
+                }
             }
             return;
         }
@@ -6767,11 +6831,11 @@ mod ui_ops_tests {
         c.label = capture::webcam::LABEL.to_string();
         assert!(c.is_webcam());
         assert_eq!(c.wire_label(), "Webcam");
-        assert_eq!(state.webcam_share(), Some((capture_id, RoomHandle(0))));
+        assert_eq!(state.webcam_rooms(), vec![RoomHandle(0)]);
         // A stopping one is gone for the UI.
         let (_tx, rx) = oneshot::channel();
         state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Stopping(rx);
-        assert_eq!(state.webcam_share(), None);
+        assert!(state.webcam_rooms().is_empty());
     }
 
     /// A webcam brings no audio along: watching only the camera must not subscribe to the sender's audio, and the
@@ -7992,5 +8056,143 @@ mod reconnect_e2e {
             client.leave_and_close().await;
         }
         drop(relay);
+    }
+}
+
+/// Row 205: the webcam is one camera capture sent to several rooms, like a screen share's fan-out. Real relay and
+/// a real `videotestsrc` capture labelled `Webcam` (as `start_webcam_now` builds one, minus the camera device).
+#[cfg(test)]
+mod webcam_fan_out_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+
+    #[tokio::test]
+    #[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
+                run with `cargo test -p simple-screensharing-client --lib -- --ignored webcam_fan_out_tests`"]
+    async fn a_webcam_is_one_capture_with_a_destination_per_room() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        if capture::webcam::unavailable().is_some() {
+            eprintln!("skipped: no v4l2src here (start_webcam refuses before it queues anything)");
+            return;
+        }
+        let port = pick_free_udp_port().expect("a free UDP port");
+        let _server = spawn_relay_server(port).expect("the relay");
+        let server_addr = format!("127.0.0.1:{port}");
+
+        let mut state = AppState::default();
+        let mode = capture::webcam::Mode { format: "MJPG".into(), width: 320, height: 240, fps_num: 30, fps_den: 1 };
+        state.webcams = vec![capture::webcam::Camera { name: "Test camera".into(), device: "fake:ball".into(), modes: vec![mode] }];
+        let mut rooms = Vec::new();
+        let mut clients = Vec::new();
+        for name in ["cam-a", "cam-b"] {
+            let join = state.create_room(&server_addr, name).expect("create_room").join_string;
+            let (client, snapshot, events) = connect_with_retry(&join, name).await.expect("connect");
+            clients.push(client.clone());
+            let handle = state.insert_room(client, snapshot, events, join);
+            state.rooms.get_mut(&handle).unwrap().in_call = true;
+            rooms.push(handle);
+        }
+        let (room_a, room_b) = (rooms[0], rooms[1]);
+
+        // The webcam running in room A: what `start_webcam_now` + `poll_capture_states` leave behind.
+        let capture_id = state.alloc_capture_id();
+        let destination_a = state.alloc_destination_id();
+        assert_eq!(destination_a, DestinationId(0), "the test source's DestKey(0) is the first destination");
+        let stream_id = {
+            let room = state.rooms.get_mut(&room_a).unwrap();
+            let id = room.next_stream_id;
+            room.next_stream_id += 1;
+            room.destinations.push(destination_a);
+            id
+        };
+        let fragment = "videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240,framerate=30/1";
+        let handle = capture::start_sharing_from_test_source(&clients[0], stream_id, 1_000, 30, fragment).await.expect("test capture");
+        let runtime = handle.destination_runtime(DestKey(destination_a.0));
+        let params = runtime.as_ref().unwrap().lock().unwrap().params();
+        state.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: capture::webcam::LABEL.to_string(),
+                status: ShareStatus::Active(ShareHandle::Video(handle)),
+                audio_for_capture: None,
+                destinations: IndexMap::from([(
+                    destination_a,
+                    Destination { room: room_a, stream_id, params, runtime, pending: None, edit: Destination::edit_from(params), apply_rx: None },
+                )]),
+            },
+        );
+        assert_eq!(state.webcam_rooms(), vec![room_a]);
+
+        // Room B: one more destination of the SAME capture (the camera is opened once), room A untouched.
+        state.start_webcam(room_b).expect("start in B");
+        state.start_webcam(room_b).expect("a second start in B is a no-op");
+        wait_until(&mut state, |s| s.pending_destinations.is_empty() && s.captures.values().filter(|c| c.is_webcam()).all(|c| c.destinations.len() == 2)).await;
+        assert!(state.share_error.is_none(), "{:?}", state.share_error);
+        assert_eq!(state.captures.values().filter(|c| c.is_webcam()).count(), 1, "one capture");
+        assert_eq!(state.webcam_rooms(), vec![room_a, room_b]);
+        assert_eq!(state.webcam_in(room_b).map(|(c, _)| c), Some(capture_id));
+        assert_eq!(state.captures[&capture_id].destinations.len(), 2, "no duplicate for the repeated start");
+
+        // Stopping in A leaves B on air.
+        state.stop_webcam_in(room_a);
+        assert_eq!(state.webcam_rooms(), vec![room_b]);
+        assert!(state.webcam_in(room_a).is_none() && state.webcam_in(room_b).is_some());
+        assert!(matches!(state.captures[&capture_id].status, ShareStatus::Active(_)), "the camera is still running");
+
+        // Back into A, then hanging up A takes only A away.
+        state.start_webcam(room_a).expect("start in A again");
+        wait_until(&mut state, |s| s.pending_destinations.is_empty() && s.webcam_rooms().len() == 2).await;
+        state.hang_up(room_a);
+        assert_eq!(state.webcam_rooms(), vec![room_b], "hang-up removes only that room's destination");
+
+        // The last room gone stops the capture.
+        state.stop_webcam_in(room_b);
+        assert!(state.webcam_capture().is_none(), "no running webcam is left");
+        assert!(state.webcam_rooms().is_empty());
+
+        // `stop_webcam` ends it everywhere.
+        let (capture2, dest2) = {
+            let id = state.alloc_capture_id();
+            let d = state.alloc_destination_id();
+            (id, d)
+        };
+        let params2 = state.captures[&capture_id].destinations.values().next().map(|d| d.params).unwrap_or(params);
+        let (_tx, rx) = oneshot::channel();
+        state.captures.insert(
+            capture2,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: capture::webcam::LABEL.to_string(),
+                status: ShareStatus::Starting(rx),
+                audio_for_capture: None,
+                destinations: IndexMap::from([
+                    (dest2, Destination { room: room_a, stream_id: 7, params: params2, runtime: None, pending: None, edit: Destination::edit_from(params2), apply_rx: None }),
+                    (DestinationId(dest2.0 + 1), Destination { room: room_b, stream_id: 8, params: params2, runtime: None, pending: None, edit: Destination::edit_from(params2), apply_rx: None }),
+                ]),
+            },
+        );
+        assert_eq!(state.webcam_rooms(), vec![room_a, room_b]);
+        state.stop_webcam();
+        assert!(state.webcam_rooms().is_empty());
+        state.stop_all_captures_fire_and_forget();
+    }
+
+    async fn wait_until(state: &mut AppState, done: impl Fn(&AppState) -> bool) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            state.drain_events(&ctx);
+            state.poll_capture_states();
+            state.poll_pending_destinations();
+            if done(state) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition not met within 20 s");
     }
 }

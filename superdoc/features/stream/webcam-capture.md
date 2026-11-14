@@ -9,7 +9,7 @@ Part of the Stream Control reference, hub: `superdoc/features/stream-control.md`
 A native webcam share is **its own capture**, not a mode of the screen share: a second `LocalCapture` next to the
 screen (or alone, a screen share is not needed), with its own destinations and its own bar button. Code: the inline
 `capture::webcam` module (listing, modes, the source fragment, pure and tested), `CaptureSource::Webcam`,
-`capture::start_webcam_sharing`; `AppState::start_webcam` / `stop_webcam` / `set_webcam_settings` /
+`capture::start_webcam_sharing`; `AppState::start_webcam` / `stop_webcam_in` / `stop_webcam` / `set_webcam_settings` /
 `refresh_webcams` and `AppSettings::webcam` (`rooms::WebcamSettings`) on the session side; the UI is
 `ui/webcam_settings.rs`, `share::webcam_menu`, `stage/pip.rs` (`superdoc/ui/STAGE.md` "Webcam and webcam in picture").
 
@@ -58,11 +58,24 @@ screen (or alone, a screen share is not needed), with its own destinations and i
   `owner_has_video` ignores webcams, so a sender with only a webcam and an audio share has that audio as an audio-only
   share with its own Listen button. *Why:* the sound belongs to the screen; a viewer who only watches the camera
   would otherwise get the desktop audio switched on with no control for it on the picture they watch.
-- **One webcam at a time** (a camera opens once): `start_webcam` into another room stops the running one first and
-  starts when no webcam capture is left (`webcam_start_after_stop`, `poll_webcam_start` runs in `poll_capture_states`),
-  because the old pipeline still holds the device while it is `Stopping`. The same path restarts a webcam after a
-  camera or mode change in the modal (a different capture); a codec or bitrate change is a live `edit_destination`.
-  A room's reconnect keeps the capture and re-adds its destination like a screen's (`SuspendedShare::Video`).
+- **One camera capture, one destination per room (2026-11-14, row 205, user decisions D12, D15).** The webcam is sent to
+  several rooms like a screen share's fan-out: `AppState::start_webcam(room)` adds a destination (`add_destination`,
+  params copied from the first destination, so the webcam's fixed encoder and the mode's rate carry over) to the
+  running capture, or starts the capture when none runs; `stop_webcam_in(room)` removes just that room (the last one
+  stops the capture and releases the camera); `stop_webcam()` ends it everywhere; `webcam_capture()`, `webcam_rooms()`
+  and `webcam_in(room)` answer where it is on. The room must be in the call. A start waits while an old webcam
+  capture is still `Stopping` (it holds the device) and queues a *set* of rooms (`webcam_start_after_stop`; rooms that
+  join while the capture is `Starting` wait in `webcam_join_when_active`); `poll_webcam_start` runs in
+  `poll_capture_states`. A camera or mode change in the modal restarts the capture in **all** rooms it was on in; codec
+  and bitrate are a live `edit_destination` on each. A camera that goes away ends it in all rooms with one toast. Hang-up,
+  leave and disconnect remove only that room's destination (the last one drops the capture, as for a screen), and a
+  reconnect re-adds each room's destination through `SuspendedShare::Video`.
+  *Why (D12):* the `ctl`'s `webcam start` must turn the webcam on in every in-call room, and one model, the same
+  `start_webcam` per room, keeps the bar button and the ctl consistent; before, a start in another room moved the camera.
+  *Why picking up never adds it (D15):* a camera appearing in a room by itself would surprise people; only that room's
+  button (or the ctl) turns it on there.
+  Tested: `session::webcam_fan_out_tests::a_webcam_is_one_capture_with_a_destination_per_room` (ignored: real relay
+  plus a `videotestsrc` capture labelled `Webcam`; run with `-- --ignored webcam_fan_out_tests`).
 - **A camera that goes away ends the share, with a toast; no restart loop** (`poll_capture_recovery_at` -> `end_lost_webcam`):
   `v4l2src` reports a source-side bus error (`CaptureErrors::mark_lost`), and a webcam is stopped like a user stop
   (destination released at once, the room told) with `errors.webcam_lost`. *Why not the screen's restart schedule

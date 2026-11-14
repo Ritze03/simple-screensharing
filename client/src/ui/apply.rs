@@ -388,8 +388,8 @@ impl App {
                 }
                 self.nav.popover = None;
             }
-            UiAction::StopWebcam => {
-                self.state.stop_webcam();
+            UiAction::StopWebcam(room) => {
+                self.state.stop_webcam_in(room);
                 self.nav.popover = None;
             }
             UiAction::SetWebcam(w) => self.state.set_webcam_settings(w),

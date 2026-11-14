@@ -11,6 +11,8 @@ All notable user-facing changes, newest first. Categories:
 
 ### Added
 
+- **Webcam in several rooms**: your webcam can now be on in several rooms at once; its button
+  turns it on or off just for that room.
 - **Pick up on the website**: the website now also connects you without putting you in the
   call; press the green button to join in and watch.
 

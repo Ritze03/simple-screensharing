@@ -84,7 +84,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut WebcamSettingsState, room
         cx.act(act);
     }
     match click {
-        FooterClick::Leading(0) => cx.act(if live.is_some() { UiAction::StopWebcam } else { UiAction::StartWebcam(room) }),
+        FooterClick::Leading(0) => cx.act(if live.is_some() { UiAction::StopWebcam(room) } else { UiAction::StartWebcam(room) }),
         FooterClick::Trailing(_) => cx.act(UiAction::CloseModal),
         // Escape with a dropdown open only closes that dropdown (the shell consumes it first).
         _ if a.close => cx.act(UiAction::CloseModal),

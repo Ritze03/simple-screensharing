@@ -409,12 +409,11 @@ impl Bar {
                 let looking = !cx.state.webcams_requested || cx.state.webcams_listing();
                 (Tone::Off, "videocam_off", if looking { tr("ui.bar.webcam_looking", "Looking for cameras…") } else { tr("ui.bar.webcam_none", "No camera found") }, false)
             }
-            None if cx.state.webcam_share().is_some() => (Tone::Off, "videocam_off", with_camera("ui.bar.move_webcam_tip", "Move your webcam here (%{camera})"), true),
             None => (Tone::Off, "videocam_off", with_camera("ui.bar.share_webcam_tip", "Share your webcam (%{camera})"), true),
         };
         let (main, caret) = split(ui, rect, &Split { name: "webcam", icon, tone, enabled, tip: &tip, caret_tip: &tr("ui.bar.webcam_caret", "Pick a camera"), open: open(cx, BarMenu::Webcam) });
         if main {
-            cx.act(if live_here { UiAction::StopWebcam } else { UiAction::StartWebcam(room) });
+            cx.act(if live_here { UiAction::StopWebcam(room) } else { UiAction::StartWebcam(room) });
         } else if caret {
             if cx.popover_of(&PopoverKind::Bar(BarMenu::Webcam)).is_none() {
                 cx.act(UiAction::RefreshWebcams);

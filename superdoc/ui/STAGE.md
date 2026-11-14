@@ -192,7 +192,7 @@ destination's live params, so an automatic codec fallback (AV1 -> H.265 -> H.264
 never went live stay unsaved. Its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
 codec and rate; Preset (with its caption) and then FPS for the live destination or the next stream (2026-11-05: Preset above FPS, a preset lit only on an exact FPS + encoding + keyframe match); Change source, All stream settings…, Go live
 in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio/desktop-audio.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
-camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its
+camera in its saved mode, into the room the bar acts on, **in addition to** any room it is already on in: one camera, one destination per room) and the next click stops it in **that room only**; its
 arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
 mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
 when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
@@ -303,14 +303,14 @@ and the pop-out windows keep their older twin (`popout::overlay_shown`).
 
 - **Your webcam** is an item of your own stage like your screen (`Kind::Mine`, `ItemId.label == "Webcam"`, `who == ""`):
   a tile `You · Webcam` with the live preview (while the window is focused, else the placeholder "Your webcam · live"),
-  a viewer chip and a Webcam settings button (not Stream settings), its `⋯` menu says Webcam settings… / Stop webcam.
+  a viewer chip and a Webcam settings button (not Stream settings), its `⋯` menu says Webcam settings… / Stop webcam (this room only; `UiAction::StopWebcam(room)`).
   Someone else's webcam is a stream whose label starts with `Webcam` (`webcam::is_webcam_label`): an idle tile with a
   Watch button, a watched tile with a `videocam` icon in its tag and no audio row ("No audio in this stream").
 - **The webcam modal** (width `MODAL_W_WIDE`): *Source* card with **Camera** and **Mode** dropdowns (`menu::select`; the Mode
   list holds every mode the camera really offers, `1280×720 · 30 fps · MJPG`, usable ones first, and opens scrolled to
   the current one), *Compression* with **Codec** (when the machine encodes more than one) and **Bitrate** (200-12000,
-  `Set by upload budget` in Absolute bandwidth mode), the fixed-encoder note, footer `[Start webcam | Stop webcam][fill][Done]`.
-  Everything acts at once; camera and mode restart a running webcam, codec and bitrate change it live.
+  `Set by upload budget` in Absolute bandwidth mode), the fixed-encoder note, footer `[Start webcam | Stop webcam][fill][Done]` (acts on the modal's room only; picking up a room never turns the webcam on there).
+  Everything acts at once; camera and mode restart a running webcam in every room it was on in, codec and bitrate change it live.
   Opened from the arrow's item, the tile's gear and `⋯`, and the sidebar's Outgoing popover (`Modal::WebcamSettings`).
 - **Webcam in picture** (Layout menu checkbox, **per view** and **on until switched off** since 2026-11-04 (#131): `StageSettings::pip`,
   `UiAction::SetStagePip`) moves a person's webcam into their first screen share that is **playing on this stage**

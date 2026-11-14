@@ -395,10 +395,10 @@ pub enum UiAction {
     SetBandwidthFloor(u32),
 
     // --- webcam (task I8) ---------------------------------------------------
-    /// Start the webcam in `room` (or move it there from another room). Its own share, no screen needed.
+    /// Turn the webcam on in `room` only (one camera capture feeds every room it is on in). No screen needed.
     StartWebcam(RoomHandle),
-    /// Stop the webcam.
-    StopWebcam,
+    /// Turn the webcam off in `room` only; the last room gone releases the camera.
+    StopWebcam(RoomHandle),
     /// The webcam menu's choices: saved, and a running webcam follows them (a new camera or mode restarts it).
     SetWebcam(simple_screensharing_client::rooms::WebcamSettings),
     /// Re-list the cameras (async; result in `cx.state.webcams`).
@@ -977,7 +977,7 @@ impl<'a> Cx<'a> {
         self.live_rooms().into_iter().filter(|h| self.my_phase(*h) == Some(MyPhase::OnAir)).collect()
     }
 
-    /// Our screen captures that have at least one destination (a webcam is not one: [`Self::webcam_share`]).
+    /// Our screen captures that have at least one destination (a webcam is not one: [`AppState::webcam_in`]).
     pub fn live_captures(&self) -> Vec<(CaptureSourceId, &'a LocalCapture)> {
         self.state
             .captures
@@ -987,13 +987,11 @@ impl<'a> Cx<'a> {
             .collect()
     }
 
-    /// Our webcam share in `room`, if there is one (task I8): its capture, destination and the capture. A
-    /// stopping one is gone already ([`AppState::webcam_share`]).
+    /// Our webcam in `room`, if it is on there (task I8): the shared capture, this room's destination and the capture. A
+    /// stopping one is gone already ([`AppState::webcam_in`]).
     pub fn webcam_share(&self, room: RoomHandle) -> Option<(CaptureSourceId, DestinationId, &'a LocalCapture)> {
-        let (id, r) = self.state.webcam_share()?;
-        let c = self.state.captures.get(&id)?;
-        let dest = c.destinations.iter().find(|(_, d)| d.room == room).map(|(d, _)| *d);
-        (r == room).then_some(dest).flatten().map(|d| (id, d, c))
+        let (id, dest) = self.state.webcam_in(room)?;
+        Some((id, dest, self.state.captures.get(&id)?))
     }
 
     /// A capture by id.
