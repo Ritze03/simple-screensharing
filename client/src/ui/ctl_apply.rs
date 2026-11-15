@@ -5,7 +5,6 @@
 //! toggle and hangup act only on rooms in the call; the stops act wherever a share runs. See
 //! `superdoc/features/ctl.md`.
 
-use egui::Context;
 use simple_screensharing_client::ctl::{Command, WebcamPlan};
 use simple_screensharing_client::protocol::StreamKind;
 use simple_screensharing_client::session::{CaptureSourceId, RoomHandle, ShareStatus};
@@ -19,9 +18,12 @@ fn rooms(n: usize) -> String {
 
 impl App {
     /// Apply every command the socket queued since the last frame and send each its answer.
-    pub(super) fn drain_ctl(&mut self, ctx: &Context) {
+    pub(super) fn drain_ctl(&mut self) {
         for request in simple_screensharing_client::ctl::take_pending() {
-            let answer = self.apply_ctl(ctx, request.command);
+            if !request.claim() {
+                continue;
+            }
+            let answer = self.apply_ctl(request.command);
             let _ = request.reply.send(answer);
         }
     }
@@ -50,9 +52,10 @@ impl App {
         format!("webcam started in {}", rooms(started))
     }
 
-    fn apply_ctl(&mut self, ctx: &Context, command: Command) -> String {
+    fn apply_ctl(&mut self, command: Command) -> String {
         match command {
             Command::WebcamStart => {
+                self.shell.webcam_memory.forget();
                 let in_call = self.rooms_in_call();
                 if in_call.is_empty() {
                     return "no room is in the call, webcam not started".into();
@@ -79,23 +82,22 @@ impl App {
                         format!("webcam stopped in {}", rooms(rs.len()))
                     }
                     WebcamPlan::Start(rs) => self.ctl_start_webcam(&rs),
-                    WebcamPlan::NothingToRestore => "webcam is off and none of its rooms is in the call, nothing started".into(),
                     WebcamPlan::NoRoomInCall => "webcam is off and no room is in the call, nothing started".into(),
                 }
             }
             Command::ScreenshareStop => self.ctl_stop_screens(),
             Command::AudioStop => {
-                let audio: Vec<(CaptureSourceId, usize)> = self
+                let audio: Vec<CaptureSourceId> = self
                     .state
                     .captures
                     .iter()
                     .filter(|(_, c)| c.kind == StreamKind::Audio && !matches!(c.status, ShareStatus::Stopping(_)))
-                    .map(|(id, c)| (*id, c.destinations.len()))
+                    .map(|(id, _)| *id)
                     .collect();
                 if audio.is_empty() {
                     return "no audio is shared, nothing to stop".into();
                 }
-                for (id, _) in &audio {
+                for id in &audio {
                     self.state.stop_share(*id);
                 }
                 self.toast(tr("ui.toast.ctl_audio_stopped", "Audio stopped (CTL)").to_string(), "volume_off");
@@ -110,7 +112,6 @@ impl App {
                     self.state.hang_up(*room);
                 }
                 self.nav.popover = None;
-                let _ = ctx;
                 let text = if in_call.len() == 1 {
                     tr("ui.toast.ctl_hung_up", "Left the call (CTL)").to_string()
                 } else {
@@ -162,4 +163,5 @@ impl App {
         }
         out.push(')');
         out
-    }}
+    }
+}

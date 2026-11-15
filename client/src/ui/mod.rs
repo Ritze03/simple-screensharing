@@ -1820,7 +1820,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.now = ctx.input(|i| i.time);
-        self.drain_ctl(ctx);
+        self.drain_ctl();
         self.poll(ctx);
 
         // Escape closes the popover before anything else sees it (a modal

@@ -77,6 +77,7 @@ impl Command {
     }
 
     /// Parse the line the CLI sent (what [`Self::wire`] produced). `kill` and `help` are not wire commands.
+    #[cfg(any(target_os = "linux", test))]
     fn parse_wire(line: &str) -> Option<Command> {
         let words: Vec<&str> = line.split_whitespace().collect();
         match Command::parse(&words) {
@@ -109,9 +110,9 @@ Usage: simple-screensharing ctl <command>
 Commands:
   webcam start       Turn the webcam on in every room you are in the call in.
   webcam stop        Turn the webcam off everywhere and forget which rooms it was on in.
-  webcam toggle      On: turn it off, remembering the rooms. Off: turn it on again in the
-                     remembered rooms that are still in the call (after \"webcam stop\"
-                     this works like \"webcam start\").
+  webcam toggle      Off if on (remembering the rooms); if off, on again in those rooms
+                     (like \"webcam start\" after a stop, or when none of them is in the
+                     call any more).
   screenshare stop   Stop every screen or window share, also one still in its set-up
                      dialog, and the audio that was started together with it.
   audio stop         Stop every audio share (Desktop audio or one app) in every room.
@@ -125,10 +126,9 @@ Output and exit code: one line per instance (\"pid 1234: webcam stopped in 2 roo
 Exit 0 when at least one instance answered, 1 when none is running, 2 for a usage error.
 
 Binding a command to a key (use the same command line; bind a different key per command):
-  GNOME   Settings > Keyboard > Keyboard Shortcuts > Custom Shortcuts > add, command:
+  GNOME   Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts, command:
             simple-screensharing ctl webcam toggle
-  KDE     System Settings > Shortcuts > Custom Shortcuts > Edit > New > Global Shortcut >
-          Command/URL, command:
+  KDE     System Settings > Keyboard > Shortcuts > Add New > Command or Script, command:
             simple-screensharing ctl webcam toggle
   sway    bindsym $mod+Shift+w exec simple-screensharing ctl webcam toggle
   Hyprland
@@ -158,9 +158,7 @@ pub enum WebcamPlan {
     Stop(Vec<RoomHandle>),
     /// Turn it on in exactly these rooms.
     Start(Vec<RoomHandle>),
-    /// Off, and none of the remembered rooms is in the call any more: nothing to turn on.
-    NothingToRestore,
-    /// Off, nothing remembered, and no room is in the call.
+    /// Off, and no room is in the call.
     NoRoomInCall,
 }
 
@@ -190,10 +188,11 @@ impl WebcamMemory {
             return if in_call.is_empty() { WebcamPlan::NoRoomInCall } else { WebcamPlan::Start(in_call.to_vec()) };
         }
         let restore: Vec<RoomHandle> = self.rooms.iter().copied().filter(|r| in_call.contains(r)).collect();
-        if restore.is_empty() {
-            return WebcamPlan::NothingToRestore;
-        }
         self.rooms.clear();
+        if restore.is_empty() {
+            // None of the remembered rooms is in the call any more: a hotkey must not get stuck, so this is `start`.
+            return if in_call.is_empty() { WebcamPlan::NoRoomInCall } else { WebcamPlan::Start(in_call.to_vec()) };
+        }
         WebcamPlan::Start(restore)
     }
 }
@@ -255,6 +254,25 @@ fn connect_or_sweep(path: &std::path::Path) -> Option<std::os::unix::net::UnixSt
         }
         Err(_) => None,
     }
+}
+
+/// The PID of the process listening behind `stream` (`SO_PEERCRED`), `None` when the kernel cannot say.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for the call and `len` is its size.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// Whether `path` is owned by the current user.
+#[cfg(target_os = "linux")]
+fn owned_by_me(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    std::fs::metadata(path).is_ok_and(|m| m.uid() == unsafe { libc::getuid() })
 }
 
 /// Remove the sockets in `dir` nobody listens on; the live instances with their connection.
@@ -348,7 +366,20 @@ fn ask(instance: Instance, mut stream: std::os::unix::net::UnixStream, command: 
 /// are signalled: a stale file of a crashed client (whose PID may belong to something else by now) was swept.
 #[cfg(target_os = "linux")]
 fn kill_all(live: Vec<(Instance, std::os::unix::net::UnixStream)>) -> Vec<String> {
-    let instances: Vec<Instance> = live.into_iter().map(|(i, s)| { drop(s); i }).collect();
+    // Only ours: the socket file and its folder owned by this user, and the listener's PID (SO_PEERCRED) the one
+    // in the file name. Anything else could make the CLI signal a stranger's process.
+    let dir_ok = live.first().and_then(|(i, _)| i.path.parent().map(owned_by_me)).unwrap_or(false);
+    let mut lines = Vec::new();
+    let mut instances: Vec<Instance> = Vec::new();
+    for (i, s) in live {
+        if !dir_ok || !owned_by_me(&i.path) {
+            lines.push(format!("pid {}: skipped (its socket or folder is not owned by you)", i.pid));
+        } else if peer_pid(&s) != Some(i.pid) {
+            lines.push(format!("pid {}: skipped (the socket's owner is not that process)", i.pid));
+        } else {
+            instances.push(i);
+        }
+    }
     for i in &instances {
         // SAFETY: plain signal to a PID we just proved is a listening client.
         unsafe { libc::kill(i.pid as libc::pid_t, libc::SIGTERM) };
@@ -361,7 +392,6 @@ fn kill_all(live: Vec<(Instance, std::os::unix::net::UnixStream)>) -> Vec<String
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let mut lines = Vec::new();
     for i in &instances {
         let line = if left.iter().any(|l| l.pid == i.pid) {
             // SAFETY: as above.
@@ -397,6 +427,22 @@ fn process_alive(pid: u32) -> bool {
 pub struct Request {
     pub command: Command,
     pub reply: mpsc::Sender<String>,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+const REQ_PENDING: u8 = 0;
+const REQ_TAKEN: u8 = 1;
+const REQ_EXPIRED: u8 = 2;
+/// Requests kept waiting for the UI thread; beyond this the oldest is dropped.
+const QUEUE_CAP: usize = 16;
+
+impl Request {
+    /// The UI thread claims the request. `false` when the listener already gave up and answered: a command the
+    /// caller was told was not applied must not run later.
+    pub fn claim(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.state.compare_exchange(REQ_PENDING, REQ_TAKEN, SeqCst, SeqCst).is_ok()
+    }
 }
 
 static PENDING: Mutex<Vec<Request>> = Mutex::new(Vec::new());
@@ -417,31 +463,48 @@ static MY_SOCKET: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// app without Hotkey support, never without the app.
 #[cfg(target_os = "linux")]
 pub fn start_listener(ctx: egui::Context) {
-    use std::os::unix::fs::PermissionsExt;
     let Some(dir) = socket_dir() else {
         tracing::info!("no runtime directory: Hotkey control (ctl) is off");
         return;
     };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(&dir) {
         tracing::warn!("ctl: cannot create {}: {e}", dir.display());
         return;
     }
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    // A folder somebody else made (or one with wider rights) is not ours to put a control socket in.
+    let dir_safe = std::fs::metadata(&dir).is_ok_and(|m| {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid has no preconditions.
+        m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0
+    });
+    if !dir_safe {
+        tracing::warn!("ctl: {} is not a private folder of ours (owner or mode): Hotkey control (ctl) is off", dir.display());
+        return;
+    }
     let path = dir.join(format!("{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+    // The socket file is created with the process umask: tighten it for the bind so it is never wider than 0600.
+    // SAFETY: umask only swaps the process mask.
+    let old_mask = unsafe { libc::umask(0o177) };
+    let bound = std::os::unix::net::UnixListener::bind(&path);
+    // SAFETY: as above.
+    unsafe { libc::umask(old_mask) };
+    let listener = match bound {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("ctl: cannot bind {}: {e}", path.display());
             return;
         }
     };
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     *MY_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
     tracing::info!("ctl: listening on {}", path.display());
     let spawned = std::thread::Builder::new().name("ctl-listener".into()).spawn(move || {
         for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
+            let Ok(conn) = conn else {
+                // EMFILE and friends: do not spin.
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
             let ctx = ctx.clone();
             let _ = std::thread::Builder::new().name("ctl-conn".into()).spawn(move || serve_connection(conn, ctx));
         }
@@ -473,7 +536,7 @@ fn serve_connection(stream: std::os::unix::net::UnixStream, ctx: egui::Context) 
     use std::io::{BufRead, Write};
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut line = String::new();
-    let Ok(read) = std::io::BufReader::new(&stream).read_line(&mut line) else { return };
+    let Ok(read) = std::io::BufReader::new(std::io::Read::take(&stream, 256)).read_line(&mut line) else { return };
     if read == 0 {
         return; // the CLI only probed (kill) or went away
     }
@@ -481,13 +544,29 @@ fn serve_connection(stream: std::os::unix::net::UnixStream, ctx: egui::Context) 
         None => format!("unknown command {:?}", line.trim()),
         Some(command) => {
             let (tx, rx) = mpsc::channel();
-            PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(Request { command, reply: tx });
+            let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(REQ_PENDING));
+            {
+                let mut q = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                q.push(Request { command, reply: tx, state: state.clone() });
+                if q.len() > QUEUE_CAP {
+                    let old = q.remove(0);
+                    old.state.store(REQ_EXPIRED, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             let started = std::time::Instant::now();
             loop {
                 ctx.request_repaint();
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(a) => break a,
-                    Err(_) if started.elapsed() >= APPLY_WAIT => break "queued, the app has not applied it yet".to_string(),
+                    Err(_) if started.elapsed() >= APPLY_WAIT => {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        let late = "not applied: the app did not answer in time".to_string();
+                        if state.compare_exchange(REQ_PENDING, REQ_EXPIRED, SeqCst, SeqCst).is_ok() {
+                            break late;
+                        }
+                        // Claimed just now: its answer is on its way.
+                        break rx.recv_timeout(Duration::from_secs(1)).unwrap_or(late);
+                    }
                     Err(_) => {}
                 }
             }
@@ -590,17 +669,24 @@ mod tests {
     }
 
     #[test]
-    fn toggle_keeps_the_memory_while_no_remembered_room_is_in_the_call() {
+    fn toggle_clears_the_memory_and_acts_like_start_when_no_remembered_room_is_in_the_call() {
         let mut m = WebcamMemory::default();
         m.toggle(&[h(1)], &[h(1)]);
-        assert_eq!(m.toggle(&[], &[h(2)]), WebcamPlan::NothingToRestore);
-        assert_eq!(m.remembered(), &[h(1)]);
-        assert_eq!(m.toggle(&[], &[h(1)]), WebcamPlan::Start(vec![h(1)]));
+        assert_eq!(m.toggle(&[], &[h(2), h(3)]), WebcamPlan::Start(vec![h(2), h(3)]));
+        assert!(m.remembered().is_empty());
+        m.toggle(&[h(1)], &[h(1)]);
+        assert_eq!(m.toggle(&[], &[]), WebcamPlan::NoRoomInCall);
+        assert!(m.remembered().is_empty());
     }
 
     #[cfg(target_os = "linux")]
     fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("sss-ctl-test-{name}-{}", std::process::id()));
+        // Under the target dir, never /tmp (a tmpfs); a path too long for sun_path (108) falls back to $HOME/tmp.
+        let mut base = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/ctl-test"));
+        if base.to_string_lossy().len() > 70 {
+            base = std::path::PathBuf::from(std::env::var("HOME").expect("HOME")).join("tmp/ctl-test");
+        }
+        let d = base.join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
