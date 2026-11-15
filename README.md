@@ -88,7 +88,7 @@ minimized or on another workspace. The app shows a short notice ending in "(CTL)
 | --- | --- |
 | `webcam start` | Webcam on in every room you are in the call in. |
 | `webcam stop` | Webcam off everywhere. |
-| `webcam toggle` | Off if on (remembering the rooms); on again in those rooms if off (if none is in the call any more, like `start`). |
+| `webcam toggle` | Off if on (remembering the rooms); if off, on again in those rooms, or in every room in the call when none of them is. |
 | `screenshare stop` | Stop every screen or window share, and the audio started with it. |
 | `audio stop` | Stop every audio share. |
 | `hangup` | Leave the call in every room (rooms stay connected). |

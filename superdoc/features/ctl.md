@@ -28,6 +28,14 @@ install; no packaging change. (D11)
 | `kill` | Quits every instance cleanly (the SIGTERM path, which leaves rooms), SIGKILL for any still alive after 5 s (`KILL_GRACE`). |
 | `help`, `--help`, `-h` | `ctl::help_text()`; never goes over the socket. |
 
+Why (D9, owner): `screenshare stop` leaves nothing of the screen on air, so it also catches a share still in its
+set-up dialog and the audio started together with it; audio started on its own and the webcam have their own commands.
+
+Why (D13, owner: "differentiate between connected and in-call"): every command respects connected vs in the call.
+`webcam start`/`toggle` and `hangup` act only on rooms in the call; `screenshare stop`, `audio stop` and `webcam stop`
+stop shares wherever they run (shares only exist in rooms in the call). No command connects, disconnects or picks up
+a room. Matches pick-up, see [session model](../architecture/session-model.md) "In the call".
+
 Acts on **every running instance** at once, with no confirmation (D2: it is mainly used for hotkeys, so it must
 always work; pressed by accident is the user's fault). Works with the window hidden, minimized or on another
 workspace (D14: a hotkey is pressed exactly when the app is not in front).
