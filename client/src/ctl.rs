@@ -1,4 +1,4 @@
-//! `simple-screensharing ctl <command>`: a tiny command line that controls every running client at once, so
+//! `simple-screensharing --ctl <command>`: a tiny command line that controls every running client at once, so
 //! users can bind **Hotkeys** on their desktop (stop the webcam, stop sharing, hang up, kill).
 //!
 //! Two halves in one module:
@@ -53,7 +53,7 @@ impl Command {
         }
     }
 
-    /// Parse the words after `ctl`. Whitespace between words is not significant.
+    /// Parse the words after `--ctl`. Whitespace between words is not significant.
     pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         let words: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
         match words.as_slice() {
@@ -98,14 +98,14 @@ pub const EXIT_USAGE: i32 = 2;
 /// The `help` text.
 pub fn help_text() -> String {
     "\
-simple-screensharing ctl: control every running Simple Screensharing window at once.
+simple-screensharing --ctl: control every running Simple Screensharing window at once.
 
 It exists so you can bind Hotkeys on your desktop: press a key and the command goes to
 every running instance, whether its window is in front, minimized or on another workspace.
 Nothing asks for confirmation (a hotkey pressed by accident does what it says), and the
 app shows a short notice ending in \"(CTL)\" when a command acted.
 
-Usage: simple-screensharing ctl <command>
+Usage: simple-screensharing --ctl <command>
 
 Commands:
   webcam start       Turn the webcam on in every room you are in the call in.
@@ -127,15 +127,15 @@ Exit 0 when at least one instance answered, 1 when none is running, 2 for a usag
 
 Binding a command to a key (use the same command line; bind a different key per command):
   GNOME   Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts, command:
-            simple-screensharing ctl webcam toggle
+            simple-screensharing --ctl webcam toggle
   KDE     System Settings > Keyboard > Shortcuts > Add New > Command or Script, command:
-            simple-screensharing ctl webcam toggle
-  sway    bindsym $mod+Shift+w exec simple-screensharing ctl webcam toggle
+            simple-screensharing --ctl webcam toggle
+  sway    bindsym $mod+Shift+w exec simple-screensharing --ctl webcam toggle
   Hyprland
-          bind = SUPER SHIFT, W, exec, simple-screensharing ctl webcam toggle
+          bind = SUPER SHIFT, W, exec, simple-screensharing --ctl webcam toggle
 
 AppImage: use the file instead of the installed name:
-  /path/to/<name>.AppImage ctl webcam toggle
+  /path/to/<name>.AppImage --ctl webcam toggle
 
 Only the normal install and the AppImage on Linux are supported (not Flatpak, not Windows).
 "
@@ -144,7 +144,7 @@ Only the normal install and the AppImage on Linux are supported (not Flatpak, no
 
 /// One-line hint printed after a usage error.
 pub fn usage_hint() -> &'static str {
-    "try 'simple-screensharing ctl help'"
+    "try 'simple-screensharing --ctl help'"
 }
 
 // ---------------------------------------------------------------------------
@@ -291,12 +291,12 @@ pub const ANSWER_TIMEOUT: Duration = Duration::from_millis(3500);
 /// How long `kill` waits for the clean quit before SIGKILL (a little above the app's own 4 s hard exit).
 pub const KILL_GRACE: Duration = Duration::from_millis(5000);
 
-/// `simple-screensharing ctl <args>`. Returns the process exit code. Never opens a window or touches GStreamer.
+/// `simple-screensharing --ctl <args>`. Returns the process exit code. Never opens a window or touches GStreamer.
 pub fn run<S: AsRef<str>>(args: &[S]) -> i32 {
     let command = match Command::parse(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("simple-screensharing ctl: {e}\n{}", usage_hint());
+            eprintln!("simple-screensharing --ctl: {e}\n{}", usage_hint());
             return EXIT_USAGE;
         }
     };
@@ -310,7 +310,7 @@ pub fn run<S: AsRef<str>>(args: &[S]) -> i32 {
             print!("{}", help_text());
             return 0;
         }
-        eprintln!("simple-screensharing ctl is Linux-only (normal install and AppImage).");
+        eprintln!("simple-screensharing --ctl is Linux-only (normal install and AppImage).");
         1
     }
 }
@@ -636,8 +636,8 @@ mod tests {
         let t = help_text();
         for needle in [
             "webcam start", "webcam stop", "webcam toggle", "screenshare stop", "audio stop", "hangup", "kill", "GNOME", "KDE", "sway",
-            "Hyprland", "AppImage", "bindsym $mod+Shift+w exec simple-screensharing ctl webcam toggle",
-            "bind = SUPER SHIFT, W, exec, simple-screensharing ctl webcam toggle", "Hotkeys",
+            "Hyprland", "AppImage", "bindsym $mod+Shift+w exec simple-screensharing --ctl webcam toggle",
+            "bind = SUPER SHIFT, W, exec, simple-screensharing --ctl webcam toggle", "Hotkeys",
         ] {
             assert!(t.contains(needle), "help lacks {needle:?}");
         }

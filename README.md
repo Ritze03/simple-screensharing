@@ -80,7 +80,7 @@ a second client or the browser client. Details: [`client/README.md`](client/READ
 
 ## Hotkeys
 
-Control a running app from a keyboard shortcut of your desktop: `simple-screensharing ctl <command>`
+Control a running app from a keyboard shortcut of your desktop: `simple-screensharing --ctl <command>`
 acts on every running instance at once, with no confirmation, even when the window is hidden,
 minimized or on another workspace. The app shows a short notice ending in "(CTL)" when it did something.
 
@@ -94,14 +94,14 @@ minimized or on another workspace. The app shows a short notice ending in "(CTL)
 | `hangup` | Leave the call in every room (rooms stay connected). |
 | `kill` | Quit every instance (a stuck one is killed after a few seconds). |
 
-`simple-screensharing ctl help` prints the same list. Bind one key per command:
+`simple-screensharing --ctl help` prints the same list. Bind one key per command:
 
-- **GNOME**: Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts, command `simple-screensharing ctl webcam toggle`.
-- **KDE**: System Settings > Keyboard > Shortcuts > Add New > Command or Script, command `simple-screensharing ctl webcam toggle`.
-- **sway**: `bindsym $mod+Shift+w exec simple-screensharing ctl webcam toggle`
-- **Hyprland**: `bind = SUPER SHIFT, W, exec, simple-screensharing ctl webcam toggle`
+- **GNOME**: Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts, command `simple-screensharing --ctl webcam toggle`.
+- **KDE**: System Settings > Keyboard > Shortcuts > Add New > Command or Script, command `simple-screensharing --ctl webcam toggle`.
+- **sway**: `bindsym $mod+Shift+w exec simple-screensharing --ctl webcam toggle`
+- **Hyprland**: `bind = SUPER SHIFT, W, exec, simple-screensharing --ctl webcam toggle`
 
-From the AppImage use the file instead: `./simple-screensharing-client-x86_64.AppImage ctl webcam toggle`.
+From the AppImage use the file instead: `./simple-screensharing-client-x86_64.AppImage --ctl webcam toggle`.
 Linux only (normal install and AppImage; not the Flatpak, not Windows).
 
 ## Downloads and platforms

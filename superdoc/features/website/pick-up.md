@@ -21,7 +21,7 @@ whole stage code already reads `state`.
   audio-only) is watched; off, they stay listed with Watch buttons.
 - **`hangUp(r)`** (the red button in the call / Room menu "Leave call"): `inCall = false`, `resume` cleared, `capture.js:stopDestsInRoom` (shares into this room only; a capture that also feeds
   another room keeps running; a staged, not yet live share here is discarded and its setup modal closes), every watch and listen stopped (`unwatchStream`, which unsubscribes). The room stays
-  connected. `app.js:hangUpRoom` hangs up at once, never with a confirm (row 207: cheap to undo, same as native and the `ctl hangup` hotkey); only Disconnect (`leaveRoom`) asks.
+  connected. `app.js:hangUpRoom` hangs up at once, never with a confirm (row 207: cheap to undo, same as native and the `--ctl hangup` hotkey); only Disconnect (`leaveRoom`) asks.
 - **Disconnect**: `app.js:leaveRoom` (unchanged flow, strings now say "Disconnect"): Room menu item, and the red button while not in the call (no confirm: nothing to lose).
 
 ## What is gated (every "may watch / share / hear" reads `inCall`)

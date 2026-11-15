@@ -37,13 +37,13 @@ const USAGE: &str = "\
 Simple Screensharing client
 
 Usage: simple-screensharing-client [OPTIONS]
-       simple-screensharing-client ctl <command>
+       simple-screensharing-client --ctl <command>
 
 Opens the desktop (egui) window.
 
-`ctl` controls every running instance at once, to bind Hotkeys on your desktop
+`--ctl` controls every running instance at once, to bind Hotkeys on your desktop
 (webcam start/stop/toggle, screenshare stop, audio stop, hangup, kill); see
-`ctl help`. Linux only.
+`--ctl help`. Linux only.
 
 Options:
       --gallery          Open the widget gallery (design QC) instead of the app.
@@ -175,9 +175,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run() -> anyhow::Result<()> {
-    // `ctl` is a plain command line: it returns before any window, tokio, GStreamer, logging or GPU setup.
+    // `--ctl` is a plain command line: it returns before any window, tokio, GStreamer, logging or GPU setup.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("ctl") {
+    if args.first().map(String::as_str) == Some("--ctl") {
         #[cfg(windows)]
         attach_parent_console();
         std::process::exit(simple_screensharing_client::ctl::run(&args[1..]));

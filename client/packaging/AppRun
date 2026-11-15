@@ -40,11 +40,11 @@ else
     export GST_REGISTRY_1_0="${XDG_RUNTIME_DIR:-/tmp}/simple-screensharing-gst-registry.bin"
 fi
 
-# --- 3a. `ctl ...` (Hotkeys): straight to the client ---------------------------
-# A key binding runs `<name>.AppImage ctl webcam toggle`; the host-requirement check
+# --- 3a. `--ctl ...` (Hotkeys): straight to the client ---------------------------
+# A key binding runs `<name>.AppImage --ctl webcam toggle`; the host-requirement check
 # below only prints warnings meant for a normal start (noise and time per key press).
 # Arguments reach the client unchanged. See superdoc/features/ctl.md.
-if [ "$1" = ctl ]; then
+if [ "$1" = --ctl ]; then
     exec "$HERE/usr/bin/simple-screensharing-client" "$@"
 fi
 

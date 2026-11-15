@@ -53,7 +53,7 @@ appending. This file stays in context for the whole session.
 - **Capture domain** — which memory the capture tee carries (`CaptureDomain`): GPU (DMA-BUF to VA memory) or System (CPU, software x264). `features/stream/capture-pipeline.md`.
 - **RateCap** — `capture::branch::RateCap`: the per-destination fps limiter on a branch's valve; a cap, never a floor. `features/stream/capture-pipeline.md`.
 - **stableKey** (browser) — a stream's identity across reconnects: room + sharer name + kind + label; the native equivalent is **Wanted stream**. `features/website/stage.md`.
-- **Hotkeys / ctl** — `simple-screensharing ctl <command>`: a CLI that controls every running native instance (webcam, screenshare, audio, hangup, kill) for desktop key bindings. `features/ctl.md`.
+- **Hotkeys / ctl** — `simple-screensharing --ctl <command>`: a CLI that controls every running native instance (webcam, screenshare, audio, hangup, kill) for desktop key bindings. `features/ctl.md`.
 - **Live preview** (own-tile preview, #78) — the sharer's own Stage tile with a live picture of what they capture, while focused; not the ~30 s room-preview thumbnails. `features/self-preview.md`.
 - **On air vs starting** (UI) — a share's phase in a room (`ui::MyPhase`): on air = a destination is Live, Rebuilding or Stalled; starting = only Starting ones. `meta/glossary-details.md`, `ui/SHARE-FLOW.md`.
 - **Direct link** (browser direct link, row 179) — `<site URL>#join=<encoded join link>`: opens and saves the room in the browser; the key stays in the fragment. `features/website/direct-link.md`.

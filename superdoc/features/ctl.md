@@ -1,6 +1,6 @@
-# Hotkeys (`ctl`)
+# Hotkeys (`--ctl`)
 
-`simple-screensharing ctl <command>` controls every running native client from a shell command, so a desktop
+`simple-screensharing --ctl <command>` controls every running native client from a shell command, so a desktop
 can bind it to a keyboard shortcut. User-facing name everywhere: **Hotkeys** (D17: it is a general shortcut set,
 not only an emergency stop, so it is not named after one).
 Linux only: normal install and AppImage. Not Flatpak (its sandbox has its own runtime dir, so the socket is
@@ -8,11 +8,14 @@ invisible to the host), not Windows (prints "Linux only", exit 1), no macOS.
 
 ## Forms
 
-- `simple-screensharing ctl <cmd>` (the `install.sh` symlink), `simple-screensharing-client ctl <cmd>`.
-- AppImage: `./<name>.AppImage ctl <cmd>`. `client/packaging/AppRun` execs the client with the arguments unchanged
-  and, for `$1 = ctl`, skips the host-requirement check (its warnings are noise and time per key press).
+- `simple-screensharing --ctl <cmd>` (the `install.sh` symlink), `simple-screensharing-client --ctl <cmd>`.
+- AppImage: `./<name>.AppImage --ctl <cmd>`. `client/packaging/AppRun` execs the client with the arguments unchanged
+  and, for `$1 = --ctl`, skips the host-requirement check (its warnings are noise and time per key press).
 
-Why a subcommand and not a second binary: the owner wanted `simple-screensharing ctl`, one form for every
+Why a flag (user request 2026-11-15): `--ctl` is a dash-flag so the args stay consistent with the client's other
+flags (`--gallery` etc.); the bare `ctl` form is gone (unreleased, no alias). The words after it have no dashes.
+
+Why a flag and not a second binary: the owner wanted `simple-screensharing --ctl`, one form for every
 install; no packaging change. (D11)
 
 ## Commands
@@ -41,7 +44,7 @@ always work; pressed by accident is the user's fault). Works with the window hid
 workspace (D14: a hotkey is pressed exactly when the app is not in front).
 
 Output: one line per instance, `pid <pid>: <what happened>`. Exit codes: 0 at least one instance answered, 1 none
-running (or not Linux), 2 usage error (`try 'simple-screensharing ctl help'`). Why (D6): a hotkey ignores output,
+running (or not Linux), 2 usage error (`try 'simple-screensharing --ctl help'`). Why (D6): a hotkey ignores output,
 but a person testing in a terminal should see what happened.
 
 The app shows a toast ending in "(CTL)": Webcam started/stopped, Screen sharing stopped, Audio stopped, Left the
@@ -64,7 +67,7 @@ call / in N rooms. Nothing done, no toast. Why (D10): a share vanishing with no 
 - Toggle memory: `ui::Shell::webcam_memory` (`ctl::WebcamMemory`), cleared by `webcam start`, `webcam stop`, the app's webcam
   buttons, a toggle-on and a toggle that found no remembered room in the call. Why (D7, owner): restore only after a toggle; after a stop it is "like a fresh instance
   basically"; start means all rooms where you are in the call; connected and in-call are different things.
-- `ctl` runs in `main.rs` before tokio, logging, GStreamer and GPU setup (about 0.01 s).
+- `--ctl` runs in `main.rs` before tokio, logging, GStreamer and GPU setup (about 0.01 s).
 
 ## Tests and verification
 
@@ -73,8 +76,8 @@ call / in N rooms. Nothing done, no toast. Why (D10): a share vanishing with no 
   `exit_codes`, `help_text_covers_commands_and_bindings`, the four `toggle_*` tests,
   `stale_sockets_are_removed_and_live_ones_kept`, `pid_comes_from_the_socket_name`,
   `a_frozen_listener_does_not_hang_the_cli`.
-- Rig recipe: `client/scripts/hs-rig.sh run -- simple-screensharing-client ctl <cmd>` (the rig's runtime dir keeps
+- Rig recipe: `client/scripts/hs-rig.sh run -- simple-screensharing-client --ctl <cmd>` (the rig's runtime dir keeps
   it away from real instances; see [rig reference](../testing/rig-reference.md)). Verified with the window on an
   invisible sway workspace: `request_repaint` did run `update`.
-- AppImage pass-through: `AppRun ctl ...` checked with a stub client that prints its arguments.
+- AppImage pass-through: `AppRun --ctl ...` checked with a stub client that prints its arguments.
 - **Not verified**: a really minimized window on GNOME/KDE; real audio shares (no-audio test rule).
