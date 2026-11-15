@@ -1,4 +1,4 @@
-//! The app's half of `simple-screensharing ctl`: apply what the control socket queued (`ctl::take_pending`) and
+//! The app's half of `simple-screensharing --ctl`: apply what the control socket queued (`ctl::take_pending`) and
 //! answer. The answer is the per-instance line the CLI prints; a toast ending in "(CTL)" shows what acted.
 //!
 //! Every command acts at once (no dialog) and respects connected vs in the call (`AppState::in_call`): start,

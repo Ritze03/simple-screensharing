@@ -70,7 +70,7 @@ screen (or alone, a screen share is not needed), with its own destinations and i
   and bitrate are a live `edit_destination` on each. A camera that goes away ends it in all rooms with one toast. Hang-up,
   leave and disconnect remove only that room's destination (the last one drops the capture, as for a screen), and a
   reconnect re-adds each room's destination through `SuspendedShare::Video`.
-  *Why (D12):* the `ctl`'s `webcam start` must turn the webcam on in every in-call room, and one model, the same
+  *Why (D12):* `--ctl webcam start` must turn the webcam on in every in-call room, and one model, the same
   `start_webcam` per room, keeps the bar button and the ctl consistent; before, a start in another room moved the camera.
   *Why picking up never adds it (D15):* a camera appearing in a room by itself would surprise people; only that room's
   button (or the ctl) turns it on there.

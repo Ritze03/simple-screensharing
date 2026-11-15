@@ -25,7 +25,7 @@ with a source-built FFmpeg, crates, release compile), later ones ~2.
 | `Dockerfile` | builder image: Debian 13, GStreamer 1.26 dev + plugins, pinned Rust, a minimal FFmpeg + gst-libav built from source, a patched `gst-plugin-pipewire` built from Debian's PipeWire source, pinned linuxdeploy / appimagetool / type2 runtime |
 | `patches/pipewire-gst-keep-possible-caps.patch` | the one fix applied to PipeWire 1.4.2's `pipewiresrc` (see "Decision: the bundled `pipewiresrc` is a patched build") |
 | `build-in-container.sh` | runs inside the image: `cargo build --release`, assemble the AppDir, linuxdeploy, self-checks, appimagetool |
-| `AppRun` | launcher inside the AppImage: points GStreamer at the bundled plugins, warns about missing/too-old host pieces, execs the client; `AppRun ctl ...` (Hotkeys, `features/ctl.md`) skips the host check and execs the client at once |
+| `AppRun` | launcher inside the AppImage: points GStreamer at the bundled plugins, warns about missing/too-old host pieces, execs the client; `AppRun --ctl ...` (Hotkeys, `features/ctl.md`) skips the host check and execs the client at once |
 | `gst-plugins.txt` | the curated list of bundled GStreamer plugins |
 | `gst-elements.txt` | elements the build verifies resolve from the bundled set alone |
 | `../../simple-screensharing.desktop` | desktop entry (repo root; ritz-get also installs it as the start-menu shortcut; AppImage icon: `docs/assets/icon.svg`, rendered at build time) |
