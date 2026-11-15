@@ -9,6 +9,11 @@ All notable user-facing changes, newest first. Categories:
 
 ## 2026-11-15
 
+### Added
+
+- **Hotkeys**: stop your webcam, screen share or audio, leave every call or quit the app
+  with a keyboard shortcut you set up on your desktop.
+
 ### Fixed
 
 - **Leave call**: leaving a call no longer asks for confirmation.

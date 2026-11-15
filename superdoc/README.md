@@ -53,6 +53,7 @@ A page that was split keeps its old name as a hub: the hub lists its pages, and 
   - [NACK and big keyframes](features/website/nack-and-big-keyframes.md): selective retransmission and large keyframes in the browser.
   - [Harness and measurements](features/website/harness-and-measurements.md): measured numbers, running the harness.
 - [Viewer window](features/viewer-window.md): watches and pop-out windows.
+- [Hotkeys (`ctl`)](features/ctl.md): the `ctl` CLI that controls every running native instance for desktop key bindings.
 - [Own-tile live preview](features/self-preview.md): the sharer sees their own share, native and browser.
 - [Relay transport](features/relay-transport.md): QUIC congestion control, datagram eviction, idle timeout.
 - [Presentation modes](features/presentation-modes.md): the render vsync mode setting.
