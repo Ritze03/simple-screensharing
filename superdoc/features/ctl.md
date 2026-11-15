@@ -19,9 +19,9 @@ install; no packaging change. (D11)
 
 | Command | Behaviour |
 | --- | --- |
-| `webcam start` | On in every room you are **in the call** in, never in a connected-only room. Fan-out: [webcam capture](stream/webcam-capture.md). |
+| `webcam start` | On in every room you are **in the call** in, never in a connected-only room; also clears the toggle memory. Fan-out: [webcam capture](stream/webcam-capture.md). |
 | `webcam stop` | Off everywhere; forgets the toggle memory. |
-| `webcam toggle` | On -> off, remembering the rooms. Off -> on again in the remembered rooms that are still in the call. After a stop, the app's own webcam button, or with nothing remembered it acts like `start`. |
+| `webcam toggle` | On -> off, remembering the rooms. Off -> on again in the remembered rooms that are still in the call; if none of them is in the call any more, the memory is forgotten and it acts like `start` (every in-call room). After a stop, the app's own webcam button, or with nothing remembered it also acts like `start`. |
 | `screenshare stop` | Every screen/window share, including one still in its set-up dialog, plus the audio started with it (`LocalCapture::audio_for_capture`, `stop_share` cascades). Webcam and separately started audio keep going. |
 | `audio stop` | Every outgoing audio share. |
 | `hangup` | Leaves the call in every in-call room; rooms stay connected. |
@@ -46,15 +46,15 @@ call / in N rooms. Nothing done, no toast. Why (D10): a share vanishing with no 
   unlinked by the next ctl run (a refused connect). Why (D3): no control channel existed, and a socket carries the
   command and the answer; the rig's private runtime dir isolates tests from the user's real instances.
 - Wire: one request line (`webcam toggle\n`), one answer line, close. `kill` and `help` never use it: kill =
-  connect check, then SIGTERM by the PID in the socket name, SIGKILL after `KILL_GRACE`. Why (D4): a hotkey must
+  connect check, then SIGTERM by the PID in the socket name, SIGKILL after `KILL_GRACE`. Before signalling, the CLI checks that the socket dir and file are owned by the user and that the peer pid (`SO_PEERCRED`) matches the file name, so a planted or stale socket cannot make it kill an unrelated process. Why (D4): a hotkey must
   always work, so a hung instance is still ended.
 - Listener: one thread plus one per connection, pushing into a queue and calling `ctx.request_repaint()` every
   100 ms until the UI answers (the window may be hidden and `update` not running); after `APPLY_WAIT` (2.5 s) it
   answers "queued...". The CLI waits `ANSWER_TIMEOUT` (3.5 s) per instance, instances in parallel; a frozen one
   prints "no answer (not responding)".
 - UI side: `client/src/ui/ctl_apply.rs` (`App::drain_ctl`, `apply_ctl`), drained at the top of `update`.
-- Toggle memory: `ui::Shell::webcam_memory` (`ctl::WebcamMemory`), cleared by `webcam stop`, the app's webcam
-  buttons and a toggle-on. Why (D7, owner): restore only after a toggle; after a stop it is "like a fresh instance
+- Toggle memory: `ui::Shell::webcam_memory` (`ctl::WebcamMemory`), cleared by `webcam start`, `webcam stop`, the app's webcam
+  buttons, a toggle-on and a toggle that found no remembered room in the call. Why (D7, owner): restore only after a toggle; after a stop it is "like a fresh instance
   basically"; start means all rooms where you are in the call; connected and in-call are different things.
 - `ctl` runs in `main.rs` before tokio, logging, GStreamer and GPU setup (about 0.01 s).
 
