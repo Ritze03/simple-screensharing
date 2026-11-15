@@ -27,6 +27,7 @@ pub mod audio_dump;
 pub mod audio_gain;
 pub mod bandwidth;
 pub mod capture;
+pub mod ctl;
 pub mod decode;
 pub mod diag_upload;
 #[cfg(test)]

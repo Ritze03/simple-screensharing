@@ -4068,6 +4068,18 @@ impl AppState {
         self.webcam_capture().and_then(|id| self.captures.get(&id)).map(|c| c.destinations.values().map(|d| d.room).collect()).unwrap_or_default()
     }
 
+    /// [`Self::webcam_rooms`] plus the rooms whose start is still queued (behind a stopping capture or a
+    /// starting one). What "the webcam is on" means for the ctl: a start that was just asked for counts.
+    pub fn webcam_rooms_or_pending(&self) -> Vec<RoomHandle> {
+        let mut rooms = self.webcam_rooms();
+        for r in self.webcam_start_after_stop.iter().chain(self.webcam_join_when_active.iter()) {
+            if !rooms.contains(r) {
+                rooms.push(*r);
+            }
+        }
+        rooms
+    }
+
     /// The webcam's capture and destination in `room`, if it is on there.
     pub fn webcam_in(&self, room: RoomHandle) -> Option<(CaptureSourceId, DestinationId)> {
         let id = self.webcam_capture()?;

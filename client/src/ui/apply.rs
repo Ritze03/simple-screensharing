@@ -374,12 +374,14 @@ impl App {
 
             // --- webcam ----------------------------------------------------
             UiAction::StartWebcam(room) => {
+                self.shell.webcam_memory.forget();
                 if let Err(e) = self.state.start_webcam(room) {
                     self.toast(tr_with("ui.toast.webcam_failed", "Couldn't share the webcam: %{error}", &[("error", &e)]), "error");
                 }
                 self.nav.popover = None;
             }
             UiAction::StopWebcam(room) => {
+                self.shell.webcam_memory.forget();
                 self.state.stop_webcam_in(room);
                 self.nav.popover = None;
             }

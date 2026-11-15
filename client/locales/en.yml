@@ -578,6 +578,12 @@ ui.stream.gop_ms: "%{ms} ms"
 
 #toast
 ui.toast.audio_failed: "Couldn't share audio: %{error}"
+ui.toast.ctl_webcam_started: "Webcam started (CTL)"
+ui.toast.ctl_webcam_stopped: "Webcam stopped (CTL)"
+ui.toast.ctl_screen_stopped: "Screen sharing stopped (CTL)"
+ui.toast.ctl_audio_stopped: "Audio stopped (CTL)"
+ui.toast.ctl_hung_up: "Left the call (CTL)"
+ui.toast.ctl_hung_up_n: "Left the call in %{count} rooms (CTL)"
 ui.toast.connect_failed: "Couldn't connect: %{error}"
 ui.toast.connect_room_failed: "Couldn't connect to %{room}: %{error}"
 ui.toast.connected: "Connected to %{room}"

@@ -97,6 +97,7 @@ use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BandEdge};
 
 mod apply;
+mod ctl_apply;
 pub mod audio_settings;
 pub mod drive_dump;
 pub mod menu;
@@ -576,6 +577,9 @@ pub struct Shell {
     /// [`App::poll_staged`]; a node found asks [`Modal::SharePick`], none stages the portal share as before.
     pub gamescope_probe: Option<(RoomHandle, bool, oneshot::Receiver<Vec<simple_screensharing_client::capture::gamescope::Node>>)>,
     pub toasts: Vec<Toast>,
+    /// Where `ctl webcam toggle` turned the webcam off ([`simple_screensharing_client::ctl::WebcamMemory`]); the
+    /// app's own webcam buttons clear it.
+    pub webcam_memory: simple_screensharing_client::ctl::WebcamMemory,
     /// Rooms whose "Live in <room>" toast was already shown for the current
     /// on-air spell ([`newly_on_air`]).
     announced_live: Vec<RoomHandle>,
@@ -1347,6 +1351,8 @@ impl App {
         // SIGTERM/SIGINT/SIGHUP close the window, so `on_exit` leaves every
         // room cleanly and peers drop us at once instead of on a timeout.
         simple_screensharing_client::session::install_shutdown_signal_handlers(cc.egui_ctx.clone());
+        // `simple-screensharing ctl ...`: the Hotkey control socket (`ctl_apply.rs` applies what arrives).
+        simple_screensharing_client::ctl::start_listener(cc.egui_ctx.clone());
         // The one place notification sounds may reach a sound card: tests build the app through `with_state`.
         simple_screensharing_client::sounds::enable_output();
         Self::with_state(AppState::default())
@@ -1814,6 +1820,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.now = ctx.input(|i| i.time);
+        self.drain_ctl(ctx);
         self.poll(ctx);
 
         // Escape closes the popover before anything else sees it (a modal
@@ -1869,6 +1876,7 @@ impl eframe::App for App {
     /// once) and stop every capture, blocking up to 1.5 s. Also the path a
     /// SIGTERM/SIGINT/SIGHUP takes (see `App::new`).
     fn on_exit(&mut self) {
+        simple_screensharing_client::ctl::cleanup();
         self.state.shutdown_blocking(std::time::Duration::from_millis(1500));
     }
 }
