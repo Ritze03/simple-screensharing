@@ -32,6 +32,16 @@ hs_load_state
 hs_export_env
 hs_assert_private
 
+# Software-encoding guard (a VA encoder under resizes faulted the GPU): the sharer's own process environment must carry
+# LIBVA_DRIVERS_PATH=/nonexistent (CLIENT_ENV_1 is not kept in the rig state, so /proc/<pid>/environ is what is checked).
+# GS_ASSUME_SOFTWARE=1 only for testing the guard itself; never to run on a VA rig.
+require_software_sharer() {
+    local pid; pid="$(hs_pid_of client1)"
+    [[ -n "$pid" ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'LIBVA_DRIVERS_PATH=/nonexistent' \
+        || die "the rig's sharer (client 1) was not started with software encoding (CLIENT_ENV_1 must contain LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system); refusing to resize on a VA encoder"
+}
+case "${1:-}" in run|start) require_software_sharer ;; esac
+
 GS_PIDS="$SCRATCH/gs.pids"; VIEW="$SCRATCH/gs-view.log"; CHANGES="$SCRATCH/gs-changes.log"
 # a middle region of the viewer's first tile (client 2 on HEADLESS-3, global x 3840..)
 TILE="${GS_TILE:-5000,450 200x160}"
@@ -177,6 +187,6 @@ case "${1:-}" in
     full) do_size full ;;
     window) do_size window ;;
     repaint) repaint ;;
-    run) shift; trap 'end_share; stop' EXIT; run "$@"; exit $? ;;
+    run) shift; trap 'touch "$SCRATCH/gs-view.stop"; end_share; stop' EXIT; run "$@"; exit $? ;;
     *) sed -n '3,25p' "$BASH_SOURCE"; exit 2 ;;
 esac

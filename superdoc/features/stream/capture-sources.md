@@ -168,7 +168,7 @@ xdpw shares outputs only (`chooser_type=none`).
   since, and the newest buffer's time. `source_caps()` stays the size the destinations were built for (the basis `rescale_for_new_source`
   and `edited_params` work from); the live size is separate.
 - `CaptureHandle::poll_resize` (called per frame from `AppState::poll_capture_recovery_at`, step 0):
-  1. the size must stay put for `RESIZE_SETTLE` (600 ms), so a drag with many sizes per second acts once;
+  1. the size must stay put for `RESIZE_SETTLE` (600 ms; a direct gamescope source uses 1.5 s, `GAMESCOPE_RESIZE_SETTLE_MS`, see the row-215 block above), so a drag with many sizes per second acts once;
   2. settled and **fresh** buffers arrived (`RESIZE_ALIVE_FRAMES` = 3 distinct `GstBuffer`s, because `pipewiresrc`'s keepalive resends the
      held buffer and must not read as alive): every destination gets `rescale_for_new_source(params, old, new)` through
      `change_destination`, the ordinary tier-2 branch swap (build alongside, first IDR, flip). The new size becomes `source_caps()`.

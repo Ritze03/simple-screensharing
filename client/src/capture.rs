@@ -994,17 +994,6 @@ enum CaptureSource {
 }
 
 impl CaptureSource {
-    /// The `gst-launch`-syntax fragment for this platform's capture source
-    /// element (see this module's doc comment) — the only piece of
-    /// [`build_pipeline`]'s description that differs by platform.
-    ///
-    /// `framerate` is the user-selected target rate ([`build_pipeline`]'s own
-    /// `framerate` parameter) — needed here (not just by the `videorate`
-    /// stage further downstream) because of `keepalive-time` below: this is
-    /// the only place in the pipeline that can plug the *upstream* half of
-    /// the "static screen ⇒ frames stop entirely" bug (see
-    /// [`build_pipeline`]'s doc comment for the downstream half).
-    /// See [`CaptureErrors::silence_is_loss`].
     /// A size change of this source is answered by a capture restart, never an in-place branch swap: a direct
     /// gamescope node (not the OBS camera) stalls upstream shortly after it renegotiates, hidden by the keepalive
     /// resend (see [`CaptureHandle::poll_resize`]).
@@ -1016,6 +1005,17 @@ impl CaptureSource {
         false
     }
 
+    /// The `gst-launch`-syntax fragment for this platform's capture source
+    /// element (see this module's doc comment) — the only piece of
+    /// [`build_pipeline`]'s description that differs by platform.
+    ///
+    /// `framerate` is the user-selected target rate ([`build_pipeline`]'s own
+    /// `framerate` parameter) — needed here (not just by the `videorate`
+    /// stage further downstream) because of `keepalive-time` below: this is
+    /// the only place in the pipeline that can plug the *upstream* half of
+    /// the "static screen ⇒ frames stop entirely" bug (see
+    /// [`build_pipeline`]'s doc comment for the downstream half).
+    /// See [`CaptureErrors::silence_is_loss`].
     fn silence_means_lost(&self) -> bool {
         match self {
             #[cfg(unix)]
@@ -1783,8 +1783,9 @@ struct Reshape {
 ///
 /// Why: stock xdpw stops delivering after an output mode change (measured 2026-11-05, #141: 1 of 240 fps
 /// then nothing, `ext: frame capture failed: buffer constraint mismatch`, `out of buffers`) although
-/// `pipewiresrc` renegotiates and pushes the new caps. A source that survives (gamescope, window capture)
-/// keeps delivering. Telling the two apart needs "caps changed at T" and "frames since T".
+/// `pipewiresrc` renegotiates and pushes the new caps. A source that survives in place (a window capture)
+/// keeps delivering; a direct gamescope source stalls shortly after renegotiating and is restarted on a size change
+/// instead (row 215, [`CaptureSource::restarts_on_resize`]). Telling the two apart needs "caps changed at T" and "frames since T".
 #[derive(Default)]
 struct SizeWatch {
     changed: Mutex<Option<(u32, u32, Instant)>>,

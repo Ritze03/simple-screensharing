@@ -11,7 +11,8 @@ All notable user-facing changes, newest first. Categories:
 
 ### Fixed
 
-- **Gamescope sharing**: a gamescope share no longer freezes when the game window changes size.
+- **Gamescope sharing**: a gamescope share now recovers by itself within a few seconds when the picture changes
+  size, instead of freezing.
 
 ## 2026-11-15
 
