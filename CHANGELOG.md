@@ -7,6 +7,12 @@ All notable user-facing changes, newest first. Categories:
 **Removed** (things taken out),
 **Info** (notes worth knowing).
 
+## 2026-11-19
+
+### Fixed
+
+- **Gamescope sharing**: a gamescope share no longer freezes when the game window changes size.
+
 ## 2026-11-15
 
 ### Added

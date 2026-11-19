@@ -38,12 +38,82 @@ otherwise the share ends with `capture lost: the gamescope capture "gamescope" i
 **Measured (rig, 2026-11-05, release).** Real `gamescope --backend headless -W 1280 -H 720 -- vkcube` inside the rig's sway and private PipeWire:
 node `gamescope`, capture started in the Gpu domain, viewer decodes 1280x720 30 fps H.264 via `vah264dec`, 6 Mbps. Main button and menu path
 both worked, "Screen" went to the portal, killing gamescope mid-share gave the give-up error after 5 attempts and no picker. A fake `pipewiresink`
-`Video/Source` (`videotestsrc`, BGRx) behaved the same, including the quick-return recovery. Not measured: a node that changes size in place (the
-headless gamescope cannot be resized and the fake node did not renegotiate); that path is the shared `SizeWatch` of row 141.
+`Video/Source` (`videotestsrc`, BGRx) behaved the same, including the quick-return recovery. Not measured then: a node that changes size
+(the headless gamescope cannot be resized and the fake node did not renegotiate). Measured since (2026-11-19, row 215, nested gamescope): it
+does change size, and the in-place swap of row 141 does not survive it; see "A gamescope size change restarts the capture" below.
 
 **Why** (the user's wording above): ask first rather than guess, because a gamescope node exists whenever a game session runs, even while the user
 means to share the desktop.
 
+
+### A gamescope size change restarts the capture (2026-11-19, row 215)
+
+**Brief.** The user: "Checkout why gamescope direct shares keep freezing on size changes. I would honestly be fine, if we always stream at the
+nested resolution of gamescope and just scale the image accordingly. But handling resolution changes should be robust and a non-issue. Right now it
+usually just breaks". (The "one fixed encode size + scaling" variant was NOT built: it cannot help, the stall below is upstream of any scaler.)
+
+**What was measured** (nested gamescope 3.17, `--backend wayland` in the rig's sway, PipeWire 1.6, software x264 on both clients):
+- The stream size is gamescope's OUTPUT size, not the game's nested `-w/-h`: resizing gamescope's window and toggling fullscreen change it.
+  A game changing its own resolution should not (source reading only, not tested).
+- After the renegotiation gamescope gives about 1 s of buffers and then stalls upstream of the consumer (`pipewire: warning: out of buffers`, the
+  node still `running`, the link `active`, no error). A bare `pipewiresrc ! identity ! fakesink` stalls too: about 12 % of resizes with a moving
+  picture, every one with a still picture. It ends only at the next size change or when the consumer reconnects.
+- `keepalive-time` hides it: the held buffer is resent at 60/s with one PTS, so `SOURCE_GAP_LOST` never fires and `poll_resize` saw the source "alive"
+  at settle time. The swap then failed (`encode branch produced no IDR within 5s`); the viewer stayed frozen 6-24 s on a resize, until the next
+  change or the watchdog.
+- A FRESH `pipewiresrc` connection after a resize negotiated the new size and delivered 14 of 14 times.
+- Pinning a size in the consumer's caps does NOT work and must never be tried behind the gamescope `pipewiresrc`: the first resize gives `stream
+  error: no more input formats` + EOS and once killed gamescope's PipeWire thread for good (node gone until gamescope restarts). gamescope only
+  scales into a size for consumers that set its own `SPA_FORMAT_VIDEO_requested_size`, which stock `pipewiresrc` cannot.
+- A fresh consumer on a STILL gamescope picture gets no frame until gamescope repaints, and gamescope only renegotiates when it pushes a frame.
+
+**What changed.**
+- `capture.rs:CaptureSource::restarts_on_resize` (a `Kind::Gamescope` node; not the OBS camera, the portal or the test source) is stored in
+  `CaptureHandle::restart_on_resize`; `CaptureHandle::poll_resize` then marks the capture lost with `SOURCE_RESIZED_TEXT` the moment the size has settled
+  and returns no swap. The session's existing restart does the rest (position 0, no backoff for a restart that comes out at another size,
+  `finish_recovery` re-adds the destinations at the new shape). No new state machine. *Why:* the renegotiated stream is not trustworthy, a fresh
+  connection is, so the reliable way out is the restart the portal already uses.
+- The settle for such a source is `GAMESCOPE_RESIZE_SETTLE_MS` (1.5 s, `SizeWatch::settle`) instead of 600 ms. *Why:* a reconnect that is followed
+  within about half a second by another size change gets a buffer smaller than its caps from gamescope and the conversion reads past the end of the
+  shared memory: SIGBUS in a `queue:src` thread (core dump: the `orcexec` code reading `/dev/shm/gamescope-pw-...`, mapped larger than the file).
+  With the 600 ms settle that killed the client in 4 of about 10 runs with sizes changing 0.2-1.5 s apart (about 1 per 70 restarts); with 1.5 s,
+  none in about 270 changes (5 bursts, 2 seeded stresses, 22 singles). The stock swap path never crashed in about 90 bursty changes (it froze 12-23 s instead). Not a cure for the gamescope
+  bug (a size change landing right after ANY consumer's connect), only keeps our reconnects out of bursts.
+- `CaptureHandle::expect_frames` does nothing for such a source: no `FIRST_FRAME_LOST` (20 s). *Why:* see "A still picture" below.
+
+**A still picture.** Before this change, a restart on a still gamescope picture produced no frame, `FIRST_FRAME_LOST` declared the restarted capture
+lost every 20 s, and the restart schedule climbed (positions 0..3 in 95 s, `CAPTURE_RESTART_DELAYS` has 5 slots) towards the give-up that ends the
+share. Now the restarted capture stays connected, the destination waits (`the capture source has produced no frame in 3.0s: an idle monitor only
+delivers a frame once something on it changes; waiting rather than failing`, as for the portal's idle monitor) and shows the picture at the next
+repaint. The restart itself takes about 5 s on a still picture (it waits for a first buffer), and the viewer keeps the last picture, at the old
+aspect, until gamescope repaints. A share STARTED on a still picture already stayed on air (the first capture is exempt, and gamescope pushes a frame at
+the first connect); it ran 95 s with no restart.
+
+**Measured** (rig, software encoder on both clients, release, `client/scripts/hs-gamescope.sh`; "freeze" = longest run of an unchanged picture in
+the viewer tile, sampled about 8 times a second):
+
+| scenario | result |
+|---|---|
+| before, one resize (stock swap) | 6.2 s, 8.1 s (scout: 7.5-24 s), then the watchdog; bursts 12-23 s, one `share error` |
+| after, 22 single changes 3-8 s apart (16:9, 4:3, 800x600, 640x480, fullscreen on/off) | every one recovered, typical 1.4-2.4 s, worst 4.1 s (a change 3 s after the previous restart); live, viewer aspect right |
+| after, bursts of 5-8 changes 0.2-1.5 s apart (20, 26, 38 changes) | live at the final size and aspect every time; 3.9-5.3 s longest freeze, about 3.5 s after the last change of a burst |
+| after, 180 s seeded stress (48 changes, 16:9, 4:3, tiny, wide, fullscreen) | live at the end, no `share error`, no give-up; longest freeze 3.2 s |
+| after, still picture, resize then 95 s still then repaint | on air the whole time, no restart storm, the new picture shows after the repaint at the right aspect |
+| after, share started on a still picture | on air 95 s, repaint shows |
+| portal path, one output mode change (software) | unchanged, 1.3 s (the row 141 table says about 1.5 s) |
+
+Why 3.5 s after the last change of a burst and not 2 s: the settle (1.5 s) plus the restart (0.5 s) plus the first picture of a fresh encode
+branch (1-1.5 s, longer at big sizes); the portal needs no settle of that length because it never crashes there.
+
+**Rerun:** `client/scripts/hs-gamescope.sh run single|burst|stress|still|startstill ...` (usage in the script and `client/scripts/README.md`): starts its own
+nested gamescope in the rig, shares it (`SHARE_PICK=gamescope`), changes its size, prints one `RESULT` line, stops only its own PIDs. Software
+encoding only (`CLIENT_ENV_1/2="LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system"`). Unit test:
+`session::ui_ops_tests::a_resized_gamescope_source_is_restarted_not_swapped`.
+
+**Not verified.** The GPU / DMA-BUF domain (not run through a resize, by the safety rule: the restart on a VA encoder is the same path that faulted
+in row 148; the SIGBUS above was seen in the System domain only); the user's own gamescope build (`gamescope-<name>`); a game changing its own
+resolution; a size change landing right after a connect still crashes the client with some (now small) probability, it is a gamescope buffer bug
+that every consumer shares.
 
 ## The OBS virtual camera as a share source (2026-11-10, row 173)
 
@@ -131,9 +201,10 @@ the old size until the next change. The 2 s gap rule restarts a capture that sta
 One H.265 run hit `ring vcn_unified_1 timeout` (only that ring was reset, `Ring reset succeeded`, the client process died with `amdgpu: The
 CS has cancelled because the context is lost`): the encoder was busy while the old capture was torn down. Not reproduced in two more runs.
 
-**For a direct `pipewiresrc` of a `Video/Source` node (gamescope, row 142):** such a node renegotiates in place, so it takes path 2 (swap),
-not the restart; `SizeWatch` hangs on the tee and works unchanged for any source. Frames there must be fresh buffers, not keepalive
-resends, or `poll_resize` reads it as dead.
+**For a direct `pipewiresrc` of a `Video/Source` node (gamescope, row 142):** `SizeWatch` hangs on the tee and works unchanged for any
+source, but such a node does NOT take path 2 (swap): it renegotiates, gives about a second of buffers and then stalls upstream, with the
+keepalive resending the held buffer so it looks alive. It takes the restart, at once when its size settles (row 215, the section above:
+`CaptureSource::restarts_on_resize`). The original assumption here ("renegotiates in place, so it swaps") was wrong, measured.
 
 ### Resize recovery verified on software, one silent share death fixed, VA still faults on a gentle window resize (2026-11-07, row 148)
 
