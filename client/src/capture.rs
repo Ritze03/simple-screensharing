@@ -994,6 +994,17 @@ enum CaptureSource {
 }
 
 impl CaptureSource {
+    /// A size change of this source is answered by a capture restart, never an in-place branch swap: a direct
+    /// gamescope node (not the OBS camera) stalls upstream shortly after it renegotiates, hidden by the keepalive
+    /// resend (see [`CaptureHandle::poll_resize`]).
+    fn restarts_on_resize(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let CaptureSource::Gamescope(n) = self {
+            return n.kind == gamescope::Kind::Gamescope;
+        }
+        false
+    }
+
     /// The `gst-launch`-syntax fragment for this platform's capture source
     /// element (see this module's doc comment) — the only piece of
     /// [`build_pipeline`]'s description that differs by platform.
@@ -1736,6 +1747,12 @@ struct CapturePipeline {
 /// How long the source's frame size must stay put before [`CaptureHandle::poll_resize`] acts on it, so
 /// dragging a window edge (many sizes per second) causes one rebuild after it settles.
 const RESIZE_SETTLE: Duration = Duration::from_millis(600);
+/// The same, for a source that is restarted rather than swapped ([`CaptureSource::restarts_on_resize`]). Why longer (row 215):
+/// gamescope renegotiates a stream it just connected badly: a size change landing within about half a second of a new
+/// consumer's connection hands that consumer a buffer smaller than its caps and the conversion reads past the end of the
+/// shared memory (SIGBUS in `queue:src`, measured: about 1 in 70 restarts when sizes changed 0.2-1.5 s apart). Waiting
+/// until the size has been quiet for this long keeps our reconnect out of a burst of changes.
+const GAMESCOPE_RESIZE_SETTLE_MS: u64 = 1500;
 /// No buffer at the `tee` for this long, on a source that resends its last frame while idle (`keepalive-time`),
 /// is a dead source. Faster than the pumps' watchdog (3 s + 2 s) because a portal that stops delivering after a
 /// size change gives no caps event we could notice instead (measured, #141: both variants occur).
@@ -1746,7 +1763,8 @@ pub const SOURCE_RESIZED_TEXT: &str = "the capture source stopped after it chang
 const RESIZE_ALIVE_FRAMES: u64 = 3;
 /// A capture that replaced a lost one ([`CaptureHandle::expect_frames`]) and has still produced no frame after this
 /// long is lost again, so the restart schedule runs on to either a picture or a visible failure (row 148). A first
-/// capture is exempt: an idle monitor legitimately delivers its first frame only when something repaints.
+/// capture is exempt: an idle monitor legitimately delivers its first frame only when something repaints. So is a
+/// direct gamescope source, always (row 215, [`CaptureHandle::expect_frames`]).
 const FIRST_FRAME_LOST: Duration = Duration::from_secs(20);
 /// After a size change a destination whose shape (aspect) is still not the source's is swapped again, at most this
 /// often and this many times per size (a swap can fail, or land inside another swap).
@@ -1765,8 +1783,9 @@ struct Reshape {
 ///
 /// Why: stock xdpw stops delivering after an output mode change (measured 2026-11-05, #141: 1 of 240 fps
 /// then nothing, `ext: frame capture failed: buffer constraint mismatch`, `out of buffers`) although
-/// `pipewiresrc` renegotiates and pushes the new caps. A source that survives (gamescope, window capture)
-/// keeps delivering. Telling the two apart needs "caps changed at T" and "frames since T".
+/// `pipewiresrc` renegotiates and pushes the new caps. A source that survives in place (a window capture)
+/// keeps delivering; a direct gamescope source stalls shortly after renegotiating and is restarted on a size change
+/// instead (row 215, [`CaptureSource::restarts_on_resize`]). Telling the two apart needs "caps changed at T" and "frames since T".
 #[derive(Default)]
 struct SizeWatch {
     changed: Mutex<Option<(u32, u32, Instant)>>,
@@ -1777,6 +1796,8 @@ struct SizeWatch {
     last_buffer: std::sync::atomic::AtomicUsize,
     /// Milliseconds (+1) since [`watch_base`] of the newest buffer; 0 = none yet.
     last_ms: std::sync::atomic::AtomicU64,
+    /// [`GAMESCOPE_RESIZE_SETTLE_MS`] for a source that is restarted on a size change; 0 = [`RESIZE_SETTLE`].
+    settle_ms: std::sync::atomic::AtomicU64,
 }
 
 fn watch_base() -> Instant {
@@ -1789,9 +1810,17 @@ impl SizeWatch {
         self.frames.load(Ordering::Relaxed)
     }
 
-    /// `true` while the size is still changing (inside [`RESIZE_SETTLE`] of the last change).
+    /// How long the size must stay put before it counts as settled.
+    fn settle(&self) -> Duration {
+        match self.settle_ms.load(Ordering::Relaxed) {
+            0 => RESIZE_SETTLE,
+            ms => Duration::from_millis(ms),
+        }
+    }
+
+    /// `true` while the size is still changing (inside [`Self::settle`] of the last change).
     fn resizing(&self, now: Instant) -> bool {
-        self.changed.lock().unwrap().is_some_and(|(_, _, at)| now.saturating_duration_since(at) < RESIZE_SETTLE)
+        self.changed.lock().unwrap().is_some_and(|(_, _, at)| now.saturating_duration_since(at) < self.settle())
     }
 
     fn install(self: &Arc<Self>, tee: &gst::Element) {
@@ -2686,6 +2715,8 @@ pub struct CaptureHandle {
     expect_frames: std::sync::atomic::AtomicBool,
     /// See [`Reshape`].
     reshape: Mutex<Reshape>,
+    /// [`CaptureSource::restarts_on_resize`], read by [`CaptureHandle::poll_resize`]; atomic only for the test seam.
+    restart_on_resize: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for CaptureHandle {
@@ -3066,6 +3097,10 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
     let capture_errors = CaptureErrors { silence_is_loss: capture_source.silence_means_lost(), size: size_watch, ..Default::default() };
+    let restart_on_resize = std::sync::atomic::AtomicBool::new(capture_source.restarts_on_resize());
+    if capture_source.restarts_on_resize() {
+        capture_errors.size.settle_ms.store(GAMESCOPE_RESIZE_SETTLE_MS, Ordering::Relaxed);
+    }
     let capture_task = tokio::spawn(capture_loop(bus.stream(), capture_errors.clone()));
 
     Ok(CaptureHandle {
@@ -3086,6 +3121,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         started: Instant::now(),
         expect_frames: std::sync::atomic::AtomicBool::new(false),
         reshape: Mutex::new(Reshape::default()),
+        restart_on_resize,
     })
 }
 
@@ -3844,6 +3880,13 @@ impl CaptureHandle {
         filter.set_property("caps", &caps);
     }
 
+    /// TEST-ONLY: make this capture answer a size change like a direct gamescope source ([`CaptureSource::restarts_on_resize`]).
+    #[cfg(any(test, feature = "test-source"))]
+    pub fn test_restart_on_resize(&self) {
+        self.restart_on_resize.store(true, Ordering::Relaxed);
+        self.capture_errors.size.settle_ms.store(GAMESCOPE_RESIZE_SETTLE_MS, Ordering::Relaxed);
+    }
+
     /// TEST-ONLY: pretend the source died, as a bus error would.
     #[cfg(any(test, feature = "test-source"))]
     pub fn inject_source_lost(&self, reason: &str) {
@@ -3887,8 +3930,14 @@ impl CaptureHandle {
 
     /// Marks this capture as the replacement of a lost one: if it never produces a frame it is lost again
     /// ([`FIRST_FRAME_LOST`]).
+    ///
+    /// Not for a direct gamescope source (row 215): it restarts after every size change, and a gamescope picture that
+    /// is not changing legitimately delivers nothing to a fresh connection until something repaints (the same idle
+    /// state as a monitor). Treating that as lost made the restarts climb the backoff schedule to a give-up.
     pub fn expect_frames(&self) {
-        self.expect_frames.store(true, Ordering::Relaxed);
+        if !self.restart_on_resize.load(Ordering::Relaxed) {
+            self.expect_frames.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Per-frame check for a source that changed size (a window resized, a monitor mode change, a game
@@ -3925,16 +3974,21 @@ impl CaptureHandle {
             self.capture_errors.mark_lost("the capture source stopped delivering frames".to_string());
         }
         let Some((w, h, at)) = *self.capture_errors.size.changed.lock().unwrap() else { return Vec::new() };
-        if basis.width == 0 || now.saturating_duration_since(at) < RESIZE_SETTLE {
+        if basis.width == 0 || now.saturating_duration_since(at) < self.capture_errors.size.settle() {
             return Vec::new();
         }
         let (frames, fresh) = (self.capture_errors.size.frames(), self.capture_errors.size.fresh.load(Ordering::Relaxed));
         if (w, h) != (basis.width, basis.height) {
             tracing::debug!("source resized to {w}x{h}: {frames} frames, {fresh} fresh since");
         }
-        if fresh < RESIZE_ALIVE_FRAMES {
-            if (w, h) != (basis.width, basis.height) && self.capture_errors.silence_is_loss && self.capture_errors.lost().is_none() {
-                tracing::warn!("the capture source delivers nothing since it changed size to {w}x{h}; restarting the capture");
+        // Why a direct gamescope source never swaps (row 215): after it renegotiates to the new size it gives about 1 s of
+        // buffers and then stalls upstream of us (`out of buffers`, node still running) in a good share of resizes; the
+        // keepalive resend keeps buffers flowing, so "alive" here is not trustworthy and the swap then fails with "no
+        // IDR within 5 s". A fresh `pipewiresrc` connection negotiated the new size every time (14 of 14).
+        let restart = self.restart_on_resize.load(Ordering::Relaxed);
+        if fresh < RESIZE_ALIVE_FRAMES || restart {
+            if (w, h) != (basis.width, basis.height) && (restart || self.capture_errors.silence_is_loss) && self.capture_errors.lost().is_none() {
+                tracing::warn!("the capture source {} since it changed size to {w}x{h}; restarting the capture", if restart { "cannot be trusted to deliver" } else { "delivers nothing" });
                 self.capture_errors.mark_lost(SOURCE_RESIZED_TEXT.to_string());
             }
             return Vec::new();

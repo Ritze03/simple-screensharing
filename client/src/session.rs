@@ -6837,6 +6837,40 @@ mod ui_ops_tests {
         }
     }
 
+    /// Row 215: a size change of a direct gamescope source is answered by a capture restart (the lost-source path with
+    /// the resize reason), not by the in-place branch swap; any other source still swaps (its new size becomes the
+    /// capture's source size). The test source stands in for both, the seam says which one it pretends to be.
+    #[tokio::test]
+    async fn a_resized_gamescope_source_is_restarted_not_swapped() {
+        let fragment = "videotestsrc is-live=true pattern=ball ! capsfilter name=sourcesize caps=video/x-raw,width=320,height=240,framerate=30/1";
+        for gamescope in [true, false] {
+            let handle = capture::start_capture_from_test_source(30, fragment).await.expect("a test-source capture");
+            if gamescope {
+                handle.test_restart_on_resize();
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(handle.source_caps().width, 320);
+            handle.test_resize_source(400, 300);
+            let mut lost = None;
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(handle.poll_resize(Instant::now()).is_empty(), "no destination here, so no swap request either way");
+                lost = lost.or(handle.source_lost());
+                if lost.is_some() || handle.source_caps().width == 400 {
+                    break;
+                }
+            }
+            if gamescope {
+                assert_eq!(lost.as_deref(), Some(capture::SOURCE_RESIZED_TEXT), "restart, with the resize reason");
+                assert_eq!(handle.source_caps().width, 320, "no swap: the capture keeps the size it was built for");
+            } else {
+                assert!(lost.is_none(), "a normal source is not lost by a size change: {lost:?}");
+                assert_eq!(handle.source_caps().width, 400, "swapped: the new size is the capture's source size");
+            }
+            let _ = handle.stop().await;
+        }
+    }
+
     /// A webcam capture is its own share: the screen-only views of the session ignore it, and it has its wire label.
     #[tokio::test]
     async fn a_webcam_capture_is_labelled_and_is_not_a_screen() {
