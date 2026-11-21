@@ -1243,6 +1243,13 @@ impl RoomSession {
         self.streams.iter().filter(|s| s.owner != me).map(|s| s.owner).collect::<std::collections::HashSet<_>>().len()
     }
 
+    /// A stream's identity for the notification sounds across a restart: owner's display name + kind + label
+    /// (`sounds::stream_key`). An owner no longer in the roster falls back to the connection id.
+    fn sound_key(&self, owner: ConnId, kind: StreamKind, label: &str) -> String {
+        let name = self.members.iter().find(|m| m.conn_id == owner).map_or_else(|| format!("{owner:016x}"), |m| m.display_name.clone());
+        crate::sounds::stream_key(&name, kind, label)
+    }
+
     /// Record that `info.owner` has started a stream: bump their member
     /// row's `stream_count` and drop `info` into `streams`, replacing any
     /// existing entry for the same `(owner, stream_id)` pair rather than
@@ -4829,12 +4836,19 @@ impl AppState {
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
                         // A stream the roster already has is announced again (a label change): not news.
                         let known = room.streams.iter().any(|s| s.owner == info.owner && s.stream_id == info.stream_id);
-                        room.sounds.stream_started(info.owner == room.client.conn_id(), known);
+                        let key = room.sound_key(info.owner, info.kind, &info.label);
+                        room.sounds.stream_started(info.owner == room.client.conn_id(), known, &key);
                         room.note_stream_started(info);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
                         let known = room.streams.iter().any(|s| s.owner == conn_id && s.stream_id == stream_id);
-                        room.sounds.stream_stopped(conn_id == room.client.conn_id(), known);
+                        let key = room
+                            .streams
+                            .iter()
+                            .find(|s| s.owner == conn_id && s.stream_id == stream_id)
+                            .map(|s| room.sound_key(conn_id, s.kind, &s.label))
+                            .unwrap_or_default();
+                        room.sounds.stream_stopped(conn_id == room.client.conn_id(), known, &key, Instant::now());
                         // Before the roster forgets the stream: ends a watch
                         // of it (no frozen tile) and queues its resume.
                         room.end_watch_of_stopped(conn_id, stream_id, Instant::now());
@@ -4932,10 +4946,16 @@ impl AppState {
             // this pass's events add up to. See `sounds::RoomSounds`.
             let me = room.client.conn_id();
             let mine = room.streams.iter().filter(|s| s.owner == me).map(|s| s.stream_id).collect();
-            room.sounds.viewers(mine, room.viewers.iter().map(|(id, (v, _))| (*id, v.as_slice())));
+            let members = &room.members;
+            let name_of = |c: ConnId| members.iter().find(|m| m.conn_id == c).map(|m| m.display_name.clone());
+            room.sounds.viewers(now, mine, room.viewers.iter().map(|(id, (v, _))| (*id, v.as_slice())), name_of);
+            // A leave or a stop waiting out its grace needs a pass after it, even in an idle window.
+            if room.sounds.grace_pending() {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
             // Not in the call: the detector keeps running (so its baseline is "what is there now" at
             // pick-up, no burst) but nothing sounds.
-            sounds.extend(room.sounds.drain_for(now, room.in_call));
+            tracing::info_span!("room", ?handle).in_scope(|| sounds.extend(room.sounds.drain_for(now, room.in_call)));
 
             // Right after this room's `StreamStarted`/`StreamStopped` events
             // have been applied to `room.streams` — the only inputs that can
@@ -7844,7 +7864,17 @@ mod reconnect_e2e {
         run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(4500)).await;
         assert_eq!(counts(), [1, 0, 1, 0], "one join, however often the relay repeats the list");
 
-        // The watcher stops watching and watches again: a leave, then a join.
+        // A keyframe request is Unsubscribe + Subscribe: the relay shows the sharer a list without the watcher and
+        // right after one with them (row 217). Nobody left, so nothing sounds, not even after the grace.
+        {
+            let client = watcher.rooms[&wh].client.clone();
+            client.unsubscribe(owner, stream).await.expect("unsubscribe");
+            client.subscribe(owner, stream).await.expect("subscribe");
+        }
+        run_for(&mut [&mut watcher, &mut sharer], crate::sounds::GRACE + Duration::from_secs(2)).await;
+        assert_eq!(counts(), [1, 0, 1, 0], "a keyframe request is no leave and no join");
+
+        // The watcher stops watching and watches again: a leave (after the grace), then a join.
         watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, stream);
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "sharer hears the leave", |_| requested(Sound::Leave) == 1).await;
         // `Leave` -> `Join` is a pause of at least the gate's second; the counters count requests, not plays.
@@ -7852,8 +7882,8 @@ mod reconnect_e2e {
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "sharer hears the second join", |_| requested(Sound::Join) == 2).await;
         assert_eq!(counts(), [2, 1, 1, 0]);
 
-        // The sharer stops: the watcher hears a stop; the sharer does not hear its viewer "leave" (not even when the
-        // relay's stale-list window of 7 s passes).
+        // The sharer stops: the watcher hears a stop (after the grace); the sharer does not hear its viewer "leave"
+        // (not even when the relay's stale-list window of 7 s passes).
         sharer.stop_share(capture_id);
         sharer.rooms.get_mut(&sh).unwrap().note_stream_stopped(sharer_conn, 0);
         drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher hears the stop", |_| requested(Sound::Stop) == 1).await;

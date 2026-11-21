@@ -58,6 +58,11 @@ A VA encoder under window-resize stress or rapid restarts caused VCN page faults
 - **No VA resize test at all, and no rapid encoder restarts on a VA encoder**, until the capture-restart teardown is
   fixed, unless the user okays that run. For that logic use software encoding (`LIBVA_DRIVERS_PATH=/nonexistent
   SSS_CAPTURE_PATH=system` in `CLIENT_ENV_1`/`_2`; the log must say `using software encoder`).
+- **Never run a plain `cargo test` of the client crate.** Its `decode::video_tests` run the VA hardware decoders and encoders
+  (`h264_hardware_preferred`, `h264_from_the_va_encoder_decodes_at_1920x1080` and their H.265 / AV1 twins, the
+  hardware-failure fallback) on the host's real GPU and caused VCN ring resets (2026-11-21, `gpu-safety-incidents.md`). Run
+  the client's tests with a name filter, or with `-- --skip decode::video_tests`, unless the user okays a hardware run.
+  (`capture::` and `ctl::` are not proven to touch VA; the incident run did not show it.)
 - At the first `mmhub page fault` or `vcn_unified` line in `journalctl -k`, **stop the run and report**; do not continue.
 
 Measurements: `testing/gpu-safety-incidents.md`, `features/stream/capture-sources.md` "Resize recovery verified".

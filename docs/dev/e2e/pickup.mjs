@@ -73,14 +73,22 @@ try {
   await B.page.screenshot(OUT + PFX + "not-in-call.png");
 
   // ---- sounds while not in the call: Alice stops and restarts her share, Bob hears nothing ----
-  const restartShare = async () => {
+  const stopShare = async () => {
     await A.page.eval(`import(new URL("js/ui/capture.js", location.href).href).then((m) => m.stopAll())`);
     await A.page.waitFor(`!__sss.S.captures.some((c) => c.state === 'live')`, { timeout: 15000, what: "Alice stopped" });
-    await L.sleep(3000);
+  };
+  const startShare = async () => {
     await L.stubCapture(A.page, { audio: false, fps: 30 });
     await L.goLive(A.page, { codec: "h264", fps: 30 });
     await L.sleep(2500);
   };
+  const restartShare = async (gapMs = 3000) => {
+    await stopShare();
+    await L.sleep(gapMs);
+    await startShare();
+  };
+  // The grace (row 217): a stop only sounds once the stream stayed away this long; the page's own constant, not a copy.
+  const GRACE_MS = await q(B, `import(new URL("js/ui/sounds.js", location.href).href).then((m) => m.GRACE_MS)`);
   await restartShare();
   check((await room(B, `r.streams.some((s) => !s.self && s.kind === "video")`)) && (await played(B)) === "", "not in the call: Alice stops and restarts her share, Bob's sound spy records nothing", await played(B));
 
@@ -91,9 +99,14 @@ try {
   const st = (await L.watchStats(B.page))[0];
   check(st && st.st && st.st.decoded > 0, "frames decode", JSON.stringify(st && st.st && { decoded: st.st.decoded }));
   check((await played(B)) === "", "no notification sound at pick-up", await played(B));
-  // in the call: the same stop / start now sounds (the stop sound and the start sound)
-  await restartShare();
-  check((await played(B)).split(",").includes("stop") && (await played(B)).split(",").includes("start"), "in the call: Alice stops and restarts her share, Bob's spy records the stop and start sounds", await played(B));
+  // in the call (row 217): a restart inside the grace is the same stream coming back, no sound; one that outlasts it is a stop, then a start
+  await restartShare(3000);
+  check(GRACE_MS > 3000 && (await played(B)) === "", "in the call: Alice stops and restarts her share within the grace, Bob's spy records no sound", await played(B));
+  await stopShare();
+  await L.sleep(GRACE_MS + 2000);
+  check((await played(B)).split(",").includes("stop") && !(await played(B)).split(",").includes("start"), "in the call: Alice's stop outlasts the grace, Bob's spy records the stop sound (and no start yet)", await played(B));
+  await startShare();
+  check((await played(B)).split(",").includes("start"), "in the call: Alice goes live again after that, Bob's spy records the start sound", await played(B));
   check(!(await has(B, "#btn-pickup")) && (await icon(B, "#btn-leave")) === "call_end" && (await has(B, "#btn-share")), "in the call: red hang-up button, share button back, no pick-up");
   check((await strip(A)).includes("Bob"), "Alice still sees Bob");
   await B.page.screenshot(OUT + PFX + "in-call.png");

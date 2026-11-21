@@ -194,7 +194,7 @@ export function invalidate() {
   setTimeout(run, 100);
 }
 
-/** One line of the connection log (Settings > Connection): `kind` is "lost" | "back" | "stream" | "recover". The user has no console on a phone, so every
+/** One line of the connection log (Settings > Connection): `kind` is "lost" | "back" | "stream" | "recover" | "sound" (a notification sound and why it played). The user has no console on a phone, so every
  *  drop of a watch writes its reason here. Kept in memory for the page's life, newest last, at most 80 lines. */
 export function dropLog(kind, text) {
   const last = S.dropLog[S.dropLog.length - 1];

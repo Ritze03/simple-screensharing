@@ -200,16 +200,50 @@ this was already covered for the viewer's own playback and nothing new was neede
   sounds never fire.
 - *Someone starts / stops a stream:* native: the `StreamStarted` / `StreamStopped` deltas (a started stream the roster already has, a label
   change, is silent; so is a stop for a stream the roster never had); browser: the difference of the stream keys between two `streams`
-  events. A webcam and a screen are two streams, an audio-only share is one; a screen share with its paired audio arrives as two and the
+  events. The key is the stream's identity across a restart: sharer name + kind + label (native `sounds::stream_key`, browser the core's
+  `stableKey` through `soundStreamKeys`), never the stream id. A webcam and a screen are two streams, an audio-only share is one; a screen share with its paired audio arrives as two and the
   gate makes it one sound.
 - *Never for:* my own streams; the snapshot at join (native: it is the baseline, not an event; browser: the snapshot arrives while the room
   is not yet `joined`, so it only sets the baseline); my own stream stopping (the viewers that go with it are not "leaving": nothing sounds for
   the people of a stream that disappeared from my streams since the last pass); a resumed room, which stays quiet for 15 s
   (`RESUME_QUIET`) after a reconnect while its baselines still follow, because a restarted relay has everybody re-announce and re-watch.
+- *A leave and a stop wait `GRACE` (5 s) before they sound* (row 217): a viewer who vanishes from the lists, or another person's stream that
+  stops, is only news once it stayed away that long. The same viewer (native: same `ConnId` or same member name; browser: same id or name)
+  or stream (same key) back within it makes no sound at all, neither the leave / stop nor the join / start. A viewer who vanishes because
+  *my* stream stopped never sounds a leave, and their return to its replacement within the grace is no join either. While not in the call
+  what waits is discarded (`drain_for`), so a pick-up cannot play old news; native asks for a repaint while one waits
+  (`RoomSounds::grace_pending`), the browser re-drains every second (`flushSounds`).
 - A room counts while it is joined, on screen or not, focused or not (the user asked for no filter).
 *Deviation from the brief, "not the first list after I start sharing":* built as "the baseline of a new stream is nobody". A first list that
 names someone is a real join (nobody can watch a stream before it is announced), so silencing it would lose the first viewer's sound; the
 list the relay sends right after an announce is empty and is no change.
+
+**Why a grace, and why 5 s** (row 217, user: "sometimes the connect sound plays randomly, even when nothing happens"). The relay reports every
+Unsubscribe and every re-announced stream as a changed list, and these are the things nobody means as "someone left", each proven in code
+and in a test (`sounds::tests`, `dev/tests.js` "row 217"):
+- *A viewer's keyframe request is Unsubscribe + Subscribe* (`decode/recovery.rs`, browser `room-client.js` `#onVideoEvent`): the relay sends the
+  sharer a list without the viewer and right after one with them (`server/src/viewers_tests.rs`). The browser handled every list datagram on
+  its own, so a sharer heard leave then join for every keyframe request of every viewer; native only when the two lists straddled two UI
+  frames, or when the second datagram was lost (the next refresh is 2 s later). This is the most likely cause of what the user hears: it
+  needs no user action at all, only a lossy link.
+- *My own capture restart* (a source resize, the gamescope restart of row 215, a recovered source: `session.rs` `finish_recovery` forgets the
+  old destination, so the stream leaves `mine`, and adds a new one under a new stream id): the old stream's viewers vanish silently (own stop)
+  and re-watch the new stream a few seconds later, where they were a fresh join with no leave. Only a join, with nothing happening.
+- *Another person's share restarting* (stop, then a start under a new id): a stop and a start sound. Browser keys were `owner:streamId`, so
+  the restart looked like a different stream.
+- *A viewer who reconnects* comes back under a new `ConnId`: recognised by member name when back within the grace.
+- *The relay's stale expiry* (7 s without a refresh: three lost datagrams in a row) makes the viewers "gone" at that moment; the next refresh
+  that gets through within the grace brings them back silently, so only about 12 s without any list sounds a leave and a join.
+- *Not covered:* a share restart or a viewer reconnect that takes longer than the grace; the quiet period of a resumed room (15 s) covers the
+  relay-restart case. *Stream keys are safe on a dropped owner:* the relay sends `StreamStopped` before `MemberLeft` (`relay.rs` cleanup of a
+  connection) on the one ordered control stream, so the owner's name is still in the roster when the stop is keyed.
+*Why 5 s:* it has to outlast a lost refresh datagram (the relay repeats a list every 2 s, so a lost "back" list heals within 2 s) and a share
+restart that comes back on its first retry (measured 1.4-4.1 s to a picture, `features/stream/capture-sources.md`). A real leave is then
+heard 5 s late, which a notice can afford; longer would start to hide a person who left and a different one who joined. One constant for
+viewers and streams, no setting.
+*Every played sound is logged with its cause:* native `info` line `notification sound <Sound>: <cause>` inside a `room{handle=..}` span
+(a sound dropped because the room is not in the call: `debug`); browser: a `sound` line in Settings > Connection (`dropLog`). A "random
+sound" report is read from there.
 
 **Browser** (`docs/js/ui/sounds.js`): `OscillatorNode` + `GainNode` with the replica's ramps. The `AudioContext` is created only when a sound
 is actually played, never at boot or on a click. Browsers block audio until the page has had a click or key press: an event sound arriving
@@ -219,8 +253,9 @@ button is itself a click and always plays. `SoundOut.play` is the single exit an
 **Tests** (nothing plays): `sounds::tests` (four sounds differ, first-note pitch by zero crossings, peak follows the volume within the cap,
 starts at 0 and ends at the -80 dB floor with no step, the edge detector over sequences, the gate, a burst reaching EOS through a `fakesink`),
 `rooms` (old settings file gets 50), `ui::tests::sound_volume_...`; `session::reconnect_e2e::notification_sounds_follow_the_room_events`
-(`#[ignore]`, real relay, two `AppState`s, counts `sounds::requested`: one start for the watcher, one join, one leave, one stop, nothing for
-the sharer's own start or stop, no leave when the stale window passes). JS: `dev/tests.js` "sounds" group (definitions, plan, the same sequences,
+(`#[ignore]`, real relay, two `AppState`s, counts `sounds::requested`: one start for the watcher, one join, nothing for an Unsubscribe +
+Subscribe, one leave (after the grace), one stop (after the grace), nothing for the sharer's own start or stop, no leave when the stale
+window passes), `server/src/viewers_tests.rs` `a_keyframe_request_shows_the_owner_...`. JS: `dev/tests.js` "sounds" group (definitions, plan, the same sequences,
 gate, setting). Real pages (headless Chromium, `SoundOut.play` replaced, `window.AudioContext` trapped): the sequence above through a
 throwaway relay. Rig: the Settings card, a drag (live `Preview`, `Set` on release, `settings.toml` written), the four Test buttons with
 `SSS_SOUND_SINK=fakesink` (no audio stream in the rig's PipeWire). New dump rects: `side.settings`

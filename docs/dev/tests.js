@@ -22,7 +22,7 @@ import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { noteInput, originHost, shownIn, ORIGIN_WINDOW_MS } from "../js/ui/origin.js";
 import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
-import { Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan } from "../js/ui/sounds.js";
+import { GRACE_MS, Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan, soundStreamKeys } from "../js/ui/sounds.js";
 import { DICT } from "../js/ui/i18n.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 import { CEILING_DB, GATE_DB, Leveller, MAX_GAIN_DB, RISE_DB_PER_S, TARGET_DB } from "../js/core/leveller.js";
@@ -2487,65 +2487,166 @@ test("sounds: the four definitions are the replica's, and the plan's peak is vol
 });
 
 const lists = (o) => new Map(Object.entries(o).map(([k, v]) => [Number(k), v]));
-const vpass = (r, mine, l, now = 0) => (r.viewers(new Set(mine), lists(l)), r.drain(now));
+const NAMES = { a: "ann", b: "bob", c: "cy", a2: "ann" }; // a2 is ann after a reconnect (a new id, the same name)
+const nameOf = (id) => NAMES[id] || null;
+const vpass = (r, mine, l, now = 0) => (r.viewers(new Set(mine), lists(l), now, nameOf), r.drain(now));
+const GR = GRACE_MS;
 
-test("sounds: viewers join and leave once per change; the relay's 2 s repeats and an old relay are silent", () => {
+test("sounds: viewers join and leave once per change; the relay's 2 s repeats and an old relay are silent; a leave is heard after the grace", () => {
   const r = new RoomSounds();
-  eq(vpass(r, [3], {}), [], "no list yet (an old relay never sends one)");
-  eq(vpass(r, [3], { 3: ["a"] }), ["join"]);
-  for (let i = 0; i < 5; i++) eq(vpass(r, [3], { 3: ["a"] }), [], "a repeat");
-  eq(vpass(r, [3], { 3: ["a", "b"] }), ["join"]);
-  eq(vpass(r, [3], { 3: ["b"] }), ["leave"]);
-  eq(vpass(r, [3], { 3: [] }), ["leave"]);
-  eq(vpass(r, [3], { 3: [] }), []);
+  eq(vpass(r, [3], {}, 0), [], "no list yet (an old relay never sends one)");
+  eq(vpass(r, [3], { 3: ["a"] }, 1000), ["join"]);
+  for (let i = 0; i < 5; i++) eq(vpass(r, [3], { 3: ["a"] }, 2000 + i * 2000), [], "a repeat");
+  eq(vpass(r, [3], { 3: ["a", "b"] }, 20000), ["join"]);
+  eq(vpass(r, [3], { 3: ["b"] }, 21000), [], "held for the grace");
+  eq(vpass(r, [3], { 3: ["b"] }, 21000 + GR - 1), []);
+  eq(vpass(r, [3], { 3: ["b"] }, 21000 + GR), ["leave"]);
+  eq(vpass(r, [3], { 3: ["b"] }, 40000), [], "once");
+  eq(vpass(r, [3], { 3: [] }, 41000), []);
+  eq(vpass(r, [3], { 3: [] }, 41000 + GR), ["leave"]);
+  ok(!r.gracePending());
 });
 
-test("sounds: a person across several streams of mine counts once; a join and a leave in one pass are both heard", () => {
+test("sounds (row 217, A): a keyframe request flickers the viewer list (without them, then with them): no sound, not now and not later", () => {
   const r = new RoomSounds();
-  eq(vpass(r, [3, 4], { 3: ["a"] }), ["join"]);
-  eq(vpass(r, [3, 4], { 3: ["a"], 4: ["a"] }), []);
-  eq(vpass(r, [3, 4], { 3: [], 4: ["a"] }), [], "still watching the other one");
-  eq(vpass(r, [3, 4], { 3: [], 4: [] }), ["leave"]);
-  eq(vpass(r, [3, 4], { 3: ["a", "c"], 4: ["d"] }), ["join"]);
-  eq(vpass(r, [3, 4], { 3: ["e"], 4: [] }), ["join", "leave"]);
+  eq(vpass(r, [3], { 3: ["a"] }, 0), ["join"]);
+  eq(vpass(r, [3], { 3: [] }, 20000), [], "Unsubscribe");
+  eq(vpass(r, [3], { 3: ["a"] }, 20016), [], "Subscribe");
+  eq(vpass(r, [3], { 3: ["a"] }, 40000), []);
+  ok(!r.gracePending());
+  eq(vpass(r, [3], { 3: [] }, 50000), [], "the same with the second list lost until the 2 s refresh");
+  eq(vpass(r, [3], { 3: ["a"] }, 52000), []);
+  eq(vpass(r, [3], { 3: ["a"] }, 80000), []);
+});
+
+test("sounds (row 217, C): a viewer list that went stale (7 s) and comes back within the grace sounds nothing; after it, a leave and a join", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3], { 3: ["a"] }, 0), ["join"]);
+  eq(vpass(r, [3], { 3: [] }, 7000), [], "the stale timer emptied the list");
+  eq(vpass(r, [3], { 3: ["a"] }, 7000 + GR - 1), [], "the refresh is back in time");
+  eq(vpass(r, [3], { 3: ["a"] }, 60000), []);
+  eq(vpass(r, [3], { 3: [] }, 70000), []);
+  eq(vpass(r, [3], { 3: [] }, 70000 + GR), ["leave"]);
+  eq(vpass(r, [3], { 3: ["a"] }, 76000), ["join"]);
+});
+
+test("sounds (row 217, B): my own share restarting (a new stream id) does not make its viewers join again", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3], { 3: ["a", "b"] }, 0), ["join"]);
+  eq(vpass(r, [], { 3: ["a", "b"] }, 10000), [], "the old stream is gone");
+  eq(vpass(r, [4], { 3: ["a", "b"] }, 12000), [], "the new one is announced");
+  eq(vpass(r, [4], { 4: ["a"] }, 13500), [], "the viewers re-watch it");
+  eq(vpass(r, [4], { 4: ["a", "b"] }, 14000), []);
+  eq(vpass(r, [4], { 4: ["a", "b"] }, 60000), [], "and nobody leaves later");
+  eq(vpass(r, [4], { 4: ["a", "b", "c"] }, 61000), ["join"], "a person who really arrives still sounds");
+  eq(vpass(r, [4], { 4: ["a", "c"] }, 62000), []);
+  eq(vpass(r, [4], { 4: ["a", "c"] }, 62000 + GR), ["leave"], "and one who really leaves");
+});
+
+test("sounds: ending my share for good is silent, and a later share starts from nobody", () => {
+  const r = new RoomSounds();
+  vpass(r, [3], { 3: ["a", "b"] }, 0);
+  eq(vpass(r, [], { 3: ["a", "b"] }, 10000), []);
+  eq(vpass(r, [], {}, 11000), []);
+  eq(vpass(r, [], {}, 11000 + GR), [], "the silent expiry makes no leave");
+  eq(vpass(r, [5], { 5: ["c"] }, 60000), ["join"]);
+});
+
+test("sounds (row 217, D): a viewer who reconnects within the grace is recognised by name, one who comes back later is a leave and a join", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3], { 3: ["a", "b"] }, 0), ["join"]);
+  eq(vpass(r, [3], { 3: ["b"] }, 10000), []);
+  eq(vpass(r, [3], { 3: ["b", "a2"] }, 12000), [], "ann is back as a2");
+  eq(vpass(r, [3], { 3: ["b", "a2"] }, 30000), [], "no leave for the old id later");
+  eq(vpass(r, [3], { 3: ["b"] }, 40000), []);
+  eq(vpass(r, [3], { 3: ["b"] }, 40000 + GR), ["leave"]);
+  eq(vpass(r, [3], { 3: ["b", "a2"] }, 50000), ["join"]);
+});
+
+test("sounds: a person across several streams of mine counts once; a join and a leave in one pass are both heard (the leave after the grace)", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3, 4], { 3: ["a"] }, 0), ["join"]);
+  eq(vpass(r, [3, 4], { 3: ["a"], 4: ["a"] }, 1000), []);
+  eq(vpass(r, [3, 4], { 3: [], 4: ["a"] }, 2000), [], "still watching the other one");
+  eq(vpass(r, [3, 4], { 3: [], 4: ["a"] }, 20000), []);
+  eq(vpass(r, [3, 4], { 3: [], 4: [] }, 21000), []);
+  eq(vpass(r, [3, 4], { 3: [], 4: [] }, 21000 + GR), ["leave"]);
+  eq(vpass(r, [3, 4], { 3: ["a", "c"], 4: ["d"] }, 40000), ["join"]);
+  eq(vpass(r, [3, 4], { 3: ["e"], 4: [] }, 41000), ["join"]);
+  eq(vpass(r, [3, 4], { 3: ["e"], 4: [] }, 41000 + GR), ["leave"]);
 });
 
 test("sounds: stopping my own stream is not everyone leaving; lists of streams that are not mine are ignored", () => {
   const r = new RoomSounds();
-  vpass(r, [3], { 3: ["a", "b"] });
-  eq(vpass(r, [], { 3: ["a", "b"] }), [], "I stopped stream 3");
-  eq(vpass(r, [], {}), []);
-  eq(vpass(r, [5], { 5: ["a"] }), ["join"], "a new stream of mine starts from nobody");
-  eq(vpass(r, [], { 9: ["a"] }), []);
-  eq(vpass(r, [3], { 9: ["a"] }), []);
+  vpass(r, [3], { 3: ["a", "b"] }, 0);
+  eq(vpass(r, [], { 3: ["a", "b"] }, 10000), [], "I stopped stream 3");
+  eq(vpass(r, [], {}, 11000 + GR), []);
+  eq(vpass(r, [5], { 5: ["c"] }, 60000), ["join"], "a new stream of mine starts from nobody");
+  eq(vpass(r, [], { 9: ["c"] }, 61000), []);
+  eq(vpass(r, [3], { 9: ["c"] }, 62000), []);
 });
 
-test("sounds: someone else's streams start and stop by key; the snapshot, a label change and my own streams are silent", () => {
+test("sounds: someone else's streams start at once and stop after the grace, by stable key; the snapshot, a label change and my own streams are silent", () => {
   const r = new RoomSounds();
-  r.streams(["x:1", "y:1"], false); // the snapshot of a (re)connect: baseline only
+  r.streams(["x:1", "y:1"], false, 0); // the snapshot of a (re)connect: baseline only
   eq(r.drain(0), []);
-  r.streams(["x:1", "y:1"], true); // the same list again (a label change keeps the key)
+  r.streams(["x:1", "y:1"], true, 0); // the same list again (a label change keeps the key)
   eq(r.drain(0), []);
-  r.streams(["x:1", "y:1", "z:2"], true);
+  r.streams(["x:1", "y:1", "z:2"], true, 0);
   eq(r.drain(0), ["start"]);
-  r.streams(["x:1", "y:1"], true);
-  eq(r.drain(0), ["stop"]);
-  r.streams(["x:1", "q:1"], true); // one gone and one new in one pass: both, once each
-  eq(r.drain(0), ["start", "stop"]);
-  r.streams(["a:1", "a:2", "a:3", "a:4", "a:5", "a:6", "a:7", "a:8"], true);
-  eq(r.drain(0), ["start", "stop"], "8 at once are one sound each");
-  eq(r.drain(0), [], "drained");
+  r.streams(["x:1", "y:1"], true, 1000);
+  eq(r.drain(1000), [], "held for the grace");
+  ok(r.gracePending());
+  eq(r.drain(1000 + GR), ["stop"]);
+  eq(r.drain(1000 + GR + 1), [], "once");
+  r.streams(["x:1", "q:1"], true, 20000); // one gone and one new in one pass
+  eq(r.drain(20000), ["start"]);
+  eq(r.drain(20000 + GR), ["stop"]);
+  r.streams(["a:1", "a:2", "a:3", "a:4", "a:5", "a:6", "a:7", "a:8"], true, 40000);
+  eq(r.drain(40000), ["start"], "8 at once are one sound each");
+  eq(r.drain(40000 + GR), ["stop"]);
+  eq(r.drain(40000 + GR), [], "drained");
+});
+
+test("sounds (row 217, E): another person's share restarting (gone and back under the same stable key) sounds neither stop nor start", () => {
+  const r = new RoomSounds();
+  r.streams(["ann/Screen/main"], false, 0);
+  r.streams([], true, 10000);
+  eq(r.drain(10000), []);
+  r.streams(["ann/Screen/main"], true, 13000);
+  eq(r.drain(13000), []);
+  eq(r.drain(60000), [], "the held stop was cancelled, not postponed");
+  r.streams(["ann/Screen/game"], true, 70000); // another label is another stream
+  eq(r.drain(70000), ["start"]);
+  eq(r.drain(70000 + GR), ["stop"]);
+  // a snapshot that arrives while a stop waits is only a baseline
+  r.streams([], true, 80000);
+  r.streams(["x"], false, 81000);
+  eq(r.drain(81000 + GR), []);
+});
+
+test("sounds: soundStreamKeys uses the stable key, skips my own streams and numbers identical ones", () => {
+  eq(soundStreamKeys([{ stableKey: "r/ann/video/Screen", key: "1:1" }, { stableKey: "r/ann/video/Screen", key: "1:2" }, { key: "9:1", self: true }, { key: "2:1" }]), ["r/ann/video/Screen", "r/ann/video/Screen#2", "2:1"]);
+});
+
+test("sounds: every played sound has its cause (the Connection log line)", () => {
+  const r = new RoomSounds();
+  r.viewers(new Set([3]), lists({ 3: ["a"] }), 0, nameOf);
+  r.streams(["bob/Screen/main"], true, 0);
+  const got = r.drainCauses(0);
+  eq(got.map(([n]) => n), ["join", "start"]);
+  ok(got[0][1].includes("ann") && got[1][1].includes("bob/Screen/main"), JSON.stringify(got));
 });
 
 test("sounds: a resumed room is quiet for a while but keeps its baselines", () => {
   const r = new RoomSounds();
   r.quiet(RESUME_QUIET_MS);
-  r.streams(["x:1"], true);
-  r.viewers(new Set([3]), lists({ 3: ["a"] }));
+  r.streams(["x:1"], true, 0);
+  r.viewers(new Set([3]), lists({ 3: ["a"] }), 0, nameOf);
   eq(r.drain(1000), [], "the replay is silent");
-  r.viewers(new Set([3]), lists({ 3: ["a"] }));
+  r.viewers(new Set([3]), lists({ 3: ["a"] }), RESUME_QUIET_MS, nameOf);
   eq(r.drain(RESUME_QUIET_MS + 1), [], "the person who came back is the baseline, their repeat is no join");
-  r.streams(["x:1", "y:1"], true);
+  r.streams(["x:1", "y:1"], true, RESUME_QUIET_MS);
   eq(r.drain(RESUME_QUIET_MS + 1), ["start"]);
 });
 

@@ -7,7 +7,7 @@ import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent, mediaLogLine } from "./media-event.js";
-import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
+import { RoomSounds, RESUME_QUIET_MS, flushSounds, soundStreamKeys } from "./sounds.js";
 import { autoWatchKeys, pickUpWatchKeys, inCallAfterConnect } from "./stage-state.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
@@ -145,7 +145,7 @@ export async function disconnectRoom(r) {
 export function pickUp(r) {
   if (!r.client || r.state !== "joined" || r.inCall) return;
   r.inCall = true;
-  r.sounds.streams(r.streams.filter((s) => !s.self).map((s) => s.key), false);
+  r.sounds.streams(soundStreamKeys(r.streams), false);
   r.knownStreams = new Set(r.streams.map((s) => s.key));
   for (const key of pickUpWatchKeys({ enabled: S.settings.autoWatch, streams: r.streams, watching: r.watches })) watchStream(r, key);
   invalidate();
@@ -207,7 +207,7 @@ function wire(r, client) {
   on("streams", (d) => {
     r.streams = d.streams;
     // Notification sounds: the snapshot a (re)connect delivers arrives while the room is not "joined" yet, so it only sets the baseline.
-    r.sounds.streams(d.streams.filter((s) => !s.self).map((s) => s.key), r.state === "joined" && r.inCall);
+    r.sounds.streams(soundStreamKeys(d.streams), r.state === "joined" && r.inCall);
     syncViewerSounds(r);
     for (const key of [...r.previews.keys()]) {
       if (!d.streams.some((s) => s.key === key)) {
@@ -303,8 +303,8 @@ function wire(r, client) {
 function syncViewerSounds(r) {
   const shares = r.client ? r.client.shares.filter((s) => !s.ended) : [];
   const vids = shares.filter((s) => s.videoStreamId != null); // an audio-only share has no viewer list
-  r.sounds.viewers(new Set(vids.map((s) => s.videoStreamId)), new Map(vids.map((s) => [s.videoStreamId, s.viewerIds])));
-  flushSounds(r.sounds);
+  r.sounds.viewers(new Set(vids.map((s) => s.videoStreamId)), new Map(vids.map((s) => [s.videoStreamId, s.viewerIds])), Date.now(), (id) => r.members.find((m) => m.id === id)?.name || null);
+  flushSounds(r.sounds, r.name);
 }
 
 /* ---------------- watching ---------------- */

@@ -7,6 +7,13 @@ All notable user-facing changes, newest first. Categories:
 **Removed** (things taken out),
 **Info** (notes worth knowing).
 
+## 2026-11-21
+
+### Fixed
+
+- **Notification sounds**: the "someone joined" and "someone left" sounds no longer play on their own when nobody
+  joined or left, for example when a viewer's picture recovers or a share restarts.
+
 ## 2026-11-19
 
 ### Fixed
