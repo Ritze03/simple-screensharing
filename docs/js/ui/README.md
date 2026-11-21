@@ -23,7 +23,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 | `origin.js` | which window (main or the stage pop-out) a modal or toast opens in: the one the user last pressed in (row 184) |
 | `popout.js` | pop-outs: a stream in Document Picture-in-Picture (fallback Fullscreen; the fullscreen stage is also the tile double-click; it survives a reconnect, `rebind`), and the whole stage in a PiP window (`popStage`) |
 | `wakelock.js` | Screen Wake Lock while watching/sharing (or joined, on a phone): `syncWakeLock()` from `render()`, re-acquired on visible and on tap |
-| `sounds.js` | notification sounds (task I9): the four generated sounds (WebAudio, the replica's definitions), the pure edge detector `RoomSounds` (a port of native `sounds::RoomSounds`: viewer-set compare, stream-key diff, quiet after a resume), the `Gate`, `SoundOut.play` (the one exit; replaced by the harness) |
+| `sounds.js` | notification sounds (task I9): the four generated sounds (WebAudio, the replica's definitions), the pure edge detector `RoomSounds` (a port of native `sounds::RoomSounds`: viewer-set compare, stable-key stream diff, a 5 s grace for leave / stop, quiet after a resume), `flushSounds` (plays, logs each sound's cause to the Connection log), the `Gate`, `SoundOut.play` (the one exit; replaced by the harness) |
 | `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 
 ## Design notes (the why)

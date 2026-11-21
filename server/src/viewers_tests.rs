@@ -114,6 +114,24 @@ async fn hello_is_acked_and_every_change_sends_the_whole_list_to_the_owner_only(
     no_datagram(&rig.viewer.conn).await;
 }
 
+/// A viewer's keyframe request is Unsubscribe + Subscribe (`client/src/decode/recovery.rs`): the owner is sent a
+/// list without the viewer and right after one with them, though nobody left. The sharer's notification sounds
+/// (`client/src/sounds.rs` `GRACE`, row 217) must not read that as a leave and a join.
+#[tokio::test]
+async fn a_keyframe_request_shows_the_owner_a_list_without_the_viewer_and_then_with_them() {
+    let mut rig = rig(Registry::new((Ipv4Addr::LOCALHOST, 0).into())).await;
+    hello(&rig.sharer);
+    assert_eq!(next_datagram(&rig.sharer.conn).await.as_ref(), &[VIEWERS_TAG_ACK]);
+    next_list(&rig.sharer.conn).await;
+    subscribe(&mut rig.viewer).await;
+    assert_eq!(next_list(&rig.sharer.conn).await, vec![VIEWER]);
+
+    unsubscribe(&mut rig.viewer).await;
+    subscribe(&mut rig.viewer).await;
+    assert_eq!(next_list(&rig.sharer.conn).await, Vec::<ConnId>::new(), "the flicker: nobody");
+    assert_eq!(next_list(&rig.sharer.conn).await, vec![VIEWER], "and the viewer is back");
+}
+
 #[tokio::test]
 async fn a_late_hello_gets_the_current_state_and_the_refresh_repeats_it() {
     let mut rig = rig(Registry::new((Ipv4Addr::LOCALHOST, 0).into())).await;
