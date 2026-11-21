@@ -618,6 +618,22 @@ mod tests {
         assert!(pass_at(&mut r, t0, secs(80), &[3], &[(3, vec![10])]).is_empty());
     }
 
+    /// Row 217, path C: three lost refresh datagrams make the session drop the list (`VIEWERS_STALE`, 7 s) and the viewer
+    /// is "gone" from that moment; the next refresh that gets through within the grace brings them back silently.
+    #[test]
+    fn a_list_that_went_stale_and_came_back_within_the_grace_sounds_nothing() {
+        let t0 = Instant::now();
+        let mut r = RoomSounds::default();
+        assert_eq!(pass_at(&mut r, t0, secs(0), &[3], &[(3, vec![10])]), [Sound::Join]);
+        assert!(pass_at(&mut r, t0, secs(7), &[3], &[]).is_empty(), "the stale window dropped the list");
+        assert!(pass_at(&mut r, t0, secs(7) + GRACE - Duration::from_millis(1), &[3], &[(3, vec![10])]).is_empty(), "the refresh is back in time");
+        assert!(pass_at(&mut r, t0, secs(60), &[3], &[(3, vec![10])]).is_empty());
+        // Back only after the grace (about 12 s without a list in all): that is a leave and a join.
+        assert!(pass_at(&mut r, t0, secs(70), &[3], &[]).is_empty());
+        assert_eq!(pass_at(&mut r, t0, secs(70) + GRACE, &[3], &[]), [Sound::Leave]);
+        assert_eq!(pass_at(&mut r, t0, secs(76), &[3], &[(3, vec![10])]), [Sound::Join]);
+    }
+
     /// Row 217, path B: a capture restart (a source resize, the gamescope restart) forgets my stream and announces a
     /// new one under another id (`session.rs` `finish_recovery`: `forget_destination` then `add_destination_inner`).
     /// The viewers re-watch the new stream a few seconds later: no Leave (my stream stopped) and, before the fix, a

@@ -15,3 +15,13 @@ succeeded` (no full reset). A kernel-log watcher (`.tl-scratch/kwatch`-style: po
 the run at once. So **no VA resize test at all** (not even gentle) until the capture-restart teardown is fixed; software encoding
 (`LIBVA_DRIVERS_PATH=/nonexistent SSS_CAPTURE_PATH=system` in `CLIENT_ENV_1`/`_2`, the log must say `using software encoder`) took 120 s window
 stresses with sizes down to 40x30 and bursts every 60 ms without a kernel message. Details: `features/stream/capture-sources.md` "Resize recovery verified".
+
+## 2026-11-21: plain `cargo test` of the client crate (VA decode tests)
+
+A plain `cargo test -p simple-screensharing-client --lib` (debug build, no skips) ran `decode::video_tests` (VA decode and
+encode tests) on the host GPU. The test process aborted (SIGABRT) with `amdgpu: The CS has cancelled because the context is
+lost. This context is guilty of a hard recovery.` The kernel log showed three ring resets within about 50 s: `vcn_unified_0`
+timeout and ring reset twice, `vcn_unified_1` once; each `Ring ... reset succeeded`. No `mmhub` page fault and no `GPU mode1
+reset` followed, and the desktop session stayed up. Cause: running the whole suite instead of a filtered one; the rig was not
+involved (it ran software encode/decode and showed no `vcn_unified` or `mmhub` lines). Rule: `claude-instructions/testing-and-verification.md`
+"GPU: the rig shares the host's real GPU".

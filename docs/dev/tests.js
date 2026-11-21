@@ -2519,6 +2519,17 @@ test("sounds (row 217, A): a keyframe request flickers the viewer list (without 
   eq(vpass(r, [3], { 3: ["a"] }, 80000), []);
 });
 
+test("sounds (row 217, C): a viewer list that went stale (7 s) and comes back within the grace sounds nothing; after it, a leave and a join", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3], { 3: ["a"] }, 0), ["join"]);
+  eq(vpass(r, [3], { 3: [] }, 7000), [], "the stale timer emptied the list");
+  eq(vpass(r, [3], { 3: ["a"] }, 7000 + GR - 1), [], "the refresh is back in time");
+  eq(vpass(r, [3], { 3: ["a"] }, 60000), []);
+  eq(vpass(r, [3], { 3: [] }, 70000), []);
+  eq(vpass(r, [3], { 3: [] }, 70000 + GR), ["leave"]);
+  eq(vpass(r, [3], { 3: ["a"] }, 76000), ["join"]);
+});
+
 test("sounds (row 217, B): my own share restarting (a new stream id) does not make its viewers join again", () => {
   const r = new RoomSounds();
   eq(vpass(r, [3], { 3: ["a", "b"] }, 0), ["join"]);

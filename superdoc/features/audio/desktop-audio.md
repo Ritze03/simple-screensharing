@@ -232,8 +232,11 @@ and in a test (`sounds::tests`, `dev/tests.js` "row 217"):
 - *Another person's share restarting* (stop, then a start under a new id): a stop and a start sound. Browser keys were `owner:streamId`, so
   the restart looked like a different stream.
 - *A viewer who reconnects* comes back under a new `ConnId`: recognised by member name when back within the grace.
-- *Not covered:* the relay's stale expiry (7 s without a refresh: three lost datagrams in a row) and a restart or reconnect that takes longer
-  than the grace still sound; the quiet period of a resumed room (15 s) covers the relay-restart case.
+- *The relay's stale expiry* (7 s without a refresh: three lost datagrams in a row) makes the viewers "gone" at that moment; the next refresh
+  that gets through within the grace brings them back silently, so only about 12 s without any list sounds a leave and a join.
+- *Not covered:* a share restart or a viewer reconnect that takes longer than the grace; the quiet period of a resumed room (15 s) covers the
+  relay-restart case. *Stream keys are safe on a dropped owner:* the relay sends `StreamStopped` before `MemberLeft` (`relay.rs` cleanup of a
+  connection) on the one ordered control stream, so the owner's name is still in the roster when the stop is keyed.
 *Why 5 s:* it has to outlast a lost refresh datagram (the relay repeats a list every 2 s, so a lost "back" list heals within 2 s) and a share
 restart that comes back on its first retry (measured 1.4-4.1 s to a picture, `features/stream/capture-sources.md`). A real leave is then
 heard 5 s late, which a notice can afford; longer would start to hide a person who left and a different one who joined. One constant for
